@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "OpenStack-native K3s Kubernetes control plane service"
 requires-python = ">=3.12"
 dependencies = [
-    "afterglow-crypto",
+    "afterglow-crypto @ git+https://github.com/openstack-afterglow/afterglow-crypto.git@aee36e8ea173e486f443fa816de4e6397d11cff2",
     "fastapi==0.125.0",
     "uvicorn[standard]==0.39.0",
     "openstacksdk==3.3.0",
@@ -39,8 +39,9 @@ drover-api = "drover.main:run"
 drover-worker = "drover.worker:main"
 drover-migrate = "drover.scripts.migrate:main"
 
-[tool.uv.sources]
-afterglow-crypto = { path = "../afterglow-crypto", editable = true }
+[tool.hatch.metadata]
+allow-direct-references = true
+
 
 [tool.hatch.build.targets.wheel]
 packages = ["drover"]

@@ -4,14 +4,11 @@ requires-python = ">=3.12"
 
 [[package]]
 name = "afterglow-crypto"
-version = "0.1.0"
-source = { editable = "../afterglow-crypto" }
+version = "0.1.1"
+source = { git = "https://github.com/openstack-afterglow/afterglow-crypto.git?rev=aee36e8ea173e486f443fa816de4e6397d11cff2#aee36e8ea173e486f443fa816de4e6397d11cff2" }
 dependencies = [
     { name = "cryptography" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "cryptography", specifier = ">=42.0.0" }]
 
 [[package]]
 name = "aiomysql"
@@ -361,7 +358,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "afterglow-crypto", editable = "../afterglow-crypto" },
+    { name = "afterglow-crypto", git = "https://github.com/openstack-afterglow/afterglow-crypto.git?rev=aee36e8ea173e486f443fa816de4e6397d11cff2" },
     { name = "aiomysql", specifier = ">=0.2.0" },
     { name = "fakeredis", extras = ["lua"], marker = "extra == 'dev'", specifier = ">=2.21" },
     { name = "fastapi", specifier = "==0.125.0" },
