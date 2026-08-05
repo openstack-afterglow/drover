@@ -1,0 +1,297 @@
+---
+# Manila CSI Plugin — OpenStack 자격증명 Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: manila-cloud-secret
+  namespace: kube-system
+stringData:
+  os-authURL: {{ os_auth_url }}
+  os-region: {{ os_region }}
+  os-userName: {{ os_username }}
+  os-password: {{ os_password }}
+  os-domainName: {{ os_domain }}
+  os-projectID: {{ project_id }}
+---
+# ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: manila-csi-controller-sa
+  namespace: kube-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: manila-csi-node-sa
+  namespace: kube-system
+---
+# ClusterRole: controller
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manila-csi-controller-role
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes", "volumeattachments"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots", "volumesnapshotcontents", "volumesnapshotclasses"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: manila-csi-controller-binding
+subjects:
+  - kind: ServiceAccount
+    name: manila-csi-controller-sa
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: manila-csi-controller-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# CSIDriver: Manila NFS
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: manila.csi.openstack.org
+spec:
+  attachRequired: false
+  podInfoOnMount: true
+---
+# Controller StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: manila-csi-controllerplugin
+  namespace: kube-system
+spec:
+  serviceName: manila-csi-controller
+  replicas: 1
+  selector:
+    matchLabels:
+      app: manila-csi-controllerplugin
+  template:
+    metadata:
+      labels:
+        app: manila-csi-controllerplugin
+    spec:
+      serviceAccountName: manila-csi-controller-sa
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: manila-csi-plugin
+          image: {{ manila_csi_image }}
+          args:
+            - /bin/manila-csi-plugin
+            - --nodeid=$(NODE_ID)
+            - --endpoint=$(CSI_ENDPOINT)
+            - --share-protocol-selector={{ share_protocol }}
+            - --fwdendpoint=unix:///var/lib/kubelet/plugins/nfs.csi.k8s.io/csi.sock
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_ENDPOINT
+              value: unix:///var/lib/kubelet/plugins/manila.csi.openstack.org/csi.sock
+            - name: OS_AUTH_URL
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-authURL
+            - name: OS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-userName
+            - name: OS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-password
+            - name: OS_DOMAIN_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-domainName
+            - name: OS_PROJECT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-projectID
+            - name: OS_REGION_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-region
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /var/lib/kubelet/plugins/manila.csi.openstack.org
+            - name: fwd-plugin-dir
+              mountPath: /var/lib/kubelet/plugins/nfs.csi.k8s.io
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v4.0.1
+          args:
+            - --csi-address=$(ADDRESS)
+            - --timeout=3m
+          env:
+            - name: ADDRESS
+              value: /var/lib/kubelet/plugins/manila.csi.openstack.org/csi.sock
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /var/lib/kubelet/plugins/manila.csi.openstack.org
+        - name: csi-snapshotter
+          image: registry.k8s.io/sig-storage/csi-snapshotter:v7.0.2
+          args:
+            - --csi-address=$(ADDRESS)
+          env:
+            - name: ADDRESS
+              value: /var/lib/kubelet/plugins/manila.csi.openstack.org/csi.sock
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /var/lib/kubelet/plugins/manila.csi.openstack.org
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/manila.csi.openstack.org
+            type: DirectoryOrCreate
+        - name: fwd-plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/nfs.csi.k8s.io
+            type: DirectoryOrCreate
+---
+# Node DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: manila-csi-nodeplugin
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: manila-csi-nodeplugin
+  template:
+    metadata:
+      labels:
+        app: manila-csi-nodeplugin
+    spec:
+      serviceAccountName: manila-csi-node-sa
+      containers:
+        - name: manila-csi-plugin
+          image: {{ manila_csi_image }}
+          args:
+            - /bin/manila-csi-plugin
+            - --nodeid=$(NODE_ID)
+            - --endpoint=$(CSI_ENDPOINT)
+            - --share-protocol-selector={{ share_protocol }}
+            - --fwdendpoint=unix:///var/lib/kubelet/plugins/nfs.csi.k8s.io/csi.sock
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_ENDPOINT
+              value: unix:///var/lib/kubelet/plugins/manila.csi.openstack.org/csi.sock
+            - name: OS_AUTH_URL
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-authURL
+            - name: OS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-userName
+            - name: OS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-password
+            - name: OS_DOMAIN_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-domainName
+            - name: OS_PROJECT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-projectID
+            - name: OS_REGION_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: manila-cloud-secret
+                  key: os-region
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /var/lib/kubelet/plugins/manila.csi.openstack.org
+            - name: fwd-plugin-dir
+              mountPath: /var/lib/kubelet/plugins/nfs.csi.k8s.io
+            - name: pods-mount-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: registration-dir
+              mountPath: /registration
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.10.1
+          args:
+            - --csi-address=$(ADDRESS)
+            - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
+          env:
+            - name: ADDRESS
+              value: /var/lib/kubelet/plugins/manila.csi.openstack.org/csi.sock
+            - name: DRIVER_REG_SOCK_PATH
+              value: /var/lib/kubelet/plugins/manila.csi.openstack.org/csi.sock
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /var/lib/kubelet/plugins/manila.csi.openstack.org
+            - name: registration-dir
+              mountPath: /registration
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/manila.csi.openstack.org
+            type: DirectoryOrCreate
+        - name: fwd-plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/nfs.csi.k8s.io
+            type: DirectoryOrCreate
+        - name: pods-mount-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+---
+# StorageClass: Manila NFS
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: manila-nfs
+provisioner: manila.csi.openstack.org
+parameters:
+  csi.storage.k8s.io/provisioner-secret-name: manila-cloud-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: kube-system
+  csi.storage.k8s.io/node-stage-secret-name: manila-cloud-secret
+  csi.storage.k8s.io/node-stage-secret-namespace: kube-system
+  type: default_share_type
+reclaimPolicy: Delete
+allowVolumeExpansion: false

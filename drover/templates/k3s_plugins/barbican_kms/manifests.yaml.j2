@@ -1,0 +1,47 @@
+---
+# Barbican KMS Plugin — DaemonSet (컨트롤 플레인)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: barbican-kms-plugin
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: barbican-kms-plugin
+  template:
+    metadata:
+      labels:
+        app: barbican-kms-plugin
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      hostNetwork: true
+      containers:
+        - name: barbican-kms-plugin
+          image: {{ barbican_kms_image }}
+          args:
+            - /bin/barbican-kms-plugin
+            - --cloud-config=/etc/config/cloud.conf
+            - --key-id={{ kek_id }}
+            - --listen=/var/lib/kms/kms.sock
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: cloud-config
+              mountPath: /etc/config
+              readOnly: true
+            - name: kms-socket
+              mountPath: /var/lib/kms
+      volumes:
+        - name: cloud-config
+          secret:
+            secretName: cloud-config
+        - name: kms-socket
+          hostPath:
+            path: /var/lib/kms
+            type: DirectoryOrCreate

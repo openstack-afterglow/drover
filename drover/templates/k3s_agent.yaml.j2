@@ -1,0 +1,186 @@
+#cloud-config
+# k3s 에이전트(worker) 노드 — 클러스터: {{ cluster_name }}
+{% if ssh_public_key %}
+ssh_authorized_keys:
+  - {{ ssh_public_key }}
+{% endif %}
+
+package_update: true
+packages:
+  - curl
+  - jq
+
+write_files:
+  - path: /opt/k3s/pin-primary-network.sh
+    permissions: "0750"
+    content: |
+{{ pin_script | indent(6, first=True) }}
+
+  - path: /opt/k3s/agent-join.sh
+    permissions: "0750"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      LOG="/var/log/k3s-agent.log"
+      log() { echo "[k3s-agent] $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG"; }
+      if ! /bin/bash /opt/k3s/pin-primary-network.sh; then
+        log "ERROR: primary network pin missing; retrying via systemd"
+        exit 1
+      fi
+      . /etc/rancher/k3s/afterglow-primary-network.env
+
+      # 이미 k3s-agent가 실행 중이면 종료 (멱등성)
+      if systemctl is-active --quiet k3s-agent 2>/dev/null; then
+        log "k3s-agent 이미 실행 중. 종료."
+        exit 0
+      fi
+
+      log "서버 API({{ server_ip }}:6443) 대기 시작..."
+      SERVER_READY=false
+      for i in $(seq 1 360); do
+        HTTP_CODE=$(curl -sk --connect-timeout 3 -o /dev/null -w '%{http_code}' https://{{ server_ip }}:6443/healthz 2>/dev/null || echo "000")
+        if [ "$HTTP_CODE" != "000" ] && [ "$HTTP_CODE" != "" ]; then
+          SERVER_READY=true
+          log "서버 API 준비 완료 (${i}회 시도, HTTP ${HTTP_CODE})"
+          break
+        fi
+        sleep 5
+      done
+
+      if [ "$SERVER_READY" != "true" ]; then
+        log "ERROR: 서버 API에 30분 내 연결 실패. systemd가 2분 후 재시도 예정."
+        exit 1
+      fi
+
+      NODE_IP="${AFTERGLOW_K3S_NODE_IP}"
+      log "k3s 에이전트 설치 시작 (버전: {{ k3s_version }}, node-ip: ${NODE_IP})..."
+      _EXEC_ARGS="agent{% for arg in extra_agent_args %} {{ arg | shlex_quote }}{% endfor %}"
+      curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION={{ k3s_version | shlex_quote }} \
+        K3S_URL={{ ('https://' ~ server_ip ~ ':6443') | shlex_quote }} \
+        K3S_TOKEN={{ node_token | shlex_quote }} \
+        INSTALL_K3S_EXEC="${_EXEC_ARGS}" \
+        sh - 2>&1 | tee -a "$LOG"
+
+      log "k3s-agent 서비스 활성화 대기 중..."
+      for i in $(seq 1 60); do
+        if systemctl is-active --quiet k3s-agent 2>/dev/null; then
+          log "k3s-agent 서비스 정상 실행 중. 클러스터 join 완료."
+          exit 0
+        fi
+        sleep 5
+      done
+
+      log "WARNING: k3s-agent 서비스가 5분 내 활성화되지 않음. 재시도 예정."
+      systemctl status k3s-agent >> "$LOG" 2>&1 || true
+      journalctl -u k3s-agent --no-pager -n 50 >> "$LOG" 2>&1 || true
+      exit 1
+
+  - path: /usr/local/sbin/afterglow-nic-up.sh
+    permissions: "0750"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      IFACE="${1:-}"
+      [ -n "${IFACE}" ] || exit 0
+      [[ "${IFACE}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || exit 0
+      case "${IFACE}" in
+        lo|lo:*|cni*|flannel*|veth*|kube*|dummy*|tunl*) exit 0 ;;
+      esac
+      PIN_ENV="/etc/rancher/k3s/afterglow-primary-network.env"
+      for _second in $(seq 0 300); do
+        if [ -r "${PIN_ENV}" ]; then
+          . "${PIN_ENV}"
+          [[ "${AFTERGLOW_K3S_PRIMARY_IFACE:-}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] && break
+        fi
+        [ "${_second}" -lt 300 ] && sleep 1
+      done
+      [ -n "${AFTERGLOW_K3S_PRIMARY_IFACE:-}" ] || exit 1
+      [ "${IFACE}" = "${AFTERGLOW_K3S_PRIMARY_IFACE}" ] && exit 0
+      NETPLAN_FILE="/etc/netplan/90-afterglow-${IFACE}.yaml"
+      LOCK="/run/afterglow-nic.lock"
+      exec 9>"${LOCK}"
+      flock -x 9
+      BACKUP="${NETPLAN_FILE}.bak.$$"
+      TMP="${NETPLAN_FILE}.tmp.$$"
+      if [ -f "${NETPLAN_FILE}" ]; then
+        cp -p "${NETPLAN_FILE}" "${BACKUP}"
+      fi
+      umask 077
+      : > "${TMP}"
+      chmod 600 "${TMP}"
+      cat > "${TMP}" <<EOF
+      network:
+        version: 2
+        ethernets:
+          ${IFACE}:
+            dhcp4: true
+            dhcp6: false
+            link-local: []
+            optional: true
+            dhcp4-overrides:
+              use-routes: false
+              use-dns: false
+      EOF
+      mv -f -- "${TMP}" "${NETPLAN_FILE}"
+      echo "[afterglow-nic-up] ${IFACE}: applying netplan..." | systemd-cat -t afterglow-nic-up
+      if netplan apply 2>&1 | systemd-cat -t afterglow-nic-up; then
+        rm -f "${BACKUP}"
+        echo "[afterglow-nic-up] ${IFACE}: done" | systemd-cat -t afterglow-nic-up
+      else
+        if [ -f "${BACKUP}" ]; then
+          mv -f -- "${BACKUP}" "${NETPLAN_FILE}"
+        else
+          rm -f "${NETPLAN_FILE}"
+        fi
+        rm -f "${TMP}"
+        echo "[afterglow-nic-up] ${IFACE}: netplan apply failed, rolling back" | systemd-cat -t afterglow-nic-up
+      fi
+
+  - path: /etc/systemd/system/afterglow-nic-up@.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Afterglow NIC up handler for %i
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/afterglow-nic-up.sh %i
+      TimeoutStartSec=330s
+      StandardOutput=journal
+      StandardError=journal
+
+  - path: /etc/udev/rules.d/99-afterglow-nic.rules
+    permissions: "0644"
+    content: |
+      SUBSYSTEM=="net", ACTION=="add", KERNEL!="lo", KERNEL!="cni*", KERNEL!="flannel*", KERNEL!="veth*", KERNEL!="kube*", KERNEL!="dummy*", KERNEL!="tunl*", RUN+="/bin/systemctl --no-block start afterglow-nic-up@%k.service"
+
+  - path: /etc/systemd/system/k3s-agent-join.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=K3s Agent Join - {{ cluster_name }}
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=!/etc/systemd/system/k3s-agent.service
+
+      [Service]
+      Type=oneshot
+      TimeoutStartSec=35min
+      ExecStart=/opt/k3s/agent-join.sh
+      Restart=on-failure
+      RestartSec=120
+      StartLimitIntervalSec=14400
+      StartLimitBurst=20
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - udevadm control --reload-rules
+  - systemctl daemon-reload
+  - systemctl enable --now k3s-agent-join.service

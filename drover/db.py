@@ -1,0 +1,111 @@
+"""Drover SQLAlchemy async database lifecycle."""
+
+from __future__ import annotations
+
+import logging
+import sys
+import time
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+_logger = logging.getLogger(__name__)
+_engine: AsyncEngine | None = None
+_session_factory: async_sessionmaker[AsyncSession] | None = None
+
+_db_unhealthy_until: float = 0.0
+_default_unhealthy_seconds: int = 15
+_CONNECTION_ERROR_CODES = frozenset({2003, 2006, 2013, 2014, 2055})
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def init_db(
+    database_url: str,
+    *,
+    pool_size: int = 5,
+    max_overflow: int = 10,
+    connect_timeout: int = 10,
+    pool_timeout: int = 10,
+    unhealthy_seconds: int = 15,
+) -> None:
+    global _engine, _session_factory, _default_unhealthy_seconds
+    _default_unhealthy_seconds = unhealthy_seconds
+    if not database_url:
+        _logger.info("database.url is not set — running without DB (Redis fallback)")
+        return
+    if _engine is not None:
+        return
+    _engine = create_async_engine(
+        database_url,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_pre_ping=True,
+        pool_timeout=pool_timeout,
+        pool_recycle=1800,
+        connect_args={"connect_timeout": connect_timeout},
+        echo=False,
+    )
+    _session_factory = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
+
+
+def get_session_factory() -> async_sessionmaker[AsyncSession] | None:
+    return _session_factory
+
+
+def is_db_available() -> bool:
+    if _engine is None:
+        return False
+    if time.time() < _db_unhealthy_until:
+        return False
+    return True
+
+
+def is_db_configured() -> bool:
+    return _engine is not None
+
+
+def is_connection_error(error: BaseException | None) -> bool:
+    if error is None:
+        return False
+    current: BaseException | None = error
+    while current is not None:
+        args = getattr(current, "args", ())
+        if args and isinstance(args[0], int) and args[0] in _CONNECTION_ERROR_CODES:
+            return True
+        current = getattr(current, "orig", None) or getattr(current, "__cause__", None)
+    return False
+
+
+def mark_db_unhealthy(error: BaseException | None = None, seconds: int | None = None) -> bool:
+    error = error if error is not None else sys.exception()
+    if not is_connection_error(error):
+        return False
+    global _db_unhealthy_until
+    duration = seconds if seconds is not None else _default_unhealthy_seconds
+    _db_unhealthy_until = time.time() + duration
+    _logger.warning("DB circuit breaker opened for %d seconds", duration)
+    return True
+
+
+async def check_db() -> bool:
+    if _engine is None:
+        return False
+    try:
+        async with _engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        _logger.warning("Drover database health check failed", exc_info=True)
+        return False
+
+
+async def close_db() -> None:
+    global _engine, _session_factory
+    if _engine is not None:
+        await _engine.dispose()
+    _engine = None
+    _session_factory = None

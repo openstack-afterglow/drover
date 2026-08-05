@@ -1,0 +1,110 @@
+---
+# Octavia Ingress Controller — 설정 ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: octavia-ingress-controller-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    cluster-name: {{ cluster_name }}
+    openstack:
+      auth-url: {{ os_auth_url }}
+      region: {{ os_region }}
+      application-credential-id: {{ app_credential_id }}
+      application-credential-secret: {{ app_credential_secret }}
+    octavia:
+      use-octavia: true
+      subnet-id: {{ subnet_id }}
+{% if floating_network_id %}
+      floating-network-id: {{ floating_network_id }}
+{% endif %}
+      manage-security-groups: true
+    ingress:
+      ingress-class: openstack
+---
+# ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: octavia-ingress-controller
+  namespace: kube-system
+---
+# ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: octavia-ingress-controller-role
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "services", "endpoints", "events", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["extensions", "networking.k8s.io"]
+    resources: ["ingresses", "ingressclasses"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["extensions", "networking.k8s.io"]
+    resources: ["ingresses/status"]
+    verbs: ["update"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: octavia-ingress-controller-binding
+subjects:
+  - kind: ServiceAccount
+    name: octavia-ingress-controller
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: octavia-ingress-controller-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# IngressClass: openstack
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: openstack
+spec:
+  controller: openstack.org/ingress-controller
+---
+# StatefulSet (단일 replica)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: octavia-ingress-controller
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: octavia-ingress-controller
+  serviceName: octavia-ingress-controller
+  template:
+    metadata:
+      labels:
+        app: octavia-ingress-controller
+    spec:
+      serviceAccountName: octavia-ingress-controller
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      hostNetwork: true
+      containers:
+        - name: octavia-ingress-controller
+          image: {{ octavia_ingress_image }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - /bin/octavia-ingress-controller
+            - --config=/etc/config/config.yaml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/config
+      volumes:
+        - name: config
+          configMap:
+            name: octavia-ingress-controller-config

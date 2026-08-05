@@ -1,0 +1,27 @@
+[Global]
+auth-url={{ auth_url }}
+region={{ region }}
+username={{ username }}
+password={{ password }}
+domain-name={{ user_domain_name }}
+tenant-id={{ project_id }}
+{% if ca_file %}
+ca-file={{ ca_file }}
+{% endif %}
+
+[LoadBalancer]
+use-octavia=true
+{% if floating_network_id %}
+floating-network-id={{ floating_network_id }}
+{% endif %}
+{% if lb_subnet_id %}
+subnet-id={{ lb_subnet_id }}
+{% endif %}
+
+[Networking]
+{% if internal_network_name %}
+internal-network-name={{ internal_network_name }}
+{% endif %}
+{% if public_network_name %}
+public-network-name={{ public_network_name }}
+{% endif %}

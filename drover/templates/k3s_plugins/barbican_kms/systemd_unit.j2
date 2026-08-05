@@ -1,0 +1,23 @@
+[Unit]
+Description=Barbican KMS plugin (k8s secret encryption provider)
+Documentation=https://github.com/kubernetes/cloud-provider-openstack/tree/master/cmd/barbican-kms-plugin
+After=network-online.target
+Wants=network-online.target
+# k3s 가 시작되기 전에 sock 가 준비되어야 한다 (apiserver 의 encryption-provider 데드락 방지)
+Before=k3s.service
+
+[Service]
+Type=simple
+# KEK ID 는 CLI flag 가 아닌 cloud.conf 의 [KeyManager] key-id 로 전달 (공식 형식).
+# barbican-kms-plugin v1.34.1 은 --key-id 를 지원하지 않음.
+ExecStart=/usr/local/bin/barbican-kms-plugin \
+  --socketpath=/var/lib/kms/kms.sock \
+  --cloud-config=/etc/kubernetes/barbican-cloud.conf
+Restart=always
+RestartSec=5s
+User=root
+StateDirectory=kms
+StateDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

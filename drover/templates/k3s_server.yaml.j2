@@ -1,0 +1,332 @@
+#cloud-config
+# 주의: /api/ 경로는 레거시 유지 - cloud-init baked VM 호환 (dual-mount 보장)
+# k3s 서버(control plane) 노드 — 클러스터: {{ cluster_name }}
+
+package_update: true
+packages:
+  - curl
+  - jq
+{% if barbican_kms_enabled %}
+  # Barbican KMS plugin binary 추출용 — k3s containerd 와 무관하게 image pull
+  # (k3s ctr 는 containerd.sock 필요 → k3s.service 시작 후에만 가능 → KMS sock chicken-and-egg)
+  - podman
+  - file
+{% endif %}
+
+write_files:
+{% if cloud_conf %}
+  - path: /etc/kubernetes/cloud.conf
+    permissions: "0600"
+    content: |
+{{ cloud_conf | indent(6, first=True) }}
+
+{% endif %}
+{% for plugin in plugins %}
+  - path: /opt/k3s/{{ plugin.name }}-manifests.yaml
+    permissions: "0644"
+    content: |
+{{ plugin.content | indent(6, first=True) }}
+
+{% endfor %}
+{% for wf in extra_write_files %}
+  - path: {{ wf.path }}
+    permissions: "{{ wf.permissions }}"
+    content: |
+{{ wf.content | indent(6, first=True) }}
+
+{% endfor %}
+  - path: /opt/k3s/pin-primary-network.sh
+    permissions: "0750"
+    content: |
+{{ pin_script | indent(6, first=True) }}
+
+  - path: /usr/local/sbin/afterglow-nic-up.sh
+    permissions: "0750"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      IFACE="${1:-}"
+      [ -n "${IFACE}" ] || exit 0
+      [[ "${IFACE}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || exit 0
+      case "${IFACE}" in
+        lo|lo:*|cni*|flannel*|veth*|kube*|dummy*|tunl*) exit 0 ;;
+      esac
+      PIN_ENV="/etc/rancher/k3s/afterglow-primary-network.env"
+      for _second in $(seq 0 300); do
+        if [ -r "${PIN_ENV}" ]; then
+          . "${PIN_ENV}"
+          [[ "${AFTERGLOW_K3S_PRIMARY_IFACE:-}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] && break
+        fi
+        [ "${_second}" -lt 300 ] && sleep 1
+      done
+      [ -n "${AFTERGLOW_K3S_PRIMARY_IFACE:-}" ] || exit 1
+      [ "${IFACE}" = "${AFTERGLOW_K3S_PRIMARY_IFACE}" ] && exit 0
+      NETPLAN_FILE="/etc/netplan/90-afterglow-${IFACE}.yaml"
+      LOCK="/run/afterglow-nic.lock"
+      exec 9>"${LOCK}"
+      flock -x 9
+      BACKUP="${NETPLAN_FILE}.bak.$$"
+      TMP="${NETPLAN_FILE}.tmp.$$"
+      if [ -f "${NETPLAN_FILE}" ]; then
+        cp -p "${NETPLAN_FILE}" "${BACKUP}"
+      fi
+      umask 077
+      : > "${TMP}"
+      chmod 600 "${TMP}"
+      cat > "${TMP}" <<EOF
+      network:
+        version: 2
+        ethernets:
+          ${IFACE}:
+            dhcp4: true
+            dhcp6: false
+            link-local: []
+            optional: true
+            dhcp4-overrides:
+              use-routes: false
+              use-dns: false
+      EOF
+      mv -f -- "${TMP}" "${NETPLAN_FILE}"
+      echo "[afterglow-nic-up] ${IFACE}: applying netplan..." | systemd-cat -t afterglow-nic-up
+      if netplan apply 2>&1 | systemd-cat -t afterglow-nic-up; then
+        rm -f "${BACKUP}"
+        echo "[afterglow-nic-up] ${IFACE}: done" | systemd-cat -t afterglow-nic-up
+      else
+        if [ -f "${BACKUP}" ]; then
+          mv -f -- "${BACKUP}" "${NETPLAN_FILE}"
+        else
+          rm -f "${NETPLAN_FILE}"
+        fi
+        rm -f "${TMP}"
+        echo "[afterglow-nic-up] ${IFACE}: netplan apply failed, rolling back" | systemd-cat -t afterglow-nic-up
+      fi
+
+  - path: /etc/systemd/system/afterglow-nic-up@.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Afterglow NIC up handler for %i
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/afterglow-nic-up.sh %i
+      TimeoutStartSec=330s
+      StandardOutput=journal
+      StandardError=journal
+
+  - path: /etc/udev/rules.d/99-afterglow-nic.rules
+    permissions: "0644"
+    content: |
+      SUBSYSTEM=="net", ACTION=="add", KERNEL!="lo", KERNEL!="cni*", KERNEL!="flannel*", KERNEL!="veth*", KERNEL!="kube*", KERNEL!="dummy*", KERNEL!="tunl*", RUN+="/bin/systemctl --no-block start afterglow-nic-up@%k.service"
+
+  - path: /opt/k3s/callback.sh
+    permissions: "0750"
+    content: |
+      #!/bin/bash
+      set -e
+      set -o pipefail
+      CALLBACK_URL="{{ callback_url }}"
+      CALLBACK_TOKEN="{{ callback_token }}"
+      PIN_ENV="/etc/rancher/k3s/afterglow-primary-network.env"
+      if [ ! -r "${PIN_ENV}" ] || ! . "${PIN_ENV}" 2>/dev/null || \
+          [[ ! "${AFTERGLOW_K3S_NODE_IP:-}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || \
+          [[ ! "${AFTERGLOW_K3S_PRIMARY_IFACE:-}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]; then
+        echo "[k3s-callback] ERROR: primary network pin missing" | tee -a /var/log/k3s-callback.log
+        curl -sf -X POST "${CALLBACK_URL}/v1/callback" \
+          -H "Content-Type: application/json" \
+          -d "{\"token\": \"${CALLBACK_TOKEN}\", \"success\": false, \"error\": \"primary network pin missing\"}" || true
+        exit 1
+      fi
+
+      log() { echo "[k3s-callback] $*" | tee -a /var/log/k3s-callback.log; }
+
+      log "Waiting for k3s kubeconfig (up to 10 min)..."
+      for i in $(seq 1 120); do
+        if [ -f /etc/rancher/k3s/k3s.yaml ]; then
+          break
+        fi
+        sleep 5
+      done
+
+      if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
+        log "ERROR: kubeconfig not found after 10 minutes"
+        curl -sf -X POST "${CALLBACK_URL}/v1/callback" \
+          -H "Content-Type: application/json" \
+          -d "{\"token\": \"${CALLBACK_TOKEN}\", \"success\": false, \"error\": \"kubeconfig not found after 10min\"}" || true
+        exit 1
+      fi
+
+      # /livez 는 k8s 1.34부터 익명 요청에 401을 반환 — admin kubeconfig로 인증된 체크 사용
+      log "Waiting for kube-apiserver /livez (up to 10 min)..."
+      APISERVER_READY=0
+      for i in $(seq 1 120); do
+        if kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml --request-timeout=3s \
+            get --raw='/livez' >/dev/null 2>&1; then
+          APISERVER_READY=1
+          break
+        fi
+        sleep 5
+      done
+      if [ "${APISERVER_READY}" -ne 1 ]; then
+        log "ERROR: kube-apiserver /livez did not return OK after 10 min"
+        curl -sf -X POST "${CALLBACK_URL}/v1/callback" \
+          -H "Content-Type: application/json" \
+          -d "{\"token\": \"${CALLBACK_TOKEN}\", \"success\": false, \"error\": \"kube-apiserver not ready after 10min\"}" || true
+        exit 1
+      fi
+      log "kube-apiserver is ready"
+
+      # k3s 재시작 루프 감지 — NRestarts 카운터로 비정상 재시작 여부 판단
+      K3S_RESTARTS=$(systemctl show k3s.service -p NRestarts --value 2>/dev/null || echo "0")
+      RESTART_THRESHOLD=5
+      if [ "${K3S_RESTARTS}" -ge "${RESTART_THRESHOLD}" ]; then
+        log "ERROR: k3s가 ${K3S_RESTARTS}회 재시작됨 — 재시작 루프 감지 (임계: ${RESTART_THRESHOLD})"
+        curl -sf -X POST "${CALLBACK_URL}/v1/callback" \
+          -H "Content-Type: application/json" \
+          -d "{\"token\": \"${CALLBACK_TOKEN}\", \"success\": false, \"error\": \"k3s restart loop detected (${K3S_RESTARTS} restarts, threshold=${RESTART_THRESHOLD})\"}" || true
+        exit 1
+      fi
+      log "k3s restart count: ${K3S_RESTARTS} (threshold: ${RESTART_THRESHOLD}) — OK"
+
+      log "Waiting for node-token (up to 5 min)..."
+      for i in $(seq 1 60); do
+        if [ -f /var/lib/rancher/k3s/server/node-token ]; then
+          break
+        fi
+        sleep 5
+      done
+
+{% if cloud_conf %}
+      # cloud-config secret 생성 (플러그인 공통 1회)
+      log "Creating cloud-config secret..."
+      SECRET_CLOUD_CONFIG_STATUS="ok"
+      if ! kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml \
+          create secret -n kube-system generic cloud-config \
+          --from-file=cloud.conf=/etc/kubernetes/cloud.conf >> /var/log/k3s-callback.log 2>&1; then
+        SECRET_CLOUD_CONFIG_STATUS="failed"
+        log "WARNING: cloud-config secret 생성 실패 — OCCM이 시작되지 않을 수 있습니다"
+      fi
+
+{% endif %}
+{% for plugin in plugins %}
+      # 플러그인 배포: {{ plugin.name }}
+      PLUGIN_{{ plugin.name | upper }}_STATUS="not_deployed"
+      PLUGIN_{{ plugin.name | upper }}_ERROR=""
+      log "Deploying plugin: {{ plugin.name }}..."
+      _ERR_FILE="/var/log/k3s-callback-{{ plugin.name }}.stderr"
+      if kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml \
+          apply --validate=false -f /opt/k3s/{{ plugin.name }}-manifests.yaml \
+          >> /var/log/k3s-callback.log 2>"${_ERR_FILE}"; then
+        PLUGIN_{{ plugin.name | upper }}_STATUS="deployed"
+        log "Plugin {{ plugin.name }} deployed successfully"
+      else
+        PLUGIN_{{ plugin.name | upper }}_STATUS="failed"
+        PLUGIN_{{ plugin.name | upper }}_ERROR="$(tail -c 1024 "${_ERR_FILE}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+        log "ERROR: Plugin {{ plugin.name }} deployment failed — see ${_ERR_FILE}"
+      fi
+
+{% endfor %}
+      SERVER_IP="${AFTERGLOW_K3S_NODE_IP}"
+      KUBECONFIG_RAW=$(cat /etc/rancher/k3s/k3s.yaml)
+      # 127.0.0.1 → 실제 서버 IP로 치환
+      KUBECONFIG_FIXED=$(echo "${KUBECONFIG_RAW}" | sed "s/127\.0\.0\.1/${SERVER_IP}/g")
+      NODE_TOKEN=$(cat /var/lib/rancher/k3s/server/node-token 2>/dev/null || echo "")
+
+      log "Sending callback to ${CALLBACK_URL}"
+      PLUGIN_STATUS_JSON=$(jq -n \
+{% for plugin in plugins %}
+        --arg {{ plugin.name }}_st "${PLUGIN_{{ plugin.name | upper }}_STATUS}" \
+        --arg {{ plugin.name }}_er "${PLUGIN_{{ plugin.name | upper }}_ERROR}" \
+{% endfor %}
+{% if plugins %}
+        '{ {% for plugin in plugins %}{{ '"' ~ plugin.name ~ '"' }}: {status: ${{ plugin.name }}_st, error: ${{ plugin.name }}_er}{% if not loop.last %}, {% endif %}{% endfor %} }')
+{% else %}
+        '{}')
+{% endif %}
+
+      PAYLOAD=$(jq -n \
+        --arg token   "${CALLBACK_TOKEN}" \
+        --arg kc      "${KUBECONFIG_FIXED}" \
+        --arg nt      "${NODE_TOKEN}" \
+        --arg sip     "${SERVER_IP}" \
+        --argjson ps  "${PLUGIN_STATUS_JSON}" \
+        --arg scs     "${SECRET_CLOUD_CONFIG_STATUS:-}" \
+        '{token: $token, success: true, kubeconfig: $kc, node_token: $nt, server_ip: $sip, plugin_status: $ps, secret_cloud_config_status: ($scs | if . == "" then null else . end)}')
+
+      log "Payload size: $(echo -n "${PAYLOAD}" | wc -c) bytes"
+      HTTP_CODE=$(curl -s -o /tmp/callback_response.txt -w "%{http_code}" \
+        -X POST "${CALLBACK_URL}/v1/callback" \
+        -H "Content-Type: application/json" \
+        -d "${PAYLOAD}" --connect-timeout 10 --max-time 30 2>&1) || true
+      RESPONSE=$(cat /tmp/callback_response.txt 2>/dev/null || echo "")
+      if [ "${HTTP_CODE}" = "200" ]; then
+        log "Callback sent successfully (HTTP ${HTTP_CODE})"
+      else
+        log "ERROR: Callback failed (HTTP ${HTTP_CODE}): ${RESPONSE}"
+        # 재시도 (30초 후)
+        sleep 30
+        log "Retrying callback..."
+        curl -s -o /dev/null -w "Retry HTTP %{http_code}\n" \
+          -X POST "${CALLBACK_URL}/v1/callback" \
+          -H "Content-Type: application/json" \
+          -d "${PAYLOAD}" --connect-timeout 10 --max-time 30 >> /var/log/k3s-callback.log 2>&1 || true
+      fi
+
+runcmd:
+  - |
+    if ! /bin/bash /opt/k3s/pin-primary-network.sh; then
+      curl -sf -X POST {{ (callback_url ~ "/v1/callback") | shlex_quote }} \
+        -H "Content-Type: application/json" \
+        -d '{"token": {{ callback_token | shlex_quote }}, "success": false, "error": "primary network pin missing"}' || true
+      exit 1
+    fi
+  - udevadm control --reload-rules
+{% if barbican_kms_enabled %}
+  # KMS plugin 을 k3s 보다 먼저 install + start (sock 가 k3s 시작 전 존재해야 apiserver
+  # encryption-provider 가 정상 init). podman 사용으로 k3s containerd 의존성 제거.
+  - bash /opt/k3s/install_kms.sh
+  - systemctl daemon-reload
+  - systemctl enable --now barbican-kms.service
+  - |
+    echo "[k3s-server] waiting for /var/lib/kms/kms.sock (max 120s)..."
+    for i in $(seq 1 120); do
+      [ -S /var/lib/kms/kms.sock ] && break
+      sleep 1
+    done
+    if [ ! -S /var/lib/kms/kms.sock ]; then
+      echo "[k3s-server] ERROR: KMS sock not ready after 120s"
+      journalctl -u barbican-kms --no-pager -n 50
+      exit 1
+    fi
+    echo "[k3s-server] KMS sock ready, proceeding to k3s install"
+{% endif %}
+  - |
+    # k3s 서버 설치 (KMS sock 이 이미 존재해 자동 enable + start 가 정상 부팅)
+    . /etc/rancher/k3s/afterglow-primary-network.env
+    SERVER_IP="${AFTERGLOW_K3S_NODE_IP}"
+    curl -sfL https://get.k3s.io | \
+      INSTALL_K3S_VERSION={{ k3s_version | shlex_quote }} \
+      sh -s - server \
+        --tls-san "${SERVER_IP}" \
+{% for san in extra_tls_sans %}
+        --tls-san {{ san | shlex_quote }} \
+{% endfor %}
+        --write-kubeconfig-mode 644 \
+{% if cluster_init %}
+        --cluster-init \
+{% elif join_url %}
+        --server {{ join_url | shlex_quote }} \
+        --token {{ ha_node_token | shlex_quote }} \
+{% endif %}
+{% if needs_external_cloud_provider %}
+        --disable-cloud-controller \
+        --kubelet-arg="cloud-provider=external" \
+{% endif %}
+{% for arg in extra_server_args %}
+        {{ arg | shlex_quote }} \
+{% endfor %}
+        --node-name={{ server_node_name | shlex_quote }}
+  # 콜백 스크립트를 백그라운드 실행 (k3s 준비 대기 후 전송)
+  - nohup /opt/k3s/callback.sh > /var/log/k3s-callback.log 2>&1 &

@@ -1,0 +1,57 @@
+#!/bin/bash
+set -euo pipefail
+LOG="/var/log/k3s-agent.log"
+log() { echo "[k3s-agent] $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG"; }
+if ! /bin/bash /opt/k3s/pin-primary-network.sh; then
+  log "ERROR: primary network pin missing; retrying via systemd"
+  exit 1
+fi
+. /etc/rancher/k3s/afterglow-primary-network.env
+
+# 이미 k3s-agent가 실행 중이면 종료 (멱등성)
+if systemctl is-active --quiet k3s-agent 2>/dev/null; then
+  log "k3s-agent 이미 실행 중. 종료."
+  exit 0
+fi
+
+log "서버 API({{ server_ip }}:6443) 대기 시작..."
+SERVER_READY=false
+for i in $(seq 1 360); do
+  HTTP_CODE=$(curl -sk --connect-timeout 3 -o /dev/null -w '%{http_code}' https://{{ server_ip }}:6443/healthz 2>/dev/null || echo "000")
+  if [ "$HTTP_CODE" != "000" ] && [ "$HTTP_CODE" != "" ]; then
+    SERVER_READY=true
+    log "서버 API 준비 완료 (${i}회 시도, HTTP ${HTTP_CODE})"
+    break
+  fi
+  sleep 5
+done
+
+if [ "$SERVER_READY" != "true" ]; then
+  log "ERROR: 서버 API에 30분 내 연결 실패. systemd가 2분 후 재시도 예정."
+  exit 1
+fi
+
+NODE_IP="${AFTERGLOW_K3S_NODE_IP}"
+log "k3s 에이전트 설치 시작 (버전: {{ k3s_version }}, node-ip: ${NODE_IP})..."
+_EXEC_ARGS="agent{% for arg in extra_agent_args %} {{ arg | shlex_quote }}{% endfor %}"
+curl -sfL https://get.k3s.io | \
+  INSTALL_K3S_VERSION={{ k3s_version | shlex_quote }} \
+  K3S_URL={{ ('https://' ~ server_ip ~ ':6443') | shlex_quote }} \
+  K3S_TOKEN={{ node_token | shlex_quote }} \
+  INSTALL_K3S_SKIP_SELINUX_RPM=true \
+  INSTALL_K3S_EXEC="${_EXEC_ARGS}" \
+  sh - 2>&1 | tee -a "$LOG"
+
+log "k3s-agent 서비스 활성화 대기 중..."
+for i in $(seq 1 60); do
+  if systemctl is-active --quiet k3s-agent 2>/dev/null; then
+    log "k3s-agent 서비스 정상 실행 중. 클러스터 join 완료."
+    exit 0
+  fi
+  sleep 5
+done
+
+log "WARNING: k3s-agent 서비스가 5분 내 활성화되지 않음. 재시도 예정."
+systemctl status k3s-agent >> "$LOG" 2>&1 || true
+journalctl -u k3s-agent --no-pager -n 50 >> "$LOG" 2>&1 || true
+exit 1

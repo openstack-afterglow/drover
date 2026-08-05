@@ -1,0 +1,40 @@
+#!/bin/bash
+# Barbican KMS plugin binary install — podman 으로 image pull 후 binary 추출.
+#
+# 왜 podman 인가: k3s 의 ctr 는 containerd.sock 필요 → containerd 는 k3s.service
+# subprocess → k3s.service 는 KMS sock 필요 → 데드락. podman 은 daemon-less,
+# k3s 와 무관하게 동작. cloud-init `packages:` 에 미리 install 됨.
+#
+# 호출 시점: cloud-init runcmd 의 첫 단계 (k3s install 전).
+set -euo pipefail
+
+KMS_IMAGE="{{ kms_image }}"
+KMS_BIN_DEST=/usr/local/bin/barbican-kms-plugin
+
+log() { echo "[install_kms] $*"; }
+
+if [ -x "$KMS_BIN_DEST" ]; then
+  log "binary 이미 install 됨: $KMS_BIN_DEST"
+else
+  log "image pull: $KMS_IMAGE"
+  podman pull "$KMS_IMAGE"
+
+  log "binary 추출"
+  TMPCONTAINER=$(podman create "$KMS_IMAGE")
+  trap 'podman rm "$TMPCONTAINER" >/dev/null 2>&1 || true' EXIT
+  podman cp "$TMPCONTAINER:/bin/barbican-kms-plugin" "$KMS_BIN_DEST"
+  chmod +x "$KMS_BIN_DEST"
+  podman rm "$TMPCONTAINER" >/dev/null
+  trap - EXIT
+
+  # binary 가 정상 ELF 인지 검증 (image entrypoint 가 wrapper 인 경우 fail-fast)
+  if ! file "$KMS_BIN_DEST" | grep -q "ELF.*executable"; then
+    log "ERROR: $KMS_BIN_DEST 가 정상 ELF binary 아님:"
+    file "$KMS_BIN_DEST"
+    exit 1
+  fi
+  log "install 완료: $KMS_BIN_DEST"
+fi
+
+mkdir -p /var/lib/kms
+chmod 0755 /var/lib/kms

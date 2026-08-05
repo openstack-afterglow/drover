@@ -1,0 +1,30 @@
+[Global]
+auth-url={{ auth_url }}
+region={{ region }}
+{% if app_credential_id %}
+# § PR1 — application credential 인증 (admin password 노출 차단).
+# app credential 은 cluster 생성 시 발급되며 cluster 삭제 시 회수됨.
+application-credential-id={{ app_credential_id }}
+application-credential-secret={{ app_credential_secret }}
+{% else %}
+# Fallback — admin password 인증 (PR1 land 전 호환). cluster 노드의 file 권한 0600 으로
+# 노출 위험 최소화. 신규 cluster 는 app_credential 경로 사용 권장.
+username={{ username }}
+password={{ password }}
+domain-name={{ user_domain_name }}
+tenant-name={{ project_name }}
+{% if project_domain_name %}
+project-domain-name={{ project_domain_name }}
+{% endif %}
+{% endif %}
+{% if ca_file %}
+ca-file={{ ca_file }}
+{% endif %}
+
+[KeyManager]
+use-barbican=true
+{% if kek_id %}
+# Per-project KEK (PR2 동적 발급) 또는 글로벌 fallback (settings.k3s_barbican_kms_kek_id).
+# barbican-kms-plugin 은 이 key-id 를 통해 Barbican secret 을 KEK 으로 사용.
+key-id={{ kek_id }}
+{% endif %}
