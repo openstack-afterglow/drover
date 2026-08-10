@@ -169,7 +169,7 @@ async def resolve_policy_snapshot(*, conn, keys: tuple[str, ...]) -> dict[str, d
         raise ResourcePolicyValidationError(f"required resource policies are not configured: {', '.join(missing)}")
 
     resolved: dict[str, dict[str, str]] = {}
-    for key, spec in specs.items():
+    for key, _spec in specs.items():
         selected = await validate_existing_selection(conn, key, stored[key]["id"])
         resolved[key] = {"id": selected["id"], "name": selected["name"]}
     return resolved

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
 from drover.utils.ssh_keys import validate_ssh_public_key
 
 TEMPLATE_DIR = Path(__file__).parent.parent / "templates"

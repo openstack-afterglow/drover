@@ -756,7 +756,6 @@ async def _scale_down_nodegroup(
     s,
 ) -> None:
     """nodegroup의 유휴 노드를 cordon→drain→삭제한다."""
-    from drover.services import autoscale as k3s_autoscale
     from drover.services import nodegroup as k3s_nodegroup
 
     ng_id = nodegroup["id"]

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
 import logging
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
 from fastapi import Depends, Header, HTTPException, Request
@@ -146,7 +146,7 @@ def get_admin_connection_for_project(project_id: str):
         api_timeout=30,
         verify=settings.ssl_verify,
     )
-    setattr(conn, "_afterglow_project_id", project_id)
+    conn._afterglow_project_id = project_id
     return conn
 
 
@@ -172,9 +172,9 @@ async def get_os_conn(
             api_timeout=30,
             verify=settings.ssl_verify,
         )
-        setattr(conn, "_afterglow_token", scoped_token)
-        setattr(conn, "_afterglow_project_id", project_id)
-        setattr(conn, "_afterglow_user_id", token_info.get("user_id", ""))
+        conn._afterglow_token = scoped_token
+        conn._afterglow_project_id = project_id
+        conn._afterglow_user_id = token_info.get("user_id", "")
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid scoped Keystone token") from None
 

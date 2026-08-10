@@ -3,7 +3,6 @@
 import os
 from unittest.mock import patch
 
-
 from drover import config
 
 

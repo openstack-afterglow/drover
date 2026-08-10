@@ -22,7 +22,6 @@ from slowapi.util import get_remote_address
 from sqlalchemy.exc import InterfaceError, OperationalError
 from starlette.requests import Request
 
-from drover.services.activity import rec
 from drover.auth import CacheMode, cache_mode, get_os_conn, get_token_info
 from drover.config import get_settings
 from drover.db import mark_db_unhealthy
@@ -37,16 +36,23 @@ from drover.models.schemas import (
 )
 from drover.services import (
     cinder,
-    cloudinit as k3s_cloudinit,
-    kube as k3s_kube,
     neutron,
     nova,
     octavia,
-    plugins as k3s_plugins,
+)
+from drover.services import (
+    cloudinit as k3s_cloudinit,
 )
 from drover.services import instance_orchestration as _instance_orch
-from drover.services import store as k3s_cluster
 from drover.services import jobs as _jobs
+from drover.services import (
+    kube as k3s_kube,
+)
+from drover.services import (
+    plugins as k3s_plugins,
+)
+from drover.services import store as k3s_cluster
+from drover.services.activity import rec
 from drover.services.cache import cached_call, invalidate, ttl_normal, ttl_slow
 from drover.services.cache import invalidation as cache_invalidation
 from drover.services.cache import keys as cache_keys

@@ -6,9 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from drover.auth import get_token_info
 from drover.models.schemas import CreateK3sNodegroupRequest, K3sNodegroupInfo, UpdateK3sNodegroupRequest
-from drover.services import store as k3s_db
-from drover.services import nodegroup as _svc
 from drover.services import jobs as _jobs
+from drover.services import nodegroup as _svc
+from drover.services import store as k3s_db
 
 router = APIRouter()
 _logger = logging.getLogger(__name__)

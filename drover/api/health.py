@@ -13,8 +13,8 @@ from slowapi.util import get_remote_address
 from drover.auth import get_token_info
 from drover.models.schemas import K3sClusterHealth
 from drover.rate_limit import limiter
-from drover.services import store as k3s_cluster
 from drover.services import health as k3s_health
+from drover.services import store as k3s_cluster
 
 router = APIRouter()
 _logger = logging.getLogger(__name__)

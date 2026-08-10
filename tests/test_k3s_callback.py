@@ -187,7 +187,7 @@ async def test_callback_stores_plugin_status_dict():
             mock_db.update_cluster_status = AsyncMock()
             mock_db.store_kubeconfig = AsyncMock()
             mock_db.get_cluster = AsyncMock(return_value={"master_count": 1})
-            resp = await ac.post(
+            await ac.post(
                 "/v1/callback",
                 json={
                     "token": "valid-token",
@@ -219,7 +219,7 @@ async def test_callback_accepts_legacy_string_plugin_status():
             mock_db.update_cluster_status = AsyncMock()
             mock_db.store_kubeconfig = AsyncMock()
             mock_db.get_cluster = AsyncMock(return_value={"master_count": 1})
-            resp = await ac.post(
+            await ac.post(
                 "/v1/callback",
                 json={
                     "token": "valid-token",

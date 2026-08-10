@@ -24,7 +24,8 @@ def _rand_suffix(length: int = 5) -> str:
 async def provision_agents(project_id: str, cluster_id: str, server_ip: str, node_token: str) -> None:
     """에이전트 VM을 모두 생성하고 클러스터 상태를 ACTIVE로 전환한다."""
     from drover.config import get_settings
-    from drover.services import cinder, cloudinit as k3s_cloudinit, keystone, nova
+    from drover.services import cinder, keystone, nova
+    from drover.services import cloudinit as k3s_cloudinit
 
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     if not cluster:
@@ -153,10 +154,14 @@ async def bootstrap_ha_servers(
     from drover.config import get_settings
     from drover.services import (
         cinder,
-        cloudinit as k3s_cloudinit,
         keystone,
         nova,
         octavia,
+    )
+    from drover.services import (
+        cloudinit as k3s_cloudinit,
+    )
+    from drover.services import (
         plugins as k3s_plugins,
     )
 

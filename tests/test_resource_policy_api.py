@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from drover.main import app
 from drover.api.resource_policies import get_admin_os_conn
+from drover.main import app
 from drover.services.resource_policies import ResourcePolicyValidationError
 
 pytestmark = pytest.mark.asyncio

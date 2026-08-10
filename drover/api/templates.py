@@ -5,7 +5,11 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 
 from drover.auth import get_token_info, require_admin
-from drover.models.schemas import CreateK3sClusterTemplateRequest, K3sClusterTemplateInfo, UpdateK3sClusterTemplateRequest
+from drover.models.schemas import (
+    CreateK3sClusterTemplateRequest,
+    K3sClusterTemplateInfo,
+    UpdateK3sClusterTemplateRequest,
+)
 from drover.services import template as _svc
 
 router = APIRouter()

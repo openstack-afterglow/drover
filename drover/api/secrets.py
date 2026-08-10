@@ -12,11 +12,11 @@ if TYPE_CHECKING:
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from drover.services.activity import rec
 from drover.auth import get_os_conn, get_token_info
 from drover.models.schemas import SecretCreateRequest, SecretInfo, SecretWriteRequest
-from drover.services import store as k3s_cluster
 from drover.services import kube as k3s_kube
+from drover.services import store as k3s_cluster
+from drover.services.activity import rec
 from drover.services.cache import invalidate
 
 router = APIRouter()

@@ -36,14 +36,22 @@ async def provision_nodegroup_vms(
     """
     from drover.services import (
         cinder,
-        cloudinit as k3s_cloudinit,
         keystone,
-        nodegroup as k3s_nodegroup,
         nova,
+    )
+    from drover.services import (
+        cloudinit as k3s_cloudinit,
+    )
+    from drover.services import (
+        nodegroup as k3s_nodegroup,
+    )
+    from drover.services import (
         plugins as k3s_plugins,
-        store as k3s_db,
     )
     from drover.services import redis_store as k3s_cluster_svc
+    from drover.services import (
+        store as k3s_db,
+    )
 
     s = get_settings()
 
@@ -170,7 +178,9 @@ async def delete_nodegroup_vms(
 
     vm_entries: [{"vm_id": ..., "name": ...}, ...]
     """
-    from drover.services import keystone, kube as k3s_kube, nodegroup as k3s_nodegroup, nova
+    from drover.services import keystone, nova
+    from drover.services import kube as k3s_kube
+    from drover.services import nodegroup as k3s_nodegroup
 
     # cordon + drain
     node_names = [e["name"] for e in vm_entries if e.get("name")]

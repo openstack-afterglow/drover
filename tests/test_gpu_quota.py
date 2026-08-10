@@ -3,7 +3,6 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
 
 from drover.services.gpu_quota import (
     DEFAULT_PROJECT_ID,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import uuid
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -38,7 +38,7 @@ class K3sClusterHealth(BaseModel):
     reachability: str
 
 
-class K3sProgressStep(str, Enum):
+class K3sProgressStep(StrEnum):
     SECURITY_GROUP = "security_group"
     SERVER_VOLUME = "server_volume"
     SERVER_CREATING = "server_creating"
