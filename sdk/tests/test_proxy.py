@@ -76,6 +76,7 @@ JSON_METHOD_TABLE = [
         None,
         {"limit": 10},
     ),
+    ("clusters_health", (), {}, "GET", "/v1/clusters/health", None, None),
     ("cluster_health", ("cluster-1",), {}, "GET", "/v1/clusters/cluster-1/health", None, None),
     ("check_cluster_health", ("cluster-1",), {}, "POST", "/v1/clusters/cluster-1/health/check", None, None),
     (
@@ -319,15 +320,6 @@ JSON_METHOD_TABLE = [
     ),
     ("delete_cluster_template", ("tmpl-1",), {}, "DELETE", "/v1/cluster-templates/tmpl-1", None, None),
     ("cluster_stats", (), {}, "GET", "/v1/stats/clusters", None, None),
-    (
-        "cluster_stats",
-        (),
-        {"project_id": "proj-1"},
-        "GET",
-        "/v1/stats/clusters",
-        None,
-        {"project_id": "proj-1"},
-    ),
     ("admin_clusters", (), {}, "GET", "/v1/admin/clusters", None, None),
     (
         "admin_clusters",

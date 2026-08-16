@@ -553,3 +553,28 @@ class PodLogResponse(BaseModel):
     namespace: str
     container: str | None = None
     log: str
+
+
+class VersionLink(BaseModel):
+    rel: str
+    href: str
+
+
+class VersionDocument(BaseModel):
+    id: str
+    status: str
+    min_version: str
+    version: str
+    links: list[VersionLink]
+
+
+class RootDiscoveryResponse(BaseModel):
+    versions: list[VersionDocument]
+
+
+class VersionDiscoveryResponse(BaseModel):
+    version: VersionDocument
+
+
+class HealthResponse(BaseModel):
+    status: str = Field(default="ok")

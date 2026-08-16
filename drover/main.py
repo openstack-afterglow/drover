@@ -33,6 +33,11 @@ from drover.api import (
 from drover.cache import close_cache
 from drover.config import get_settings
 from drover.db import close_db, init_db
+from drover.models.schemas import (
+    HealthResponse,
+    RootDiscoveryResponse,
+    VersionDiscoveryResponse,
+)
 from drover.rate_limit import limiter
 from drover.services.errors import K3sApiError
 
@@ -68,9 +73,9 @@ async def k3s_api_error_handler(request: Request, exc: K3sApiError):
 
 app.add_middleware(SlowAPIMiddleware)
 
-# Routers mounted under /v1 (clusters router included BEFORE health router per route-order contract)
-app.include_router(clusters.router, prefix="/v1/clusters", tags=["clusters"])
+# Routers mounted under /v1 (health router included BEFORE clusters router so /v1/clusters/health matches before /{cluster_id})
 app.include_router(health.router, prefix="/v1/clusters", tags=["health"])
+app.include_router(clusters.router, prefix="/v1/clusters", tags=["clusters"])
 app.include_router(callback.router, prefix="/v1", tags=["callback"])
 app.include_router(configmaps.router, prefix="/v1/clusters", tags=["configmaps"])
 app.include_router(secrets.router, prefix="/v1/clusters", tags=["secrets"])
@@ -99,17 +104,32 @@ def _version_document(request: Request) -> dict:
     }
 
 
-@app.get("/", include_in_schema=False)
+@app.get(
+    "/",
+    response_model=RootDiscoveryResponse,
+    summary="Root version discovery",
+    description="Get available API versions.",
+)
 async def root_discovery(request: Request):
     return {"versions": [_version_document(request)]}
 
 
-@app.get("/v1/", include_in_schema=False)
+@app.get(
+    "/v1/",
+    response_model=VersionDiscoveryResponse,
+    summary="V1 version discovery",
+    description="Get API v1 version document.",
+)
 async def version_discovery(request: Request):
     return {"version": _version_document(request)}
 
 
-@app.get("/v1/health", include_in_schema=False)
+@app.get(
+    "/v1/health",
+    response_model=HealthResponse,
+    summary="Service health check",
+    description="Get service health status.",
+)
 async def health_check():
     return {"status": "ok"}
 

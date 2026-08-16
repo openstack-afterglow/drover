@@ -157,7 +157,7 @@ async def get_k3s_cluster(
     return await cached_call(cache_key, ttl_normal(), _fetch, enabled=cm.enabled, refresh=cm.refresh)
 
 
-@router.api_route("/{cluster_id}/kubeconfig", methods=["GET", "HEAD"])
+@router.get("/{cluster_id}/kubeconfig", operation_id="download_kubeconfig")
 async def download_kubeconfig(
     request: Request,
     cluster_id: str,
@@ -236,6 +236,17 @@ async def download_kubeconfig(
         media_type="application/yaml",
         headers={"Content-Disposition": f'attachment; filename="kubeconfig-{cluster_name}.yaml"'},
     )
+
+
+@router.head("/{cluster_id}/kubeconfig", operation_id="head_kubeconfig")
+async def head_kubeconfig(
+    request: Request,
+    cluster_id: str,
+    token_info: dict = Depends(get_token_info),
+    cm: CacheMode = Depends(cache_mode),
+):
+    """kubeconfig 메타데이터 조회 (HEAD)."""
+    return await download_kubeconfig(request, cluster_id, token_info, cm)
 
 
 @router.post("/async")
@@ -828,8 +839,6 @@ async def scale_k3s_cluster(
         extra={"desired_count": desired},
     )
     return {"message": f"스케일링 시작: {current} → {desired}", "agent_count": desired}
-
-
 
 
 async def _delete_cluster_progress(

@@ -78,9 +78,7 @@ class Proxy(proxy.Proxy):
         return self._stream_request("POST", f"/v1/clusters/{_segment(cluster_id)}/delete-async")
 
     def node_interfaces(self, cluster_id, vm_id):
-        return self._json_request(
-            "GET", f"/v1/clusters/{_segment(cluster_id)}/nodes/{_segment(vm_id)}/interfaces"
-        )
+        return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/nodes/{_segment(vm_id)}/interfaces")
 
     def attach_node_interface(self, cluster_id, vm_id, **attrs):
         return self._json_request(
@@ -105,9 +103,10 @@ class Proxy(proxy.Proxy):
         return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/stampede")
 
     def stampede_events(self, cluster_id, **query):
-        return self._json_request(
-            "GET", f"/v1/clusters/{_segment(cluster_id)}/stampede/events", params=_query(**query)
-        )
+        return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/stampede/events", params=_query(**query))
+
+    def clusters_health(self):
+        return self._json_request("GET", "/v1/clusters/health")
 
     def cluster_health(self, cluster_id):
         return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/health")
@@ -133,9 +132,7 @@ class Proxy(proxy.Proxy):
         return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/namespaces")
 
     def configmaps(self, cluster_id, **query):
-        return self._json_request(
-            "GET", f"/v1/clusters/{_segment(cluster_id)}/configmaps", params=_query(**query)
-        )
+        return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/configmaps", params=_query(**query))
 
     def get_configmap(self, cluster_id, namespace, name):
         return self._json_request(
@@ -164,9 +161,7 @@ class Proxy(proxy.Proxy):
         )
 
     def secrets(self, cluster_id, **query):
-        return self._json_request(
-            "GET", f"/v1/clusters/{_segment(cluster_id)}/secrets", params=_query(**query)
-        )
+        return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/secrets", params=_query(**query))
 
     def get_secret(self, cluster_id, namespace, name):
         return self._json_request(
@@ -195,9 +190,7 @@ class Proxy(proxy.Proxy):
         )
 
     def pods(self, cluster_id, namespace):
-        return self._json_request(
-            "GET", f"/v1/clusters/{_segment(cluster_id)}/namespaces/{_segment(namespace)}/pods"
-        )
+        return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/namespaces/{_segment(namespace)}/pods")
 
     def delete_pod(self, cluster_id, namespace, name):
         return self._json_request(
@@ -243,8 +236,7 @@ class Proxy(proxy.Proxy):
     def scale_deployment(self, cluster_id, namespace, name, **attrs):
         return self._json_request(
             "PATCH",
-            f"/v1/clusters/{_segment(cluster_id)}/namespaces/{_segment(namespace)}"
-            f"/deployments/{_segment(name)}/scale",
+            f"/v1/clusters/{_segment(cluster_id)}/namespaces/{_segment(namespace)}/deployments/{_segment(name)}/scale",
             body=attrs,
         )
 
@@ -254,14 +246,10 @@ class Proxy(proxy.Proxy):
         return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/nodegroups")
 
     def get_nodegroup(self, cluster_id, nodegroup_id):
-        return self._json_request(
-            "GET", f"/v1/clusters/{_segment(cluster_id)}/nodegroups/{_segment(nodegroup_id)}"
-        )
+        return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/nodegroups/{_segment(nodegroup_id)}")
 
     def create_nodegroup(self, cluster_id, **attrs):
-        return self._json_request(
-            "POST", f"/v1/clusters/{_segment(cluster_id)}/nodegroups", body=attrs
-        )
+        return self._json_request("POST", f"/v1/clusters/{_segment(cluster_id)}/nodegroups", body=attrs)
 
     def update_nodegroup(self, cluster_id, nodegroup_id, **attrs):
         return self._json_request(
@@ -271,9 +259,7 @@ class Proxy(proxy.Proxy):
         )
 
     def delete_nodegroup(self, cluster_id, nodegroup_id):
-        return self._json_request(
-            "DELETE", f"/v1/clusters/{_segment(cluster_id)}/nodegroups/{_segment(nodegroup_id)}"
-        )
+        return self._json_request("DELETE", f"/v1/clusters/{_segment(cluster_id)}/nodegroups/{_segment(nodegroup_id)}")
 
     # -- Cluster templates --------------------------------------------------
 
@@ -287,17 +273,15 @@ class Proxy(proxy.Proxy):
         return self._json_request("POST", "/v1/cluster-templates", body=attrs)
 
     def update_cluster_template(self, template_id, **attrs):
-        return self._json_request(
-            "PATCH", f"/v1/cluster-templates/{_segment(template_id)}", body=attrs
-        )
+        return self._json_request("PATCH", f"/v1/cluster-templates/{_segment(template_id)}", body=attrs)
 
     def delete_cluster_template(self, template_id):
         return self._json_request("DELETE", f"/v1/cluster-templates/{_segment(template_id)}")
 
     # -- Stats --------------------------------------------------------------
 
-    def cluster_stats(self, **query):
-        return self._json_request("GET", "/v1/stats/clusters", params=_query(**query))
+    def cluster_stats(self):
+        return self._json_request("GET", "/v1/stats/clusters")
 
     # -- Admin ----------------------------------------------------------------
 
@@ -311,9 +295,7 @@ class Proxy(proxy.Proxy):
         return self._text_request("GET", f"/v1/admin/clusters/{_segment(cluster_id)}/kubeconfig")
 
     def admin_scale_cluster(self, cluster_id, **attrs):
-        return self._json_request(
-            "PATCH", f"/v1/admin/clusters/{_segment(cluster_id)}/scale", body=attrs
-        )
+        return self._json_request("PATCH", f"/v1/admin/clusters/{_segment(cluster_id)}/scale", body=attrs)
 
     def admin_delete_cluster(self, cluster_id):
         return self._json_request("DELETE", f"/v1/admin/clusters/{_segment(cluster_id)}")
@@ -383,7 +365,9 @@ class Proxy(proxy.Proxy):
         return self._json_request("GET", f"/v1/admin/gpu-quotas/{_segment(project_id)}")
 
     def set_project_gpu_quota(self, project_id: str, gpu_type: str, limit: int):
-        return self._json_request("PUT", f"/v1/admin/gpu-quotas/{_segment(project_id)}", body={"gpu_type": gpu_type, "limit": limit})
+        return self._json_request(
+            "PUT", f"/v1/admin/gpu-quotas/{_segment(project_id)}", body={"gpu_type": gpu_type, "limit": limit}
+        )
 
     def delete_project_gpu_quota(self, project_id: str, gpu_type: str):
         return self._json_request("DELETE", f"/v1/admin/gpu-quotas/{_segment(project_id)}/{_segment(gpu_type)}")

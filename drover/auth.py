@@ -8,6 +8,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
 from fastapi import Depends, Header, HTTPException, Request
+from fastapi.security import APIKeyHeader
 from keystoneauth1 import session as ks_session
 from keystoneauth1.identity import v3
 
@@ -15,6 +16,12 @@ from drover.config import get_settings
 
 _logger = logging.getLogger(__name__)
 _admin_role_id_cache: str | None = None
+keystone_token_scheme = APIKeyHeader(
+    name="X-Auth-Token",
+    auto_error=False,
+    scheme_name="KeystoneToken",
+    description="Keystone authentication token",
+)
 
 
 @dataclass
@@ -101,7 +108,7 @@ def validate_token(token: str, project_id: str = "") -> dict:
 
 async def require_token(
     request: Request,
-    x_auth_token: str | None = Header(default=None, alias="X-Auth-Token"),
+    x_auth_token: str | None = Depends(keystone_token_scheme),
     x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
 ) -> dict:
     if not x_auth_token:
