@@ -23,6 +23,17 @@ def _query(**kwargs: object) -> dict | None:
 
 
 class Proxy(proxy.Proxy):
+    """Catalog-relative proxy for a Keystone endpoint already resolved at ``/v1``."""
+
+    def request(self, url, method, *args, **kwargs):
+        if url == "/v1":
+            url = "/"
+        elif url.startswith("/v1/"):
+            url = url[3:]
+        elif url.startswith(("/v1?", "/v1#")):
+            url = "/" + url[3:]
+        return super().request(url, method, *args, **kwargs)
+
     def _json_request(self, method: str, path: str, *, body: dict | None = None, params: dict | None = None):
         kwargs: dict = {}
         if body is not None:

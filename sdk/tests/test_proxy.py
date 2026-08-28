@@ -449,7 +449,9 @@ STREAM_METHOD_TABLE = [
     ("admin_rotate_certs", ("cluster-1",), "POST", "/v1/admin/clusters/cluster-1/rotate-certs"),
 ]
 
-_PUBLIC_PROXY_METHODS = {name for name in vars(Proxy) if not name.startswith("_") and callable(getattr(Proxy, name))}
+_PUBLIC_PROXY_METHODS = {
+    name for name in vars(Proxy) if name != "request" and not name.startswith("_") and callable(getattr(Proxy, name))
+}
 
 
 def test_route_tables_cover_every_public_proxy_method():
@@ -535,6 +537,44 @@ def test_gpu_quota_identifiers_are_escaped_in_paths():
         "GET",
         raise_exc=True,
     )
+
+
+def test_gpu_quota_request_uses_catalog_relative_path(monkeypatch):
+    request = MagicMock(return_value=_response(200, payload={"ok": True}))
+    monkeypatch.setattr("openstack.proxy.Proxy.request", request)
+    catalog_proxy = Proxy(session=MagicMock(), service_type="drover")
+
+    result = catalog_proxy.check_gpu_quota({"pci_passthrough:alias": "GTX-1080ti:1"})
+
+    request.assert_called_once_with(
+        "/gpu-quotas/check",
+        "POST",
+        raise_exc=True,
+        json={"extra_specs": {"pci_passthrough:alias": "GTX-1080ti:1"}},
+    )
+    assert result == {"ok": True}
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("/v1", "/"),
+        ("/v1/", "/"),
+        ("/v1/clusters", "/clusters"),
+        ("/v1?detail=true", "/?detail=true"),
+        ("/v1#versions", "/#versions"),
+        ("/v10/clusters", "/v10/clusters"),
+        ("https://drover.example/v1/clusters", "https://drover.example/v1/clusters"),
+    ],
+)
+def test_request_normalizes_only_catalog_version_prefix(monkeypatch, url, expected):
+    request = MagicMock(return_value=_response(200, payload={"ok": True}))
+    monkeypatch.setattr("openstack.proxy.Proxy.request", request)
+    catalog_proxy = Proxy(session=MagicMock(), service_type="drover")
+
+    catalog_proxy.request(url, "GET", "request failed", True)
+
+    request.assert_called_once_with(expected, "GET", "request failed", True)
 
 
 def test_service_description_constructs_with_required_service_type():
