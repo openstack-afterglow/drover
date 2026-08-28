@@ -62,14 +62,14 @@ jobs:
           load: true
           tags: drover-worker:local
       - name: Scan drover-api image for vulnerabilities
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           image-ref: drover-api:local
           format: table
           exit-code: '0'
           severity: CRITICAL,HIGH
       - name: Scan drover-worker image for vulnerabilities
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           image-ref: drover-worker:local
           format: table
@@ -111,7 +111,7 @@ jobs:
           OS_AUTH_URL: http://127.0.0.1:5000/v3
           OS_USERNAME: admin
           OS_PASSWORD: secret
-        run: uv run drover-migrate
+        run: uv run drover-migrate --apply
       - name: Verify API and worker readiness smoke against MariaDB and Redis
         env:
           DATABASE_URL: mysql+aiomysql://drover:droverpass@127.0.0.1:3306/drover

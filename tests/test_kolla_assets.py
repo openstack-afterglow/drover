@@ -1,5 +1,6 @@
 """Tests for Kolla-Ansible deployment assets under deploy/kolla/."""
 
+import json
 from pathlib import Path
 
 import jinja2
@@ -110,6 +111,9 @@ def test_migration_admission_ordering():
     bootstrap_idx = imported_files.index("bootstrap.yml")
     deploy_idx = imported_files.index("deploy.yml")
     assert bootstrap_idx < deploy_idx, "bootstrap.yml (migration gate) must precede deploy.yml"
+
+    migration_container = json.loads((KOLLA_DIR / "templates" / "drover-migrate.json.j2").read_text(encoding="utf-8"))
+    assert migration_container["command"] == "drover-migrate --apply"
 
 
 def test_keystone_registration_tasks_structure():

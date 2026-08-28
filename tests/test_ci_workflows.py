@@ -43,6 +43,10 @@ def test_ci_workflow_structure():
 
     trivy_steps = [s for s in steps if "trivy-action" in s.get("uses", "")]
     assert len(trivy_steps) >= 2, "Expected Trivy scanning steps for both Docker targets"
+    assert all(
+        s["uses"] == "aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1"
+        for s in trivy_steps
+    ), "Trivy action must use the immutable known-safe 0.35.0 revision"
 
     # Validate db-migration-and-readiness services & steps
     db_job = jobs["db-migration-and-readiness"]
@@ -55,6 +59,7 @@ def test_ci_workflow_structure():
     db_steps = db_job.get("steps", [])
     migrate_step = next((s for s in db_steps if "drover-migrate" in s.get("run", "")), None)
     assert migrate_step is not None, "Missing drover-migrate step in db-migration-and-readiness job"
+    assert migrate_step["run"] == "uv run drover-migrate --apply"
 
     readiness_step = next((s for s in db_steps if "readiness_checks" in s.get("run", "")), None)
     assert readiness_step is not None, "Missing readiness check smoke step"
