@@ -66,6 +66,8 @@ class K3sProgressMessage(BaseModel):
     progress: int
     message: str
     cluster_id: str | None = None
+    operation_id: str | None = None
+    sequence: int | None = None
     error: str | None = None
     elapsed_seconds: float | None = None
 
@@ -150,6 +152,8 @@ class K3sClusterInfo(BaseModel):
     os_type: str | None = None
     master_count: int = 1
     stampede_enabled: bool = False
+    last_reconciled_at: str | None = None
+    drift_status: dict | None = None
 
 
 class K3sClusterInfoDeleted(K3sClusterInfo):
@@ -409,6 +413,8 @@ class CreateK3sNodegroupRequest(BaseModel):
             raise ValueError("Stampede 노드그룹은 flavor_id가 필요합니다")
         if self.min_size > self.max_size:
             raise ValueError("min_size는 max_size보다 클 수 없습니다")
+        if self.node_count < self.min_size or self.node_count > self.max_size:
+            raise ValueError(f"node_count ({self.node_count})는 min_size ({self.min_size})와 max_size ({self.max_size}) 범위 밖입니다")
         return self
 
 
@@ -461,6 +467,11 @@ class UpdateK3sNodegroupRequest(BaseModel):
             raise ValueError("Stampede 노드그룹은 flavor_id가 필요합니다")
         if self.min_size is not None and self.max_size is not None and self.min_size > self.max_size:
             raise ValueError("min_size는 max_size보다 클 수 없습니다")
+        if self.node_count is not None:
+            if self.min_size is not None and self.node_count < self.min_size:
+                raise ValueError(f"node_count ({self.node_count})는 min_size ({self.min_size})보다 작을 수 없습니다")
+            if self.max_size is not None and self.node_count > self.max_size:
+                raise ValueError(f"node_count ({self.node_count})는 max_size ({self.max_size})보다 클 수 없습니다")
         return self
 
 
@@ -578,3 +589,48 @@ class VersionDiscoveryResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str = Field(default="ok")
+
+class ReadinessResponse(BaseModel):
+    status: str
+    checks: dict[str, str]
+
+
+class DroverOperationInfo(BaseModel):
+    id: str
+    project_id: str
+    cluster_id: str | None = None
+    kind: str
+    status: str
+    request_id: str | None = None
+    idempotency_key: str | None = None
+    request_hash: str | None = None
+    error: str | None = None
+    created_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+class DroverOperationEventInfo(BaseModel):
+    id: str
+    operation_id: str
+    sequence: int
+    phase: str
+    message: str
+    payload_json: dict | None = None
+    created_at: str | None = None
+
+
+class ManagedOpenStackResourceInfo(BaseModel):
+    id: str
+    cluster_id: str
+    operation_id: str | None = None
+    service: str
+    resource_type: str
+    resource_id: str
+    name: str | None = None
+    state: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    metadata: dict | None = None
+    created_at: str | None = None
+    last_seen_at: str | None = None
+    deleted_at: str | None = None

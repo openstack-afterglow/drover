@@ -41,12 +41,22 @@ def _ng_to_dict(ng: K3sNodegroup) -> dict:
     }
 
 
-def _validate_scalable_invariants(role: str, node_count: int, flavor_id: str | None, stampede_enabled: bool) -> None:
+def _validate_scalable_invariants(
+    role: str,
+    node_count: int,
+    flavor_id: str | None,
+    stampede_enabled: bool,
+    min_size: int = 0,
+    max_size: int = 5,
+) -> None:
     if role == "server":
         raise ValueError("커스텀 server 노드그룹은 아직 지원되지 않습니다.")
     if stampede_enabled and not flavor_id:
         raise ValueError("Stampede 노드그룹은 flavor_id가 필요합니다.")
-
+    if min_size > max_size:
+        raise ValueError("min_size는 max_size보다 클 수 없습니다.")
+    if node_count < min_size or node_count > max_size:
+        raise ValueError(f"node_count ({node_count})는 min_size ({min_size})와 max_size ({max_size}) 범위 밖입니다.")
 
 def _deterministic_default_id(cluster_id: str, name: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"afterglow:k3s-nodegroup:{cluster_id}:{name}"))
@@ -182,7 +192,9 @@ async def create_nodegroup(cluster_id: str, data: dict) -> dict:
         node_count = int(data.get("node_count", 0))
         flavor_id = data.get("flavor_id") or None
         stampede_enabled = bool(data.get("stampede_enabled", False))
-        _validate_scalable_invariants(role, node_count, flavor_id, stampede_enabled)
+        min_size = int(data.get("min_size", 0))
+        max_size = int(data.get("max_size", 5))
+        _validate_scalable_invariants(role, node_count, flavor_id, stampede_enabled, min_size, max_size)
 
         ng = K3sNodegroup(
             id=str(uuid.uuid4()),
@@ -231,7 +243,9 @@ async def update_nodegroup(cluster_id: str, nodegroup_id: str, updates: dict) ->
         next_count = int(updates.get("node_count", ng.node_count))
         next_flavor = updates.get("flavor_id", ng.flavor_id)
         next_stampede = bool(updates.get("stampede_enabled", ng.stampede_enabled))
-        _validate_scalable_invariants(next_role, next_count, next_flavor, next_stampede)
+        next_min = int(updates.get("min_size", ng.min_size if ng.min_size is not None else 0))
+        next_max = int(updates.get("max_size", ng.max_size if ng.max_size is not None else 5))
+        _validate_scalable_invariants(next_role, next_count, next_flavor, next_stampede, next_min, next_max)
 
         _allowed = {
             "node_count",

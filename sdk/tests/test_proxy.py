@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
@@ -89,6 +89,17 @@ JSON_METHOD_TABLE = [
         None,
     ),
     ("create_shell_ticket", ("cluster-1",), {}, "POST", "/v1/clusters/cluster-1/shell-ticket", None, None),
+    ("get_operation", ("op-123",), {}, "GET", "/v1/operations/op-123", None, None),
+    ("operation_events", ("op-123",), {}, "GET", "/v1/operations/op-123/events", None, None),
+    (
+        "operation_events",
+        ("op-123",),
+        {"since_sequence": 2},
+        "GET",
+        "/v1/operations/op-123/events",
+        None,
+        {"since_sequence": 2},
+    ),
     ("namespaces", ("cluster-1",), {}, "GET", "/v1/clusters/cluster-1/namespaces", None, None),
     (
         "configmaps",
@@ -351,6 +362,16 @@ JSON_METHOD_TABLE = [
         None,
     ),
     ("admin_cluster_templates", (), {}, "GET", "/v1/admin/cluster-templates", None, None),
+    ("admin_managed_resources", (), {}, "GET", "/v1/admin/managed-resources", None, None),
+    (
+        "admin_managed_resources",
+        (),
+        {"cluster_id": "c-123", "operation_id": "op-456"},
+        "GET",
+        "/v1/admin/managed-resources",
+        None,
+        {"cluster_id": "c-123", "operation_id": "op-456"},
+    ),
     ("resource_policies", (), {}, "GET", "/v1/admin/resource-policies", None, None),
     (
         "resource_policy_catalog",
@@ -449,7 +470,11 @@ STREAM_METHOD_TABLE = [
     ("admin_rotate_certs", ("cluster-1",), "POST", "/v1/admin/clusters/cluster-1/rotate-certs"),
 ]
 
-_PUBLIC_PROXY_METHODS = {name for name in vars(Proxy) if not name.startswith("_") and callable(getattr(Proxy, name))}
+_PUBLIC_PROXY_METHODS = {
+    name
+    for name in vars(Proxy)
+    if name != "request" and not name.startswith("_") and callable(getattr(Proxy, name))
+}
 
 
 def test_route_tables_cover_every_public_proxy_method():
@@ -497,15 +522,18 @@ def test_stream_methods_request_without_buffering(method_name, args, http_method
     proxy.request = MagicMock(return_value=response)
 
     result = getattr(proxy, method_name)(*args)
+    actual_lines = list(result)
 
-    expected_kwargs = {"raise_exc": True, "stream": True}
+    expected_kwargs = {
+        "raise_exc": True,
+        "stream": True,
+        "headers": {"Idempotency-Key": ANY},
+    }
     if method_name == "create_cluster":
-        # create_cluster(**attrs) always forwards a (possibly empty) JSON body.
         expected_kwargs["json"] = {}
     proxy.request.assert_called_once_with(path, http_method, **expected_kwargs)
     response.iter_lines.assert_called_once_with(decode_unicode=True)
-    assert list(result) == lines
-
+    assert actual_lines == lines
 
 def test_gpu_quota_identifiers_are_escaped_in_paths():
     proxy = Proxy(session=MagicMock(), service_type="drover")
@@ -537,21 +565,24 @@ def test_gpu_quota_identifiers_are_escaped_in_paths():
     )
 
 
-def test_service_description_constructs_with_required_service_type():
+def test_service_description_discovers_container_infra_through_drover_alias():
     description = DroverService()
-    assert description.service_type == "drover"
+    assert description.service_type == "container-infra"
+    assert description.aliases == ["drover"]
     assert description.supported_versions == {"1": Proxy}
 
 
-def test_register_enables_non_official_service_before_attaching_proxy(monkeypatch):
-    """Register enables Drover and applies its optional trusted endpoint override."""
+def test_register_enables_catalog_service_before_attaching_drover_alias(monkeypatch):
+    """Register discovers Drover through Keystone and retains an emergency override."""
 
     class Config:
         def __init__(self):
             self.enabled = set()
-
         def enable_service(self, service_type):
             self.enabled.add(service_type)
+
+        def set_service_value(self, key, service_type, value):
+            setattr(self, f"{service_type}_{key}", value)
 
         def has_service(self, service_type):
             return service_type in self.enabled
@@ -570,10 +601,97 @@ def test_register_enables_non_official_service_before_attaching_proxy(monkeypatc
     catalog_proxy = register(catalog_connection)
 
     assert isinstance(catalog_proxy, Proxy)
-    assert catalog_connection.config.has_service("drover")
+    assert catalog_connection.config.has_service("container-infra")
     assert catalog_proxy.endpoint_override is None
 
-    monkeypatch.setenv("SERVICE_DROVER_INTERNAL_URL", "http://drover-api:8011/")
-    override_proxy = register(Connection())
 
-    assert override_proxy.endpoint_override == "http://drover-api:8011"
+
+def test_register_configures_emergency_override_before_proxy_resolution(monkeypatch):
+    class Config:
+        def __init__(self):
+            self.enabled = set()
+            self.values = {}
+
+        def enable_service(self, service_type):
+            self.enabled.add(service_type)
+
+        def set_service_value(self, key, service_type, value):
+            self.values[(key, service_type)] = value
+
+    class Connection:
+        def __init__(self):
+            self.config = Config()
+            self.drover = Proxy(session=MagicMock(), service_type="container-infra")
+
+        def add_service(self, service):
+            assert self.config.values[("endpoint_override", service.service_type)] == "https://drover.example/v1"
+
+    monkeypatch.setenv("SERVICE_DROVER_INTERNAL_URL", "https://drover.example")
+    register(Connection())
+
+
+def test_proxy_uses_catalog_relative_paths(monkeypatch):
+    request = MagicMock(return_value=_response(200, payload=[]))
+    monkeypatch.setattr("openstack.proxy.Proxy.request", request)
+    catalog_proxy = Proxy(session=MagicMock(), service_type="container-infra")
+
+    catalog_proxy.clusters()
+
+    request.assert_called_once_with("/clusters", "GET", raise_exc=True)
+
+def test_idempotency_key_header_forwarding():
+    proxy = Proxy(session=MagicMock(), service_type="drover")
+    response = SimpleNamespace(iter_lines=MagicMock(return_value=iter([])))
+    proxy.request = MagicMock(return_value=response)
+
+    # Custom idempotency key
+    list(proxy.create_cluster(name="c1", idempotency_key="custom-key-123"))
+    proxy.request.assert_called_with(
+        "/v1/clusters/async",
+        "POST",
+        raise_exc=True,
+        stream=True,
+        json={"name": "c1"},
+        headers={"Idempotency-Key": "custom-key-123"},
+    )
+
+    # Generated idempotency key
+    list(proxy.create_cluster(name="c2"))
+    call_kwargs = proxy.request.call_args.kwargs
+    assert "Idempotency-Key" in call_kwargs["headers"]
+    assert len(call_kwargs["headers"]["Idempotency-Key"]) > 0
+    assert call_kwargs["json"] == {"name": "c2"}
+
+
+def test_disconnect_then_poll_completion():
+    proxy = Proxy(session=MagicMock(), service_type="drover")
+
+    initial_line = 'data: {"step": "security_group", "progress": 20, "message": "Creating SG", "operation_id": "op-99", "sequence": 1}'
+
+    def failing_stream(*args, **kwargs):
+        yield initial_line
+        raise ConnectionResetError("SSE connection dropped")
+
+    response = SimpleNamespace(iter_lines=MagicMock(side_effect=failing_stream))
+    proxy.request = MagicMock(return_value=response)
+
+    op_events_mock = MagicMock(return_value=[
+        {
+            "sequence": 2,
+            "phase": "completed",
+            "message": "Done",
+            "payload_json": {"step": "completed", "progress": 100, "cluster_id": "c-99"},
+        }
+    ])
+    get_op_mock = MagicMock(return_value={"id": "op-99", "status": "SUCCEEDED"})
+    proxy.operation_events = op_events_mock
+    proxy.get_operation = get_op_mock
+
+    items = list(proxy.create_cluster(name="c-disc", idempotency_key="key-disc"))
+
+    assert len(items) == 2
+    assert items[0] == initial_line
+    assert "completed" in items[1]
+    assert "op-99" in items[1]
+    op_events_mock.assert_called_with("op-99", since_sequence=1)
+    get_op_mock.assert_called_with("op-99")

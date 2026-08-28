@@ -474,8 +474,24 @@ async def _scale_up_nodegroup(
     last_up = state.get("last_scale_up", 0)
     cooldown = s.drover_stampede_scale_up_cooldown
     if time.time() - last_up < cooldown:
+        rem = cooldown - (time.time() - last_up)
         _logger.debug(
-            "stampede: nodegroup %s scale-up 쿨다운 중 (%.0fs 남음)", ng_id, cooldown - (time.time() - last_up)
+            "stampede: nodegroup %s scale-up 쿨다운 중 (%.0fs 남음)", ng_id, rem
+        )
+        await _record_stampede_event(
+            project_id=project_id,
+            cluster_id=cluster_id,
+            nodegroup_id=ng_id,
+            action="cooldown",
+            status="skipped",
+            extra={
+                "reason": "cooldown",
+                "direction": "scale_up",
+                "cooldown_seconds": cooldown,
+                "remaining_seconds": rem,
+                "triggering_metric": "pending_pods",
+                "pending_pod_count": len(pending_pods),
+            },
         )
         return
 
@@ -610,7 +626,13 @@ async def _scale_up_nodegroup(
         nodegroup_id=ng_id,
         action="scale_up",
         status="started",
-        extra={"add_count": add_count, "flavor_id": flavor["id"], "flavor_name": flavor.get("name", "")},
+        extra={
+            "add_count": add_count,
+            "flavor_id": flavor["id"],
+            "flavor_name": flavor.get("name", ""),
+            "triggering_metric": "pending_pods",
+            "pending_pod_count": len(unresolvable_pods),
+        },
     )
 
     # Persist before returning: the worker, not this API/reconcile process,
@@ -645,6 +667,8 @@ async def _provision_and_track(
     labels: dict | None,
     taints: list | None,
     gpu_required: bool = False,
+    operation_id: str | None = None,
+    triggering_metric: str | dict | None = None,
 ) -> None:
     """VM 프로비저닝 후 Ready/GPU 대기, in-flight 카운터 감소."""
     from drover.services import autoscale as k3s_autoscale
@@ -667,6 +691,8 @@ async def _provision_and_track(
         _logger.exception("stampede: nodegroup %s provisioning failed", nodegroup_id)
         new_vms = []
         provision_error = "provision_failed"
+    new_vm_ids = [v["vm_id"] for v in new_vms if v.get("vm_id")]
+    await k3s_autoscale.reconcile_nodegroup_vms(project_id, cluster_id, nodegroup_id)
     missing_count = max(0, add_count - len(new_vms))
     if missing_count:
         _logger.warning(
@@ -675,7 +701,6 @@ async def _provision_and_track(
             len(new_vms),
             add_count,
         )
-
     ready_nodes = []
     failed_nodes = []
     for vm in new_vms:
@@ -710,9 +735,10 @@ async def _provision_and_track(
             elif failed_nodes:
                 reason = "node_not_ready"
             updates["last_blocked_reason"] = reason
-            tracked_count = len(ng.get("vms") or [])
-            actual_count = max(0, tracked_count - len(failed_nodes))
-            await k3s_nodegroup.set_nodegroup_count(cluster_id, nodegroup_id, actual_count)
+            if failed_nodes:
+                tracked_count = len(ng.get("vms") or [])
+                actual_count = max(0, tracked_count - len(failed_nodes))
+                await k3s_nodegroup.set_nodegroup_count(cluster_id, nodegroup_id, actual_count)
         await _update_stampede_state(nodegroup_id, cluster_id, updates)
 
     if missing_count:
@@ -738,8 +764,27 @@ async def _provision_and_track(
             "missing_count": missing_count,
             "provision_error": provision_error,
             "reason": reason,
+            "vm_ids": new_vm_ids,
+            "triggering_metric": triggering_metric or "pending_pods",
         },
     )
+    if operation_id:
+        from drover.services import operations
+
+        await operations.append_operation_event(
+            None,
+            operation_id,
+            phase="stampede_provision_complete",
+            message=f"Stampede provisioned {len(new_vms)} VMs for nodegroup {nodegroup_id}",
+            payload_json={
+                "nodegroup_id": nodegroup_id,
+                "add_count": add_count,
+                "vm_ids": new_vm_ids,
+                "ready_nodes": ready_nodes,
+                "failed_nodes": failed_nodes,
+                "triggering_metric": triggering_metric or "pending_pods",
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +815,21 @@ async def _scale_down_nodegroup(
     last_down = state.get("last_scale_down", 0)
     cooldown = s.drover_stampede_scale_down_cooldown
     if time.time() - last_down < cooldown:
+        rem = cooldown - (time.time() - last_down)
+        await _record_stampede_event(
+            project_id=project_id,
+            cluster_id=cluster_id,
+            nodegroup_id=ng_id,
+            action="cooldown",
+            status="skipped",
+            extra={
+                "reason": "cooldown",
+                "direction": "scale_down",
+                "cooldown_seconds": cooldown,
+                "remaining_seconds": rem,
+                "triggering_metric": "idle_nodes",
+            },
+        )
         return
 
     threshold = s.drover_stampede_scale_down_threshold

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import time
+import uuid
 from urllib.parse import quote
 
 from openstack import proxy
@@ -23,6 +26,15 @@ def _query(**kwargs: object) -> dict | None:
 
 
 class Proxy(proxy.Proxy):
+    """Catalog-relative proxy for a Keystone endpoint registered at ``/v1``."""
+
+    def request(self, url, method, **kwargs):
+        if url == "/v1":
+            url = "/"
+        elif url.startswith("/v1/"):
+            url = url[3:]
+        return super().request(url, method, **kwargs)
+
     def _json_request(self, method: str, path: str, *, body: dict | None = None, params: dict | None = None):
         kwargs: dict = {}
         if body is not None:
@@ -39,7 +51,15 @@ class Proxy(proxy.Proxy):
         response = self.request(path, method, raise_exc=True, **kwargs)
         return response.text
 
-    def _stream_request(self, method: str, path: str, *, body: dict | None = None, params: dict | None = None):
+    def _stream_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict | None = None,
+        params: dict | None = None,
+        headers: dict | None = None,
+    ):
         """Issue a streaming (SSE) request and return a line iterator.
 
         ``stream=True`` is forwarded through the SDK session so the response
@@ -51,9 +71,113 @@ class Proxy(proxy.Proxy):
             kwargs["json"] = body
         if params:
             kwargs["params"] = params
+        if headers:
+            kwargs["headers"] = headers
         response = self.request(path, method, raise_exc=True, **kwargs)
         return response.iter_lines(decode_unicode=True)
 
+    def _stream_mutation(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict | None = None,
+        params: dict | None = None,
+        headers: dict | None = None,
+    ):
+        req_headers = dict(headers) if headers else {}
+        body_dict = dict(body) if body is not None else None
+
+        if body_dict is not None:
+            key = body_dict.pop("idempotency_key", None) or body_dict.pop("Idempotency-Key", None)
+            if key:
+                req_headers["Idempotency-Key"] = str(key)
+
+        if "Idempotency-Key" not in req_headers and "idempotency-key" not in req_headers:
+            req_headers["Idempotency-Key"] = str(uuid.uuid4())
+
+        seen_sequences = set()
+        last_op_id = None
+        last_seq = 0
+
+        try:
+            stream = self._stream_request(method, path, body=body_dict, params=params, headers=req_headers)
+            for line in stream:
+                if isinstance(line, str) and line.startswith("data:"):
+                    raw = line[5:].strip()
+                    if raw:
+                        try:
+                            pj = json.loads(raw)
+                            if isinstance(pj, dict):
+                                op_id = pj.get("operation_id")
+                                if op_id:
+                                    last_op_id = op_id
+                                seq = pj.get("sequence")
+                                if seq is not None:
+                                    try:
+                                        seq_int = int(seq)
+                                        seen_sequences.add(seq_int)
+                                        if seq_int > last_seq:
+                                            last_seq = seq_int
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                yield line
+        except Exception as exc:
+            if not last_op_id:
+                raise exc
+
+            terminal_statuses = {"WAITING_CALLBACK", "SUCCEEDED", "FAILED", "CANCELLED"}
+            while True:
+                try:
+                    events = self.operation_events(last_op_id, since_sequence=last_seq)
+                except Exception:
+                    events = []
+
+                if isinstance(events, list):
+                    for ev in events:
+                        seq = ev.get("sequence") if isinstance(ev, dict) else getattr(ev, "sequence", None)
+                        if seq is not None:
+                            try:
+                                seq_int = int(seq)
+                                if seq_int in seen_sequences:
+                                    continue
+                                seen_sequences.add(seq_int)
+                                if seq_int > last_seq:
+                                    last_seq = seq_int
+                            except Exception:
+                                pass
+
+                        pj = ev.get("payload_json") if isinstance(ev, dict) else getattr(ev, "payload_json", {})
+                        if not isinstance(pj, dict):
+                            pj = {}
+                        step = pj.get("step") or (ev.get("phase") if isinstance(ev, dict) else getattr(ev, "phase", ""))
+                        msg = ev.get("message") if isinstance(ev, dict) else getattr(ev, "message", "")
+                        cluster_id = pj.get("cluster_id")
+                        error = pj.get("error")
+
+                        progress_msg = {
+                            "step": step,
+                            "progress": pj.get("progress", 10),
+                            "message": msg,
+                            "cluster_id": cluster_id,
+                            "operation_id": last_op_id,
+                            "sequence": seq,
+                            "error": error,
+                            "elapsed_seconds": None,
+                        }
+                        yield f"data: {json.dumps(progress_msg)}"
+
+                try:
+                    op = self.get_operation(last_op_id)
+                    status = op.get("status") if isinstance(op, dict) else getattr(op, "status", None)
+                except Exception:
+                    status = None
+
+                if status in terminal_statuses:
+                    break
+                time.sleep(0.1)
     # -- Tenant clusters -----------------------------------------------
 
     def clusters(self, **query):
@@ -66,7 +190,7 @@ class Proxy(proxy.Proxy):
         return self._text_request("GET", f"/v1/clusters/{_segment(cluster_id)}/kubeconfig")
 
     def create_cluster(self, **attrs):
-        return self._stream_request("POST", "/v1/clusters/async", body=attrs)
+        return self._stream_mutation("POST", "/v1/clusters/async", body=attrs)
 
     def scale_cluster(self, cluster_id, **attrs):
         return self._json_request("PATCH", f"/v1/clusters/{_segment(cluster_id)}/scale", body=attrs)
@@ -75,7 +199,7 @@ class Proxy(proxy.Proxy):
         return self._json_request("DELETE", f"/v1/clusters/{_segment(cluster_id)}")
 
     def delete_cluster_async(self, cluster_id):
-        return self._stream_request("POST", f"/v1/clusters/{_segment(cluster_id)}/delete-async")
+        return self._stream_mutation("POST", f"/v1/clusters/{_segment(cluster_id)}/delete-async")
 
     def node_interfaces(self, cluster_id, vm_id):
         return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/nodes/{_segment(vm_id)}/interfaces")
@@ -121,7 +245,7 @@ class Proxy(proxy.Proxy):
         return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/certificate-expiry")
 
     def rotate_certs(self, cluster_id):
-        return self._stream_request("POST", f"/v1/clusters/{_segment(cluster_id)}/rotate-certs")
+        return self._stream_mutation("POST", f"/v1/clusters/{_segment(cluster_id)}/rotate-certs")
 
     def create_shell_ticket(self, cluster_id):
         return self._json_request("POST", f"/v1/clusters/{_segment(cluster_id)}/shell-ticket")
@@ -301,7 +425,7 @@ class Proxy(proxy.Proxy):
         return self._json_request("DELETE", f"/v1/admin/clusters/{_segment(cluster_id)}")
 
     def admin_delete_cluster_async(self, cluster_id):
-        return self._stream_request("POST", f"/v1/admin/clusters/{_segment(cluster_id)}/delete-async")
+        return self._stream_mutation("POST", f"/v1/admin/clusters/{_segment(cluster_id)}/delete-async")
 
     def admin_ca_certificate(self, cluster_id):
         return self._text_request("GET", f"/v1/admin/clusters/{_segment(cluster_id)}/ca-certificate")
@@ -310,10 +434,12 @@ class Proxy(proxy.Proxy):
         return self._json_request("GET", f"/v1/admin/clusters/{_segment(cluster_id)}/certificate-expiry")
 
     def admin_rotate_certs(self, cluster_id):
-        return self._stream_request("POST", f"/v1/admin/clusters/{_segment(cluster_id)}/rotate-certs")
+        return self._stream_mutation("POST", f"/v1/admin/clusters/{_segment(cluster_id)}/rotate-certs")
 
     def admin_cluster_templates(self):
         return self._json_request("GET", "/v1/admin/cluster-templates")
+    def admin_managed_resources(self, **query):
+        return self._json_request("GET", "/v1/admin/managed-resources", params=_query(**query))
 
     def resource_policies(self):
         return self._json_request("GET", "/v1/admin/resource-policies")
@@ -381,3 +507,11 @@ class Proxy(proxy.Proxy):
         route directly from baked VM cloud-init scripts, not through the SDK.
         """
         return self._json_request("POST", "/v1/callback", body=attrs)
+
+    # -- Operations -----------------------------------------------------
+
+    def get_operation(self, operation_id):
+        return self._json_request("GET", f"/v1/operations/{_segment(operation_id)}")
+
+    def operation_events(self, operation_id, **query):
+        return self._json_request("GET", f"/v1/operations/{_segment(operation_id)}/events", params=_query(**query))

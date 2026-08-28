@@ -129,8 +129,9 @@ def get_token_info(token_info: dict = Depends(require_token)) -> dict:
 
 
 def require_admin(token_info: dict = Depends(require_token)) -> dict:
-    if not token_info.get("is_system_admin"):
-        raise HTTPException(status_code=403, detail="관리자 권한이 필요합니다")
+    from drover.policy import authorize
+
+    authorize("drover:admin", {"project_id": token_info.get("project_id", "")}, token_info)
     return token_info
 
 

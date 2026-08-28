@@ -373,6 +373,22 @@ def wait_server_deleted(conn: openstack.connection.Connection, server_id: str, t
         time.sleep(3)
     raise TimeoutError(f"서버 {server_id} 삭제 대기 타임아웃 ({timeout}s)")
 
+def delete_server_safe(
+    conn: openstack.connection.Connection,
+    server_id: str,
+    expected_project_id: str,
+    expected_cluster_id: str,
+) -> None:
+    """프로젝트 및 Drover 소유권 검증 후 서버 VM을 안전하게 삭제."""
+    from drover.services.inventory import validate_resource_ownership
+
+    srv = conn.compute.find_server(server_id, ignore_missing=True)
+    if srv is None:
+        return
+    if not validate_resource_ownership(srv, expected_project_id, expected_cluster_id, "server"):
+        raise ValueError(f"Nova server {server_id} ownership validation failed for project {expected_project_id}")
+    delete_server(conn, server_id)
+    wait_server_deleted(conn, server_id)
 
 def start_server(conn: openstack.connection.Connection, server_id: str) -> None:
     conn.compute.start_server(server_id)

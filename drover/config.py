@@ -6,9 +6,15 @@ import os
 import tomllib
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ConfigurationError(RuntimeError):
+    """Raised when required deployment configuration is missing or invalid."""
 
 
 def _config_candidates() -> list[Path]:
@@ -33,6 +39,35 @@ def load_raw_toml() -> dict:
                 return tomllib.load(handle)
     return {}
 
+def _inject_db_password(url: str, password: str) -> str:
+    if not url or not password:
+        return url
+    parts = urlsplit(url)
+    if not parts.netloc:
+        return url
+    if "@" in parts.netloc:
+        userinfo, host = parts.netloc.rsplit("@", 1)
+        user = userinfo.split(":", 1)[0]
+    else:
+        user = "drover"
+        host = parts.netloc
+    new_netloc = f"{user}:{password}@{host}"
+    return urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
+
+
+def _inject_redis_password(url: str, password: str) -> str:
+    if not url or not password:
+        return url
+    parts = urlsplit(url)
+    if not parts.netloc:
+        return url
+    if "@" in parts.netloc:
+        _, host = parts.netloc.rsplit("@", 1)
+    else:
+        host = parts.netloc
+    new_netloc = f":{password}@{host}"
+    return urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
+
 
 def _load_toml() -> dict:
     data = load_raw_toml()
@@ -46,19 +81,25 @@ def _load_toml() -> dict:
         "os_auth_url": keystone.get("auth_url", ""),
         "os_username": keystone.get("username", ""),
         "os_password": keystone.get("password", ""),
-        "os_project_name": keystone.get("project_name", "drover"),
+        "os_password_file": keystone.get("password_file", keystone.get("os_password_file", "")),
         "os_project_domain_name": keystone.get("project_domain_name", "Default"),
         "os_user_domain_name": keystone.get("user_domain_name", "Default"),
         "os_region_name": keystone.get("region", keystone.get("region_name", "RegionOne")),
         "os_interface": keystone.get("interface", "internal"),
         "os_insecure": keystone.get("insecure", False),
         "os_cacert": keystone.get("cacert", ""),
+        "os_service_project_id": keystone.get("service_project_id", keystone.get("os_service_project_id", "")),
+        "admin_legacy_project_policy": keystone.get(
+            "admin_legacy_project_policy", keystone.get("legacy_project_policy", False)
+        ),
         "database_url": database.get("url", ""),
+        "database_password_file": database.get("password_file", database.get("database_password_file", "")),
         "database_pool_size": database.get("pool_size", 5),
         "database_max_overflow": database.get("max_overflow", 10),
         "database_connect_timeout": database.get("connect_timeout", 10),
         "database_pool_timeout": database.get("pool_timeout", 10),
         "redis_url": cache.get("redis_url", "redis://localhost:6379/7"),
+        "redis_password_file": cache.get("password_file", cache.get("redis_password_file", "")),
         "cache_ttl_fast": cache.get("ttl_fast", 15),
         "cache_ttl_normal": cache.get("ttl_normal", 30),
         "cache_ttl_slow": cache.get("ttl_slow", 60),
@@ -73,6 +114,9 @@ def _load_toml() -> dict:
         "cache_ttl_auth_token": cache.get("ttl_auth_token", 60),
         "drover_callback_base_url": drover.get("callback_base_url", ""),
         "drover_kubeconfig_encryption_key": drover.get("kubeconfig_encryption_key", ""),
+        "drover_kubeconfig_encryption_key_file": drover.get(
+            "kubeconfig_encryption_key_file", drover.get("encryption_key_file", "")
+        ),
         "drover_boot_volume_size_gb": drover.get("boot_volume_size_gb", 30),
         "drover_occm_enabled": drover.get("occm_enabled", True),
         "drover_occm_image": drover.get("occm_image", "ghcr.io/openstack-afterglow/openstack-cloud-controller-manager:v1.28.0"),
@@ -92,6 +136,7 @@ def _load_toml() -> dict:
         "drover_barbican_kms_kek_id": drover.get("barbican_kms_kek_id", ""),
         "drover_cert_rotation_node_timeout_sec": drover.get("cert_rotation_node_timeout_sec", 300),
         "drover_cert_rotation_job_image": drover.get("cert_rotation_job_image", "rancher/k3s:v1.28.4-k3s2"),
+        "k3s_health_interval": drover.get("k3s_health_interval", drover.get("health_interval", 180)),
         "drover_stampede_enabled": drover.get("stampede_enabled", False),
         "drover_stampede_interval": drover.get("stampede_interval", 60),
         "drover_stampede_scale_down_threshold": drover.get("stampede_scale_down_threshold", 0.5),
@@ -99,6 +144,10 @@ def _load_toml() -> dict:
         "drover_stampede_scale_up_cooldown": drover.get("stampede_scale_up_cooldown", 120),
         "drover_stampede_scale_down_cooldown": drover.get("stampede_scale_down_cooldown", 300),
         "drover_stampede_resource_headroom_factor": drover.get("stampede_resource_headroom_factor", 0.3),
+        "drover_reconcile_interval": drover.get("reconcile_interval", drover.get("drover_reconcile_interval", 300)),
+        "drover_reconcile_concurrency_per_project": drover.get("reconcile_concurrency_per_project", drover.get("max_concurrent_reconciles_per_project", 2)),
+        "drover_callback_allowed_cidrs": drover.get("callback_allowed_cidrs", drover.get("drover_callback_allowed_cidrs", [])),
+        "drover_policy_file": drover.get("policy_file", drover.get("drover_policy_file", "/etc/drover/policy.yaml")),
         "trusted_proxies": drover.get("trusted_proxies", "127.0.0.1/32,::1/128"),
     }
 
@@ -109,22 +158,25 @@ class Settings(BaseSettings):
     os_auth_url: str = ""
     os_username: str = ""
     os_password: str = ""
-    os_project_name: str = "drover"
+    os_password_file: str = ""
     os_project_domain_name: str = "Default"
     os_user_domain_name: str = "Default"
     os_region_name: str = "RegionOne"
     os_interface: str = "internal"
     os_insecure: bool = False
     os_cacert: str = ""
+    os_service_project_id: str = ""
+    admin_legacy_project_policy: bool = False
 
     database_url: str = ""
+    database_password_file: str = ""
     database_pool_size: int = 5
     database_max_overflow: int = 10
     database_connect_timeout: int = 10
     database_pool_timeout: int = 10
 
     redis_url: str = "redis://localhost:6379/7"
-    cache_ttl_fast: int = 15
+    redis_password_file: str = ""
     cache_ttl_normal: int = 30
     cache_ttl_slow: int = 60
     cache_ttl_static: int = 300
@@ -138,7 +190,9 @@ class Settings(BaseSettings):
     cache_ttl_auth_token: int = 60
 
     drover_callback_base_url: str = ""
+    drover_policy_file: str = "/etc/drover/policy.yaml"
     drover_kubeconfig_encryption_key: str = ""
+    drover_kubeconfig_encryption_key_file: str = ""
     drover_boot_volume_size_gb: int = 30
     drover_occm_enabled: bool = True
     drover_occm_image: str = "ghcr.io/openstack-afterglow/openstack-cloud-controller-manager:v1.28.0"
@@ -158,6 +212,7 @@ class Settings(BaseSettings):
     drover_barbican_kms_kek_id: str = ""
     drover_cert_rotation_node_timeout_sec: int = 300
     drover_cert_rotation_job_image: str = "rancher/k3s:v1.28.4-k3s2"
+    k3s_health_interval: int = 180
     drover_stampede_enabled: bool = False
     drover_stampede_interval: int = 60
     drover_stampede_scale_down_threshold: float = 0.5
@@ -165,8 +220,21 @@ class Settings(BaseSettings):
     drover_stampede_scale_up_cooldown: int = 120
     drover_stampede_scale_down_cooldown: int = 300
     drover_stampede_resource_headroom_factor: float = 0.3
+    drover_reconcile_interval: int = 300
+    drover_reconcile_concurrency_per_project: int = 2
+    drover_callback_allowed_cidrs: list[str] = []
     trusted_proxies: str = "127.0.0.1/32,::1/128"
 
+    @field_validator("drover_callback_allowed_cidrs", mode="before")
+    @classmethod
+    def validate_callback_allowed_cidrs(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            if not value.strip():
+                return []
+            return [c.strip() for c in value.split(",") if c.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(c).strip() for c in value if str(c).strip()]
+        return []
     @field_validator("drover_kubeconfig_encryption_key")
     @classmethod
     def validate_encryption_key(cls, value: str) -> str:
@@ -180,6 +248,55 @@ class Settings(BaseSettings):
                 raise ValueError("drover.kubeconfig_encryption_key must be hexadecimal") from exc
         return value
 
+
+    @model_validator(mode="after")
+    def _load_file_secrets(self) -> Settings:
+        target_os_pass_file = self.os_password_file or os.environ.get("OS_PASSWORD_FILE", "")
+        if not target_os_pass_file and not self.os_password and Path("/etc/drover/secrets/os_password").is_file():
+            target_os_pass_file = "/etc/drover/secrets/os_password"
+        if target_os_pass_file:
+            self.os_password_file = target_os_pass_file
+            p = Path(target_os_pass_file)
+            if p.is_file():
+                self.os_password = p.read_text().strip()
+
+        target_enc_file = (
+            self.drover_kubeconfig_encryption_key_file
+            or os.environ.get("DROVER_KUBECONFIG_ENCRYPTION_KEY_FILE", "")
+        )
+        if (
+            not target_enc_file
+            and not self.drover_kubeconfig_encryption_key
+            and Path("/etc/drover/secrets/kubeconfig_encryption_key").is_file()
+        ):
+            target_enc_file = "/etc/drover/secrets/kubeconfig_encryption_key"
+        if target_enc_file:
+            self.drover_kubeconfig_encryption_key_file = target_enc_file
+            p = Path(target_enc_file)
+            if p.is_file():
+                self.drover_kubeconfig_encryption_key = p.read_text().strip()
+
+        target_db_pass_file = self.database_password_file or os.environ.get("DATABASE_PASSWORD_FILE", "")
+        if not target_db_pass_file and Path("/etc/drover/secrets/database_password").is_file():
+            target_db_pass_file = "/etc/drover/secrets/database_password"
+        if target_db_pass_file:
+            self.database_password_file = target_db_pass_file
+            p = Path(target_db_pass_file)
+            if p.is_file():
+                db_pass = p.read_text().strip()
+                self.database_url = _inject_db_password(self.database_url, db_pass)
+
+        target_redis_pass_file = self.redis_password_file or os.environ.get("REDIS_PASSWORD_FILE", "")
+        if not target_redis_pass_file and Path("/etc/drover/secrets/redis_password").is_file():
+            target_redis_pass_file = "/etc/drover/secrets/redis_password"
+        if target_redis_pass_file:
+            self.redis_password_file = target_redis_pass_file
+            p = Path(target_redis_pass_file)
+            if p.is_file():
+                redis_pass = p.read_text().strip()
+                self.redis_url = _inject_redis_password(self.redis_url, redis_pass)
+
+        return self
     @property
     def ssl_verify(self) -> bool | str:
         if self.os_insecure:
@@ -193,3 +310,33 @@ def get_settings() -> Settings:
         if not os.environ.get(key.upper()):
             os.environ[key.upper()] = str(value)
     return Settings()
+
+
+def validate_config(settings: Settings | None = None) -> Settings:
+    """Validate core deployment configuration required for service operation.
+
+    Raises ConfigurationError if any required setting is missing or invalid.
+    """
+    if settings is None:
+        settings = get_settings()
+
+    missing: list[str] = []
+    if not settings.database_url or not settings.database_url.strip():
+        missing.append("database_url (DATABASE_URL)")
+    if not settings.drover_callback_base_url or not settings.drover_callback_base_url.strip():
+        missing.append("drover_callback_base_url (DROVER_CALLBACK_BASE_URL)")
+    if not settings.drover_kubeconfig_encryption_key or not settings.drover_kubeconfig_encryption_key.strip():
+        missing.append("drover_kubeconfig_encryption_key (DROVER_KUBECONFIG_ENCRYPTION_KEY)")
+    if not settings.os_auth_url or not settings.os_auth_url.strip():
+        missing.append("os_auth_url (OS_AUTH_URL)")
+    if not settings.os_username or not settings.os_username.strip():
+        missing.append("os_username (OS_USERNAME)")
+    if not settings.os_password or not settings.os_password.strip():
+        missing.append("os_password (OS_PASSWORD)")
+
+    if missing:
+        raise ConfigurationError(
+            f"Missing required core deployment configuration: {', '.join(missing)}"
+        )
+
+    return settings

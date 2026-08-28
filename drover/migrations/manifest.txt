@@ -1,1 +1,2 @@
 001_baseline|001_baseline.sql|a2aea5b60553b97143aa647b83d1bc9b1e62620cd3c94045ca647a1fa9813638
+002_operations|002_operations.sql|2b81cb803b186aaa985f8814b1a4a81dda8a90e4aee184ddf8143a0f5fc40b3a

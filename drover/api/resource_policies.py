@@ -10,12 +10,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, StrictBool, StringConstraints
 
-from drover.auth import require_admin, require_token
+from drover.auth import require_token
 from drover.config import get_settings
+from drover.policy import require_policy
 from drover.services import resource_policies
 from drover.services import resource_policy_store as store
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_policy("drover:admin"))])
 
 
 class ResourcePolicyUpdate(BaseModel):
@@ -59,7 +60,7 @@ async def get_admin_os_conn() -> AsyncIterator:
             await asyncio.to_thread(connection.close)
 
 
-@router.get("/resource-policies", dependencies=[Depends(require_admin)])
+@router.get("/resource-policies")
 async def list_resource_policies(conn=Depends(get_admin_os_conn)):
     try:
         return await store.inspect_policies(conn)
@@ -67,7 +68,7 @@ async def list_resource_policies(conn=Depends(get_admin_os_conn)):
         raise HTTPException(status_code=503, detail="리소스 정책 저장소를 사용할 수 없습니다") from exc
 
 
-@router.get("/resource-policies/catalog/{policy_key}", dependencies=[Depends(require_admin)])
+@router.get("/resource-policies/catalog/{policy_key}")
 async def discover_resource_policy_options(policy_key: str, conn=Depends(get_admin_os_conn)):
     try:
         spec = resource_policies.get_spec(policy_key)
@@ -86,7 +87,7 @@ async def discover_resource_policy_options(policy_key: str, conn=Depends(get_adm
         raise HTTPException(status_code=503, detail="OpenStack 리소스 목록을 조회할 수 없습니다") from exc
 
 
-@router.put("/resource-policies/{policy_key}", dependencies=[Depends(require_admin)])
+@router.put("/resource-policies/{policy_key}")
 async def update_resource_policy(
     policy_key: str,
     body: ResourcePolicyUpdate,
@@ -106,7 +107,7 @@ async def update_resource_policy(
         raise HTTPException(status_code=503, detail="리소스 정책 저장소를 사용할 수 없습니다") from exc
 
 
-@router.get("/runtime-settings", dependencies=[Depends(require_admin)])
+@router.get("/runtime-settings")
 async def list_runtime_settings():
     try:
         return await store.list_runtime_settings()
@@ -114,7 +115,7 @@ async def list_runtime_settings():
         raise HTTPException(status_code=503, detail="런타임 설정 저장소를 사용할 수 없습니다") from exc
 
 
-@router.put("/runtime-settings/{setting_key}", dependencies=[Depends(require_admin)])
+@router.put("/runtime-settings/{setting_key}")
 async def update_runtime_setting(
     setting_key: str,
     body: RuntimeSettingUpdate,

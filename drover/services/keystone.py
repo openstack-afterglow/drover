@@ -471,9 +471,9 @@ def _create_app_cred_sync(project_id: str, cluster_name: str, user_id: str, pass
     try:
         app_cred = mgr_conn.identity.create_application_credential(
             user=user_id,
-            name=f"k3s-ingress-{cluster_name}",
-            description=f"k3s cluster {cluster_name} octavia ingress controller",
-            roles=[{"name": "member"}, {"name": "load-balancer_member"}],
+            name=f"drover-appcred-{cluster_name}",
+            description=f"Drover k3s cluster {cluster_name} application credential",
+            roles=[{"name": "member"}],
         )
         return {"id": app_cred.id, "secret": app_cred.secret, "user_id": user_id}
     finally:

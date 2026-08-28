@@ -12,15 +12,38 @@ from sqlalchemy import exists, or_, select
 from sqlalchemy.orm import aliased
 
 from drover.db import get_session_factory
-from drover.models.orm import DroverJob, K3sCluster
+from drover.models.orm import DroverJob, DroverOperation, K3sCluster
+from drover.services import operations
 
 _logger = logging.getLogger("drover.jobs")
 _LEASE_SECONDS = 900
 _MAX_ATTEMPTS = 3
 _BATCH_SIZE = 5
 _SUPPORTED_KINDS = frozenset(
-    {"bootstrap_ha", "provision_agents", "scale", "nodegroup_reconcile", "stampede_provision", "delete"}
+    {
+        "create",
+        "bootstrap_ha",
+        "provision_agents",
+        "scale",
+        "nodegroup_reconcile",
+        "stampede_provision",
+        "delete",
+        "rotate_certificates",
+        "reconcile",
+    }
 )
+
+JOB_TO_OP_KIND = {
+    "create": "create",
+    "bootstrap_ha": "create",
+    "provision_agents": "create",
+    "scale": "scale",
+    "nodegroup_reconcile": "nodegroup_reconcile",
+    "stampede_provision": "nodegroup_reconcile",
+    "delete": "delete",
+    "rotate_certificates": "rotate_certificates",
+    "reconcile": "reconcile",
+}
 
 
 def _now() -> datetime:
@@ -34,35 +57,78 @@ async def enqueue_job(
     payload: dict,
     user_id: str | None = None,
     username: str | None = None,
+    operation_id: str | None = None,
+    request_id: str | None = None,
+    idempotency_key: str | None = None,
+    request_hash: str | None = None,
+    op_kind: str | None = None,
 ) -> str:
-    """Persist a job before a request reports that background work started."""
+    """Persist a job and link or create its operation in a single transaction."""
     if kind not in _SUPPORTED_KINDS:
         raise ValueError(f"unsupported Drover job kind: {kind}")
     factory = get_session_factory()
     if factory is None:
         raise RuntimeError("Database unavailable for durable job enqueue")
 
-    job = DroverJob(
-        id=str(uuid.uuid4()),
-        cluster_id=cluster_id,
-        project_id=project_id,
-        kind=kind,
-        status="queued",
-        payload_json=payload,
-        user_id=user_id or None,
-        username=username or None,
-        created_at=_now(),
-        updated_at=_now(),
-    )
     async with factory() as session, session.begin():
+        target_op_id = operation_id
+        if not target_op_id:
+            mapped_op_kind = op_kind or JOB_TO_OP_KIND.get(kind, "create")
+            active_op = await operations._get_active_op_impl(
+                session, cluster_id, kind=mapped_op_kind
+            )
+            if active_op is not None:
+                target_op_id = active_op.id
+            else:
+                new_op = await operations.create_or_get_operation(
+                    session,
+                    project_id=project_id,
+                    cluster_id=cluster_id,
+                    kind=mapped_op_kind,
+                    request_id=request_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    status="QUEUED",
+                )
+                target_op_id = new_op.id
+
+        job = DroverJob(
+            id=str(uuid.uuid4()),
+            cluster_id=cluster_id,
+            project_id=project_id,
+            kind=kind,
+            status="queued",
+            payload_json=payload,
+            user_id=user_id or None,
+            username=username or None,
+            operation_id=target_op_id,
+            created_at=_now(),
+            updated_at=_now(),
+        )
         session.add(job)
+        if target_op_id:
+            await operations._append_event_impl(
+                session,
+                target_op_id,
+                phase="job_enqueued",
+                message=f"Job {kind} enqueued",
+                payload_json={"job_id": job.id, "kind": kind, "request_id": request_id},
+            )
     return job.id
 
 
-async def _execute_job_direct(kind: str, payload: dict, cluster_id: str, project_id: str) -> None:
-    from drover.services import autoscale, provisioner
+async def _execute_job_direct(
+    kind: str,
+    payload: dict,
+    cluster_id: str,
+    project_id: str,
+    operation_id: str | None = None,
+) -> None:
+    from drover.services import autoscale, deletion, provisioner
 
-    if kind == "bootstrap_ha":
+    if kind == "create":
+        await provisioner.create_cluster_job(project_id, cluster_id, payload, operation_id=operation_id)
+    elif kind == "bootstrap_ha":
         await provisioner.bootstrap_ha_servers(
             project_id,
             cluster_id,
@@ -71,6 +137,7 @@ async def _execute_job_direct(kind: str, payload: dict, cluster_id: str, project
             int(payload.get("master_count", 3)),
             payload.get("lb_pool_id", ""),
             payload.get("lb_fip_address", ""),
+            operation_id=operation_id,
         )
     elif kind == "provision_agents":
         await provisioner.provision_agents(
@@ -80,16 +147,31 @@ async def _execute_job_direct(kind: str, payload: dict, cluster_id: str, project
             payload.get("node_token", ""),
         )
     elif kind == "scale":
-        await autoscale.scale_agents(project_id, cluster_id, int(payload["desired_count"]))
+        op_id = operation_id or payload.pop("_operation_id", None)
+        metric = payload.get("triggering_metric")
+        if op_id or metric:
+            await autoscale.scale_agents(
+                project_id,
+                cluster_id,
+                int(payload["desired_count"]),
+                operation_id=op_id,
+                triggering_metric=metric,
+            )
+        else:
+            await autoscale.scale_agents(project_id, cluster_id, int(payload["desired_count"]))
     elif kind == "nodegroup_reconcile":
         nodegroup = payload.get("nodegroup") or {}
         action = payload.get("action")
+        op_id = operation_id or payload.pop("_operation_id", None)
+        metric = payload.get("triggering_metric", "manual")
         if action == "provision":
             await autoscale.provision_nodegroup_and_reconcile(
                 project_id,
                 cluster_id,
                 nodegroup,
                 int(payload.get("add_count", 0)),
+                operation_id=op_id,
+                triggering_metric=metric,
             )
         elif action in {"delete_vms", "delete_group"}:
             await autoscale.delete_nodegroup_and_reconcile(
@@ -98,11 +180,21 @@ async def _execute_job_direct(kind: str, payload: dict, cluster_id: str, project
                 nodegroup,
                 payload.get("remove_entries") or [],
                 delete_group=action == "delete_group",
+                operation_id=op_id,
+                triggering_metric=metric,
             )
         else:
             raise ValueError(f"unknown nodegroup reconciliation action: {action!r}")
     elif kind == "stampede_provision":
         from drover.services.stampede import _provision_and_track
+
+        op_id = operation_id or payload.pop("_operation_id", None)
+        metric = payload.get("triggering_metric")
+        kwargs = {}
+        if op_id is not None:
+            kwargs["operation_id"] = op_id
+        if metric is not None:
+            kwargs["triggering_metric"] = metric
 
         await _provision_and_track(
             project_id=project_id,
@@ -114,25 +206,24 @@ async def _execute_job_direct(kind: str, payload: dict, cluster_id: str, project
             labels=payload.get("labels"),
             taints=payload.get("taints"),
             gpu_required=bool(payload.get("gpu_required")),
+            **kwargs,
         )
     elif kind == "delete":
-        from drover.api.clusters import _delete_cluster_progress
-        from drover.services import keystone, store
+        await deletion.execute_delete_cluster(
+            project_id, cluster_id, payload, operation_id=operation_id
+        )
+    elif kind == "rotate_certificates":
+        from drover.services import cert_rotation
 
-        cluster = await store.get_cluster(project_id, cluster_id)
-        if not cluster or cluster.get("deleted_at"):
-            return
-        conn = await asyncio.to_thread(keystone.get_admin_connection_for_project, project_id)
-        token_info = {
-            "project_id": project_id,
-            "user_id": payload.get("user_id", ""),
-            "username": payload.get("username", ""),
-        }
-        try:
-            async for _ in _delete_cluster_progress(conn, project_id, cluster, token_info):
-                pass
-        finally:
-            await asyncio.to_thread(conn.close)
+        await cert_rotation.rotate_cluster_certificates(project_id, cluster_id)
+    elif kind == "reconcile":
+        from drover.services import reconciliation
+
+        await reconciliation.reconcile_cluster(
+            project_id=project_id,
+            cluster_id=cluster_id,
+            operation_id=operation_id,
+        )
     else:
         raise ValueError(f"unsupported Drover job kind: {kind}")
 
@@ -144,9 +235,7 @@ async def _mark_cluster_failed(session, job: DroverJob, error: str) -> None:
         cluster.status_reason = error
         cluster.updated_at = _now()
 
-
 async def _claim_one() -> tuple[str, int, str, str, str, dict] | None:
-    """Claim one job without allowing concurrent work for the same cluster."""
     factory = get_session_factory()
     if factory is None:
         return None
@@ -212,18 +301,49 @@ async def _claim_one() -> tuple[str, int, str, str, str, dict] | None:
                 job.claimed_at = None
                 job.updated_at = now
                 await _mark_cluster_failed(session, job, error)
+                op_id = getattr(job, "operation_id", None)
+                if op_id:
+                    op = await session.get(DroverOperation, op_id, with_for_update=True)
+                    if op:
+                        op.status = "FAILED"
+                        op.error = error
+                        op.finished_at = now
+                        await operations._append_event_impl(
+                            session,
+                            op.id,
+                            phase="job_failed",
+                            message=f"Job {job.kind} retry limit exceeded: {error}",
+                            payload_json={"job_id": job.id, "error": error},
+                        )
                 continue
+
+            is_lease_recovery = job.status == "running" and job.claimed_at is not None
+            prior_attempts = job.attempts
             job.status = "running"
             job.attempts += 1
             job.claimed_at = now
             job.updated_at = now
+
+            op_id = getattr(job, "operation_id", None)
+            if op_id:
+                op = await session.get(DroverOperation, op_id, with_for_update=True)
+                if op:
+                    if op.status == "QUEUED":
+                        op.status = "RUNNING"
+                        if not op.started_at:
+                            op.started_at = now
+                    if is_lease_recovery or prior_attempts > 0:
+                        pass
+            payload = dict(job.payload_json or {})
+            if getattr(job, "operation_id", None):
+                payload["_operation_id"] = job.operation_id
             return (
                 job.id,
                 job.attempts,
                 job.kind,
                 job.cluster_id,
                 job.project_id,
-                job.payload_json or {},
+                payload,
             )
 
 
@@ -240,6 +360,26 @@ async def _complete(job_id: str, *, attempt: int) -> bool:
         job.claimed_at = None
         job.last_error = None
         job.updated_at = _now()
+
+        op_id = getattr(job, "operation_id", None)
+        if op_id:
+            op = await session.get(DroverOperation, op_id, with_for_update=True)
+            if op:
+                if op.status != "WAITING_CALLBACK":
+                    op.status = "SUCCEEDED"
+                    op.finished_at = _now()
+                    phase = "job_completed"
+                    msg = f"Job {job.kind} completed"
+                else:
+                    phase = "server_boot_ready"
+                    msg = "Boot server ready, waiting for cloud-init callback"
+                await operations._append_event_impl(
+                    session,
+                    op.id,
+                    phase=phase,
+                    message=msg,
+                    payload_json={"job_id": job.id, "op_status": op.status},
+                )
         return True
 
 
@@ -256,11 +396,36 @@ async def _retry_or_fail(job_id: str, *, attempt: int, error: str) -> bool:
         job.last_error = clean_error
         job.claimed_at = None
         job.updated_at = _now()
+
+        op = None
+        op_id = getattr(job, "operation_id", None)
+        if op_id:
+            op = await session.get(DroverOperation, op_id, with_for_update=True)
+
         if job.attempts >= _MAX_ATTEMPTS:
             job.status = "failed"
             await _mark_cluster_failed(session, job, clean_error)
+            if op:
+                op.status = "FAILED"
+                op.error = clean_error
+                op.finished_at = _now()
+                await operations._append_event_impl(
+                    session,
+                    op.id,
+                    phase="job_failed",
+                    message=f"Job {job.kind} failed after {job.attempts} attempts: {clean_error}",
+                    payload_json={"job_id": job.id, "error": clean_error},
+                )
         else:
             job.status = "queued"
+            if op:
+                await operations._append_event_impl(
+                    session,
+                    op.id,
+                    phase="job_attempt_failed",
+                    message=f"Job {job.kind} attempt {attempt} failed: {clean_error}. Retrying...",
+                    payload_json={"job_id": job.id, "attempt": attempt, "error": clean_error},
+                )
         return True
 
 
@@ -334,4 +499,5 @@ async def get_job(job_id: str) -> dict | None:
             "status": job.status,
             "attempts": job.attempts,
             "last_error": job.last_error,
+            "operation_id": getattr(job, "operation_id", None),
         }

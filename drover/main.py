@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -11,6 +12,7 @@ from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from sqlalchemy import text
 
 from drover.api import (
     admin,
@@ -22,6 +24,7 @@ from drover.api import (
     health,
     k3s_services,
     nodegroups,
+    operations,
     pods,
     resource_policies,
     secrets,
@@ -30,23 +33,78 @@ from drover.api import (
     templates,
     workloads,
 )
-from drover.cache import close_cache
-from drover.config import get_settings
-from drover.db import close_db, init_db
+from drover.cache import _get_redis, close_cache
+from drover.config import get_settings, validate_config
+from drover.db import check_db, close_db, get_session_factory, init_db
+from drover.middleware import CorrelationMiddleware
 from drover.models.schemas import (
     HealthResponse,
+    ReadinessResponse,
     RootDiscoveryResponse,
     VersionDiscoveryResponse,
 )
 from drover.rate_limit import limiter
+from drover.scripts.migrate import load_manifest
+from drover.services import keystone
 from drover.services.errors import K3sApiError
 
 _logger = logging.getLogger(__name__)
 
 
+async def _check_redis() -> bool:
+    await _get_redis().ping()
+    return True
+
+
+async def _check_migration_ledger() -> bool:
+    session_factory = get_session_factory()
+    if session_factory is None:
+        return False
+
+    try:
+        manifest = load_manifest()
+        async with session_factory() as session:
+            rows = (
+                await session.execute(
+                    text("SELECT logical_id, sha256 FROM schema_migrations")
+                )
+            ).all()
+    except Exception:
+        _logger.warning("Drover migration ledger readiness check failed", exc_info=True)
+        return False
+
+    applied = {row.logical_id: row.sha256 for row in rows}
+    return all(applied.get(migration.logical_id) == migration.sha256 for migration in manifest)
+
+
+async def _check_keystone_service_credentials() -> bool:
+    try:
+        connection = await asyncio.to_thread(keystone.get_service_project_connection)
+        return bool(await asyncio.to_thread(connection.authorize))
+    except Exception:
+        _logger.warning("Drover Keystone readiness check failed", exc_info=True)
+        return False
+
+
+async def readiness_checks() -> dict[str, str]:
+    results = await asyncio.gather(
+        check_db(),
+        _check_redis(),
+        _check_migration_ledger(),
+        _check_keystone_service_credentials(),
+        return_exceptions=True,
+    )
+    names = ("database", "redis", "migrations", "keystone")
+    return {
+        name: "ok" if result is True else "unavailable"
+        for name, result in zip(names, results, strict=True)
+    }
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     settings = get_settings()
+    validate_config(settings)
     init_db(
         settings.database_url,
         pool_size=settings.database_pool_size,
@@ -72,6 +130,7 @@ async def k3s_api_error_handler(request: Request, exc: K3sApiError):
 
 
 app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(CorrelationMiddleware)
 
 # Routers mounted under /v1 (health router included BEFORE clusters router so /v1/clusters/health matches before /{cluster_id})
 app.include_router(health.router, prefix="/v1/clusters", tags=["health"])
@@ -86,6 +145,7 @@ app.include_router(nodegroups.router, prefix="/v1/clusters", tags=["nodegroups"]
 app.include_router(certificates.router, prefix="/v1/clusters", tags=["certificates"])
 app.include_router(shell.router, prefix="/v1/clusters", tags=["shell"])
 app.include_router(templates.router, prefix="/v1/cluster-templates", tags=["templates"])
+app.include_router(operations.router, prefix="/v1/operations", tags=["operations"])
 app.include_router(admin.router, prefix="/v1/admin", tags=["admin"])
 app.include_router(resource_policies.router, prefix="/v1/admin", tags=["admin"])
 app.include_router(stats.router, prefix="/v1/stats", tags=["stats"])
@@ -133,6 +193,32 @@ async def version_discovery(request: Request):
 async def health_check():
     return {"status": "ok"}
 
+
+
+@app.get(
+    "/v1/health/live",
+    response_model=HealthResponse,
+    summary="Process liveness check",
+    description="Returns success while the API process can serve requests.",
+)
+async def liveness_check():
+    return {"status": "ok"}
+
+
+@app.get(
+    "/v1/health/ready",
+    response_model=ReadinessResponse,
+    summary="Service readiness check",
+    description="Checks database, Redis, schema migration ledger, and Keystone service credentials.",
+)
+async def readiness_check():
+    checks = await readiness_checks()
+    if all(status == "ok" for status in checks.values()):
+        return {"status": "ok", "checks": checks}
+    return JSONResponse(
+        status_code=503,
+        content={"status": "unavailable", "checks": checks},
+    )
 
 def run() -> None:
     uvicorn.run("drover.main:app", host="0.0.0.0", port=8011)

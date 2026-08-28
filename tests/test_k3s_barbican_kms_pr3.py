@@ -39,7 +39,7 @@ def _settings_with_kms() -> MagicMock:
 def test_extra_write_files_does_not_include_static_pod_manifest():
     """PR3 핵심: host static pod manifest 가 더 이상 작성되지 않아야 한다."""
     plugin = BarbicanKmsPlugin()
-    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms())
+    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms(), app_credential={"id": "app-cred-id-test", "secret": "app-cred-secret-test"})
     paths = [f["path"] for f in files]
     assert not any("/var/lib/rancher/k3s/agent/pod-manifests" in p for p in paths), (
         f"static pod manifest 가 여전히 작성됨: {paths}"
@@ -50,7 +50,7 @@ def test_extra_write_files_does_not_include_static_pod_manifest():
 def test_extra_write_files_includes_systemd_unit():
     """barbican-kms.service systemd unit 파일이 작성되어야 한다."""
     plugin = BarbicanKmsPlugin()
-    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms())
+    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms(), app_credential={"id": "app-cred-id-test", "secret": "app-cred-secret-test"})
     unit_files = [f for f in files if f["path"] == "/etc/systemd/system/barbican-kms.service"]
     assert len(unit_files) == 1
     content = unit_files[0]["content"]
@@ -73,7 +73,7 @@ def test_extra_write_files_includes_systemd_unit():
 def test_extra_write_files_includes_install_script():
     """install_kms.sh 가 0750 권한으로 작성되어야 한다 (podman 기반 — k3s containerd 의존 X)."""
     plugin = BarbicanKmsPlugin()
-    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms())
+    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms(), app_credential={"id": "app-cred-id-test", "secret": "app-cred-secret-test"})
     install_files = [f for f in files if f["path"] == "/opt/k3s/install_kms.sh"]
     assert len(install_files) == 1
     assert install_files[0]["permissions"] == "0750"
@@ -88,7 +88,7 @@ def test_extra_write_files_includes_install_script():
 def test_extra_write_files_includes_encryption_config():
     """encryption-config.yaml 이 0600 권한으로 작성되어야 한다 (apiserver 가 부팅 시 읽음)."""
     plugin = BarbicanKmsPlugin()
-    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms())
+    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms(), app_credential={"id": "app-cred-id-test", "secret": "app-cred-secret-test"})
     enc_files = [f for f in files if f["path"] == "/etc/kubernetes/encryption-config.yaml"]
     assert len(enc_files) == 1
     assert enc_files[0]["permissions"] == "0600"
@@ -99,7 +99,7 @@ def test_extra_write_files_includes_encryption_config():
 def test_extra_write_files_includes_cloud_conf():
     """barbican-cloud.conf 가 0600 권한으로 작성되어야 한다 (KMS plugin 이 인증에 사용)."""
     plugin = BarbicanKmsPlugin()
-    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms())
+    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms(), app_credential={"id": "app-cred-id-test", "secret": "app-cred-secret-test"})
     cc_files = [f for f in files if f["path"] == "/etc/kubernetes/barbican-cloud.conf"]
     assert len(cc_files) == 1
     assert cc_files[0]["permissions"] == "0600"
@@ -109,10 +109,8 @@ def test_extra_write_files_includes_cloud_conf():
 def test_extra_write_files_returns_exactly_four_files():
     """PR3 후 정확히 4개 파일: systemd unit + install script + encryption-config + cloud.conf."""
     plugin = BarbicanKmsPlugin()
-    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms())
+    files = plugin.extra_write_files("proj-1", "test-cluster", _settings_with_kms(), app_credential={"id": "app-cred-id-test", "secret": "app-cred-secret-test"})
     assert len(files) == 4
-
-
 # ---------------------------------------------------------------------------
 # server_install_args — pod-manifest-path 제거 + encryption-provider-config 유지
 # ---------------------------------------------------------------------------
@@ -239,15 +237,12 @@ def test_cloud_conf_uses_app_credential_when_provided():
     assert "username=admin" not in content
 
 
-def test_cloud_conf_falls_back_to_admin_password_when_no_app_cred():
-    """PR1 fallback: app_credential=None 시 admin password 사용 (deprecated, dev 전용)."""
+def test_cloud_conf_raises_error_when_no_app_cred():
+    """app_credential=None 시 ValueError 발생 (password fallback 없음)."""
+    import pytest
     plugin = BarbicanKmsPlugin()
-    files = plugin.extra_write_files("proj-1", "test", _settings_with_kms(), app_credential=None)
-    cc = next(f for f in files if f["path"] == "/etc/kubernetes/barbican-cloud.conf")
-    content = cc["content"]
-    assert "application-credential-id" not in content
-    assert "username=admin" in content
-    assert "password=secret" in content
+    with pytest.raises(ValueError, match="app_credential"):
+        plugin.extra_write_files("proj-1", "test", _settings_with_kms(), app_credential=None)
 
 
 def test_aggregate_extra_write_files_passes_app_credential_to_kms():
@@ -262,12 +257,12 @@ def test_aggregate_extra_write_files_passes_app_credential_to_kms():
     assert "application-credential-id=app-cred-id-test" in cc["content"]
 
 
-def test_extra_write_files_signature_backward_compatible():
-    """app_credential 인자 미전달 시에도 동작 (PR1 land 전 caller 호환)."""
+def test_extra_write_files_raises_error_without_app_cred():
+    """app_credential 인자 미전달 시 ValueError 발생."""
+    import pytest
     plugin = BarbicanKmsPlugin()
-    # app_credential kwarg 미전달
-    files = plugin.extra_write_files("proj-1", "test", _settings_with_kms())
-    assert len(files) == 4  # systemd unit + install + cloud.conf + enc-config
+    with pytest.raises(ValueError, match="app_credential"):
+        plugin.extra_write_files("proj-1", "test", _settings_with_kms())
 
 
 # ---------------------------------------------------------------------------

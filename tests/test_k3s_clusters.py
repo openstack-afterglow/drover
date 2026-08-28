@@ -7,6 +7,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from drover.main import app
+from drover.models.orm import ManagedOpenStackResource
 
 
 def _make_cluster_record():
@@ -60,6 +61,20 @@ async def test_get_drover_cluster_success(client):
         resp = await client.get("/v1/clusters/k3s-1")
     assert resp.status_code == 200
 
+
+
+@pytest.mark.asyncio
+async def test_get_drover_cluster_includes_reconciliation_fields(client):
+    rec = _make_cluster_record()
+    rec["last_reconciled_at"] = "2026-08-25T12:00:00Z"
+    rec["drift_status"] = {"has_drift": False, "mismatches": []}
+    with patch("drover.api.clusters.k3s_cluster") as mock_db:
+        mock_db.get_cluster = AsyncMock(return_value=rec)
+        resp = await client.get("/v1/clusters/k3s-1")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["last_reconciled_at"] == "2026-08-25T12:00:00Z"
+    assert data["drift_status"] == {"has_drift": False, "mismatches": []}
 
 @pytest.mark.asyncio
 async def test_get_drover_cluster_not_found(client):
@@ -186,36 +201,37 @@ async def test_delete_drover_cluster_enqueues_durable_job(client):
 
 @pytest.mark.asyncio
 async def test_delete_drover_cluster_cleans_occm_lbs(client):
-    """OCCM 활성 클러스터 삭제 시 Octavia LB를 정리해야 한다."""
+    """recorded inventory에 있는 Octavia LB를 정리해야 한다."""
     cluster = _make_cluster_record()
     cluster["occm_enabled"] = True
-
-    mock_lbs = [
-        {"id": "lb-1", "name": "kube_service_mycluster_kube-system_traefik"},
-        {"id": "lb-2", "name": "kube_service_mycluster_default_my-svc"},
-        {"id": "lb-3", "name": "other-lb-not-related"},
+    mock_managed = [
+        ManagedOpenStackResource(service="octavia", resource_type="load_balancer", resource_id="lb-1"),
+        ManagedOpenStackResource(service="octavia", resource_type="load_balancer", resource_id="lb-2"),
     ]
 
-    with patch("drover.api.clusters.k3s_cluster") as mock_db:
-        mock_db.get_cluster = AsyncMock(return_value=cluster)
+    with (
+        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
+        patch("drover.services.deletion.k3s_cluster") as mock_db,
+        patch("drover.services.deletion.inventory.list_managed_resources", AsyncMock(return_value=mock_managed)),
+        patch("drover.services.deletion.nova") as mock_nova,
+        patch("drover.services.deletion.neutron") as mock_neutron,
+        patch("drover.services.deletion.octavia") as mock_octavia,
+        patch("drover.services.deletion.k3s_kube") as mock_kube,
+    ):
+        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
         mock_db.update_cluster_status = AsyncMock()
         mock_db.delete_cluster_record = AsyncMock()
         mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        with patch("drover.api.clusters.nova") as mock_nova:
-            mock_nova.delete_server = MagicMock()
-            with patch("drover.api.clusters.neutron") as mock_neutron:
-                mock_neutron.delete_security_group = MagicMock()
-                with patch("drover.api.clusters.octavia") as mock_octavia:
-                    mock_octavia.list_load_balancers = MagicMock(return_value=mock_lbs)
-                    mock_octavia.delete_load_balancer = MagicMock()
-                    with patch("drover.api.clusters.k3s_kube") as mock_kube:
-                        mock_kube.delete_k8s_nodes = AsyncMock()
-                        resp = await client.post("/v1/clusters/k3s-1/delete-async")
+        mock_nova.delete_server_safe = MagicMock()
+        mock_neutron.delete_security_group_safe = MagicMock()
+        mock_octavia.delete_load_balancer_safe = MagicMock()
+        mock_kube.delete_k8s_nodes = AsyncMock()
+
+        resp = await client.post("/v1/clusters/k3s-1/delete-async")
 
     assert resp.status_code == 200
-    # 클러스터 이름 prefix에 해당하는 LB 2개만 삭제되어야 함
-    assert mock_octavia.delete_load_balancer.call_count == 2
-    deleted_ids = {call.args[1] for call in mock_octavia.delete_load_balancer.call_args_list}
+    assert mock_octavia.delete_load_balancer_safe.call_count == 2
+    deleted_ids = {call.args[1] for call in mock_octavia.delete_load_balancer_safe.call_args_list}
     assert deleted_ids == {"lb-1", "lb-2"}
 
 
@@ -224,21 +240,27 @@ async def test_delete_drover_cluster_lb_cleanup_failure_continues(client):
     """LB 정리 실패해도 클러스터 삭제는 계속 진행되어야 한다."""
     cluster = _make_cluster_record()
     cluster["occm_enabled"] = True
+    mock_managed = [
+        ManagedOpenStackResource(service="octavia", resource_type="load_balancer", resource_id="lb-1"),
+    ]
 
-    with patch("drover.api.clusters.k3s_cluster") as mock_db:
-        mock_db.get_cluster = AsyncMock(return_value=cluster)
+    with (
+        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
+        patch("drover.services.deletion.k3s_cluster") as mock_db,
+        patch("drover.services.deletion.inventory.list_managed_resources", AsyncMock(return_value=mock_managed)),
+        patch("drover.services.deletion.nova"),
+        patch("drover.services.deletion.neutron"),
+        patch("drover.services.deletion.octavia") as mock_octavia,
+        patch("drover.services.deletion.k3s_kube") as mock_kube,
+    ):
+        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
         mock_db.update_cluster_status = AsyncMock()
         mock_db.delete_cluster_record = AsyncMock()
         mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        with patch("drover.api.clusters.nova") as mock_nova:
-            mock_nova.delete_server = MagicMock()
-            with patch("drover.api.clusters.neutron") as mock_neutron:
-                mock_neutron.delete_security_group = MagicMock()
-                with patch("drover.api.clusters.octavia") as mock_octavia:
-                    mock_octavia.list_load_balancers = MagicMock(side_effect=Exception("Octavia unavailable"))
-                    with patch("drover.api.clusters.k3s_kube") as mock_kube:
-                        mock_kube.delete_k8s_nodes = AsyncMock()
-                        resp = await client.post("/v1/clusters/k3s-1/delete-async")
+        mock_octavia.delete_load_balancer_safe = MagicMock(side_effect=Exception("Octavia unavailable"))
+        mock_kube.delete_k8s_nodes = AsyncMock()
+
+        resp = await client.post("/v1/clusters/k3s-1/delete-async")
 
     assert resp.status_code == 200
     mock_db.delete_cluster_record.assert_called_once()
@@ -246,27 +268,30 @@ async def test_delete_drover_cluster_lb_cleanup_failure_continues(client):
 
 @pytest.mark.asyncio
 async def test_delete_drover_cluster_no_occm_skips_lb_cleanup(client):
-    """OCCM 비활성 클러스터는 LB 정리를 스킵해야 한다."""
+    """기록된 LB가 없는 클러스터는 LB 정리를 스킵해야 한다."""
     cluster = _make_cluster_record()
     cluster["occm_enabled"] = False
 
-    with patch("drover.api.clusters.k3s_cluster") as mock_db:
-        mock_db.get_cluster = AsyncMock(return_value=cluster)
+    with (
+        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
+        patch("drover.services.deletion.k3s_cluster") as mock_db,
+        patch("drover.services.deletion.inventory.list_managed_resources", AsyncMock(return_value=[])),
+        patch("drover.services.deletion.nova"),
+        patch("drover.services.deletion.neutron"),
+        patch("drover.services.deletion.octavia") as mock_octavia,
+        patch("drover.services.deletion.k3s_kube") as mock_kube,
+    ):
+        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
         mock_db.update_cluster_status = AsyncMock()
         mock_db.delete_cluster_record = AsyncMock()
         mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        with patch("drover.api.clusters.nova") as mock_nova:
-            mock_nova.delete_server = MagicMock()
-            with patch("drover.api.clusters.neutron") as mock_neutron:
-                mock_neutron.delete_security_group = MagicMock()
-                with patch("drover.api.clusters.octavia") as mock_octavia:
-                    mock_octavia.list_load_balancers = MagicMock()
-                    with patch("drover.api.clusters.k3s_kube") as mock_kube:
-                        mock_kube.delete_k8s_nodes = AsyncMock()
-                        resp = await client.post("/v1/clusters/k3s-1/delete-async")
+        mock_octavia.delete_load_balancer_safe = MagicMock()
+        mock_kube.delete_k8s_nodes = AsyncMock()
+
+        resp = await client.post("/v1/clusters/k3s-1/delete-async")
 
     assert resp.status_code == 200
-    mock_octavia.list_load_balancers.assert_not_called()
+    mock_octavia.delete_load_balancer_safe.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -276,8 +301,15 @@ async def test_delete_drover_cluster_deletes_k8s_nodes(client):
     cluster["occm_enabled"] = False
     cluster["agent_vm_ids"] = ["vm-agent-1", "vm-agent-2"]
 
-    with patch("drover.api.clusters.k3s_cluster") as mock_db:
-        mock_db.get_cluster = AsyncMock(return_value=cluster)
+    with (
+        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
+        patch("drover.services.deletion.k3s_cluster") as mock_db,
+        patch("drover.services.deletion.nova"),
+        patch("drover.services.deletion.neutron"),
+        patch("drover.services.deletion.octavia"),
+        patch("drover.services.deletion.k3s_kube") as mock_kube,
+    ):
+        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
         mock_db.update_cluster_status = AsyncMock()
         mock_db.delete_cluster_record = AsyncMock()
         mock_db.get_agent_vm_names = AsyncMock(
@@ -286,13 +318,9 @@ async def test_delete_drover_cluster_deletes_k8s_nodes(client):
                 "vm-agent-2": "mycluster-agent-2",
             }
         )
-        with patch("drover.api.clusters.nova") as mock_nova:
-            mock_nova.delete_server = MagicMock()
-            with patch("drover.api.clusters.neutron") as mock_neutron:
-                mock_neutron.delete_security_group = MagicMock()
-                with patch("drover.api.clusters.k3s_kube") as mock_kube:
-                    mock_kube.delete_k8s_nodes = AsyncMock()
-                    resp = await client.post("/v1/clusters/k3s-1/delete-async")
+        mock_kube.delete_k8s_nodes = AsyncMock()
+
+        resp = await client.post("/v1/clusters/k3s-1/delete-async")
 
     assert resp.status_code == 200
     mock_kube.delete_k8s_nodes.assert_called_once()
@@ -308,18 +336,21 @@ async def test_delete_drover_cluster_continues_if_k8s_node_delete_fails(client):
     cluster = _make_cluster_record()
     cluster["occm_enabled"] = False
 
-    with patch("drover.api.clusters.k3s_cluster") as mock_db:
-        mock_db.get_cluster = AsyncMock(return_value=cluster)
+    with (
+        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
+        patch("drover.services.deletion.k3s_cluster") as mock_db,
+        patch("drover.services.deletion.nova"),
+        patch("drover.services.deletion.neutron"),
+        patch("drover.services.deletion.octavia"),
+        patch("drover.services.deletion.k3s_kube") as mock_kube,
+    ):
+        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
         mock_db.update_cluster_status = AsyncMock()
         mock_db.delete_cluster_record = AsyncMock()
         mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        with patch("drover.api.clusters.nova") as mock_nova:
-            mock_nova.delete_server = MagicMock()
-            with patch("drover.api.clusters.neutron") as mock_neutron:
-                mock_neutron.delete_security_group = MagicMock()
-                with patch("drover.api.clusters.k3s_kube") as mock_kube:
-                    mock_kube.delete_k8s_nodes = AsyncMock(side_effect=Exception("K8s API unreachable"))
-                    resp = await client.post("/v1/clusters/k3s-1/delete-async")
+        mock_kube.delete_k8s_nodes = AsyncMock(side_effect=Exception("K8s API unreachable"))
+
+        resp = await client.post("/v1/clusters/k3s-1/delete-async")
 
     assert resp.status_code == 200
     mock_db.delete_cluster_record.assert_called_once()
@@ -332,20 +363,22 @@ async def test_delete_drover_cluster_vm_already_deleted(client):
     cluster["id"] = "k3s-vm-already-del"
     cluster["occm_enabled"] = False
 
-    with patch("drover.api.clusters.k3s_cluster") as mock_db:
-        mock_db.get_cluster = AsyncMock(return_value=cluster)
+    with (
+        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
+        patch("drover.services.deletion.k3s_cluster") as mock_db,
+        patch("drover.services.deletion.nova") as mock_nova,
+        patch("drover.services.deletion.neutron"),
+        patch("drover.services.deletion.octavia"),
+        patch("drover.services.deletion.k3s_kube") as mock_kube,
+    ):
+        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
         mock_db.update_cluster_status = AsyncMock()
         mock_db.delete_cluster_record = AsyncMock()
         mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        with patch("drover.api.clusters.nova") as mock_nova:
-            # delete_server가 이미 없는 VM → 예외 없이 리턴 (nova.py에서 404 처리)
-            mock_nova.delete_server = MagicMock()
-            mock_nova.wait_server_deleted = MagicMock()
-            with patch("drover.api.clusters.neutron") as mock_neutron:
-                mock_neutron.delete_security_group = MagicMock()
-                with patch("drover.api.clusters.k3s_kube") as mock_kube:
-                    mock_kube.delete_k8s_nodes = AsyncMock()
-                    resp = await client.post("/v1/clusters/k3s-vm-already-del/delete-async")
+        mock_nova.delete_server_safe = MagicMock()
+        mock_kube.delete_k8s_nodes = AsyncMock()
+
+        resp = await client.post("/v1/clusters/k3s-vm-already-del/delete-async")
 
     assert resp.status_code == 200
     mock_db.delete_cluster_record.assert_called_once()
@@ -359,24 +392,27 @@ async def test_delete_drover_cluster_vm_wait_timeout(client):
     cluster["occm_enabled"] = False
     cluster["security_group_id"] = "sg-1"
 
-    with patch("drover.api.clusters.k3s_cluster") as mock_db:
-        mock_db.get_cluster = AsyncMock(return_value=cluster)
+    with (
+        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
+        patch("drover.services.deletion.k3s_cluster") as mock_db,
+        patch("drover.services.deletion.nova") as mock_nova,
+        patch("drover.services.deletion.neutron") as mock_neutron,
+        patch("drover.services.deletion.octavia"),
+        patch("drover.services.deletion.k3s_kube") as mock_kube,
+    ):
+        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
         mock_db.update_cluster_status = AsyncMock()
         mock_db.delete_cluster_record = AsyncMock()
         mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        with patch("drover.api.clusters.nova") as mock_nova:
-            mock_nova.delete_server = MagicMock()
-            mock_nova.wait_server_deleted = MagicMock(side_effect=TimeoutError("timeout"))
-            with patch("drover.api.clusters.neutron") as mock_neutron:
-                mock_neutron.delete_security_group = MagicMock()
-                with patch("drover.api.clusters.k3s_kube") as mock_kube:
-                    mock_kube.delete_k8s_nodes = AsyncMock()
-                    resp = await client.post("/v1/clusters/k3s-vm-wait-timeout/delete-async")
+        mock_nova.delete_server_safe = MagicMock(side_effect=TimeoutError("timeout"))
+        mock_neutron.delete_security_group_safe = MagicMock()
+        mock_kube.delete_k8s_nodes = AsyncMock()
+
+        resp = await client.post("/v1/clusters/k3s-vm-wait-timeout/delete-async")
 
     assert resp.status_code == 200
     mock_db.delete_cluster_record.assert_called_once()
-    mock_neutron.delete_security_group.assert_called()
-
+    mock_neutron.delete_security_group_safe.assert_called()
 
 # ---------------------------------------------------------------------------
 # API LB octavia 서비스 단위 테스트 (LB-first 전략)
@@ -868,24 +904,26 @@ async def test_delete_drover_cluster_async_happy_path(client):
     cluster["occm_enabled"] = False
     cluster["security_group_id"] = "sg-async-1"
 
-    with patch("drover.api.clusters.k3s_cluster") as mock_db:
-        mock_db.get_cluster = AsyncMock(return_value=cluster)
+    with (
+        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
+        patch("drover.services.deletion.k3s_cluster") as mock_db,
+        patch("drover.services.deletion.nova") as mock_nova,
+        patch("drover.services.deletion.neutron") as mock_neutron,
+        patch("drover.services.deletion.octavia") as mock_octavia,
+        patch("drover.services.deletion.k3s_kube") as mock_kube,
+    ):
+        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
         mock_db.update_cluster_status = AsyncMock()
         mock_db.delete_cluster_record = AsyncMock()
         mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        with patch("drover.api.clusters.nova") as mock_nova:
-            mock_nova.delete_server = MagicMock()
-            mock_nova.wait_server_deleted = MagicMock()
-            with patch("drover.api.clusters.neutron") as mock_neutron:
-                mock_neutron.delete_floating_ip = MagicMock()
-                mock_neutron.delete_security_group = MagicMock()
-                with patch("drover.api.clusters.octavia") as mock_octavia:
-                    mock_octavia.delete_load_balancer = MagicMock()
-                    with patch("drover.api.clusters.k3s_kube") as mock_kube:
-                        mock_kube.delete_k8s_nodes = AsyncMock()
-                        async with client.stream("POST", "/v1/clusters/k3s-async-1/delete-async") as resp:
-                            assert resp.status_code == 200
-                            msgs = await _consume_sse(resp)
+        mock_nova.delete_server_safe = MagicMock()
+        mock_neutron.delete_security_group_safe = MagicMock()
+        mock_octavia.delete_load_balancer_safe = MagicMock()
+        mock_kube.delete_k8s_nodes = AsyncMock()
+
+        async with client.stream("POST", "/v1/clusters/k3s-async-1/delete-async") as resp:
+            assert resp.status_code == 200
+            msgs = await _consume_sse(resp)
 
     steps = [m["step"] for m in msgs]
     assert "delete_init" in steps
@@ -902,32 +940,30 @@ async def test_delete_drover_cluster_async_partial_failure_continues(client):
     cluster["id"] = "k3s-async-partial"
     cluster["occm_enabled"] = True
 
-    with patch("drover.api.clusters.k3s_cluster") as mock_db:
-        mock_db.get_cluster = AsyncMock(return_value=cluster)
+    with (
+        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
+        patch("drover.services.deletion.k3s_cluster") as mock_db,
+        patch("drover.services.deletion.nova"),
+        patch("drover.services.deletion.neutron"),
+        patch("drover.services.deletion.octavia") as mock_octavia,
+        patch("drover.services.deletion.k3s_kube") as mock_kube,
+    ):
+        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
         mock_db.update_cluster_status = AsyncMock()
         mock_db.delete_cluster_record = AsyncMock()
         mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        with patch("drover.api.clusters.nova") as mock_nova:
-            mock_nova.delete_server = MagicMock()
-            mock_nova.wait_server_deleted = MagicMock()
-            with patch("drover.api.clusters.neutron") as mock_neutron:
-                mock_neutron.delete_floating_ip = MagicMock()
-                mock_neutron.delete_security_group = MagicMock()
-                with patch("drover.api.clusters.octavia") as mock_octavia:
-                    mock_octavia.list_load_balancers = MagicMock(side_effect=Exception("octavia error"))
-                    mock_octavia.delete_load_balancer = MagicMock()
-                    with patch("drover.api.clusters.k3s_kube") as mock_kube:
-                        mock_kube.delete_k8s_nodes = AsyncMock()
-                        async with client.stream(
-                            "POST", "/v1/clusters/k3s-async-partial/delete-async"
-                        ) as resp:
-                            assert resp.status_code == 200
-                            msgs = await _consume_sse(resp)
+        mock_octavia.delete_load_balancer_safe = MagicMock(side_effect=Exception("octavia error"))
+        mock_kube.delete_k8s_nodes = AsyncMock()
+
+        async with client.stream(
+            "POST", "/v1/clusters/k3s-async-partial/delete-async"
+        ) as resp:
+            assert resp.status_code == 200
+            msgs = await _consume_sse(resp)
 
     steps = [m["step"] for m in msgs]
     assert steps[-1] == "completed"
     mock_db.delete_cluster_record.assert_called_once()
-
 
 @pytest.mark.asyncio
 async def test_delete_drover_cluster_async_already_deleted(client):
@@ -972,8 +1008,11 @@ async def test_delete_drover_cluster_async_fatal_failure(client):
     cluster["id"] = "k3s-async-fatal"
     cluster["occm_enabled"] = False
 
-    with patch("drover.api.clusters.k3s_cluster") as mock_db:
-        mock_db.get_cluster = AsyncMock(return_value=cluster)
+    with (
+        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
+        patch("drover.services.deletion.k3s_cluster") as mock_db,
+    ):
+        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
         mock_db.update_cluster_status = AsyncMock(side_effect=Exception("DB 연결 실패"))
         mock_db.delete_cluster_record = AsyncMock()
         async with client.stream("POST", "/v1/clusters/k3s-async-fatal/delete-async") as resp:

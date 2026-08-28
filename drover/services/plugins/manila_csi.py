@@ -24,8 +24,8 @@ class ManilaCsiPlugin:
     def should_deploy(self, settings: Settings) -> bool:
         if not settings.drover_manila_csi_enabled:
             return False
-        if not settings.os_auth_url or not settings.os_username or not settings.os_password:
-            _logger.warning("ManilaCsI 활성화됨이지만 OpenStack 인증 정보 미설정")
+        if not settings.os_auth_url:
+            _logger.warning("ManilaCSI 활성화됨이지만 os_auth_url 미설정")
             return False
         return True
 
@@ -33,17 +33,26 @@ class ManilaCsiPlugin:
         """Manila CSI는 별도 Secret 사용 — cloud.conf에 추가 섹션 없음."""
         return ""
 
-    def generate_manifests(self, cluster_name: str, project_id: str, settings: Settings, **kwargs) -> str:
+    def generate_manifests(
+        self,
+        cluster_name: str,
+        project_id: str,
+        settings: Settings,
+        *,
+        app_credential: dict | None = None,
+        **kwargs,
+    ) -> str:
         """Manila CSI + NFS CSI 드라이버 매니페스트 반환."""
+        if not app_credential or not app_credential.get("id") or not app_credential.get("secret"):
+            raise ValueError("app_credential containing id and secret is required for Manila CSI plugin")
         manila = _jinja.get_template("k3s_plugins/manila_csi/manifests.yaml.j2").render(
             manila_csi_image=settings.drover_manila_csi_image,
             cluster_name=cluster_name,
             share_protocol=settings.drover_manila_csi_share_protocol,
             os_auth_url=settings.os_auth_url,
             os_region=settings.os_region_name,
-            os_username=settings.os_username,
-            os_password=settings.os_password,
-            os_domain=settings.os_user_domain_name,
+            app_credential_id=app_credential["id"],
+            app_credential_secret=app_credential["secret"],
             project_id=project_id,
         )
         nfs = _jinja.get_template("k3s_plugins/manila_csi/nfs_csi.yaml.j2").render(

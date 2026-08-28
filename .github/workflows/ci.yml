@@ -39,3 +39,113 @@ jobs:
       - run: uv sync --all-extras --frozen
       - run: uv run pytest
       - run: uv run ruff check .
+
+  docker-build-and-scan:
+    name: Build Docker targets and scan images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build drover-api image target
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: drover-api
+          load: true
+          tags: drover-api:local
+      - name: Build drover-worker image target
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: drover-worker
+          load: true
+          tags: drover-worker:local
+      - name: Scan drover-api image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: drover-api:local
+          format: table
+          exit-code: '0'
+          severity: CRITICAL,HIGH
+      - name: Scan drover-worker image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: drover-worker:local
+          format: table
+          exit-code: '0'
+          severity: CRITICAL,HIGH
+
+  db-migration-and-readiness:
+    name: MariaDB migration ledger & API/worker readiness smoke
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: rootpassword
+          MARIADB_DATABASE: drover
+          MARIADB_USER: drover
+          MARIADB_PASSWORD: droverpass
+        ports:
+          - 3306:3306
+        options: --health-cmd="healthcheck.sh --connect --innodb_initialized" --health-interval=10s --health-timeout=5s --health-retries=5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=5s --health-retries=5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - name: Run migration ledger against disposable MariaDB
+        env:
+          DATABASE_URL: mysql+aiomysql://drover:droverpass@127.0.0.1:3306/drover
+          REDIS_URL: redis://127.0.0.1:6379/0
+          DROVER_CALLBACK_BASE_URL: http://127.0.0.1:8011
+          DROVER_KUBECONFIG_ENCRYPTION_KEY: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+          OS_AUTH_URL: http://127.0.0.1:5000/v3
+          OS_USERNAME: admin
+          OS_PASSWORD: secret
+        run: uv run drover-migrate
+      - name: Verify API and worker readiness smoke against MariaDB and Redis
+        env:
+          DATABASE_URL: mysql+aiomysql://drover:droverpass@127.0.0.1:3306/drover
+          REDIS_URL: redis://127.0.0.1:6379/0
+          DROVER_CALLBACK_BASE_URL: http://127.0.0.1:8011
+          DROVER_KUBECONFIG_ENCRYPTION_KEY: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+          OS_AUTH_URL: http://127.0.0.1:5000/v3
+          OS_USERNAME: admin
+          OS_PASSWORD: secret
+        run: |
+          uv run python -c "
+          import asyncio, sys
+          from drover.db import init_db
+          from drover.main import readiness_checks, liveness_check
+
+          async def main():
+              await init_db()
+              checks = await readiness_checks()
+              print('Readiness checks result:', checks)
+              assert checks['database'] == 'ok', 'Database check failed'
+              assert checks['redis'] == 'ok', 'Redis check failed'
+              assert checks['migrations'] == 'ok', 'Migrations check failed'
+
+          asyncio.run(main())
+          "
+
+  package-kolla-assets:
+    name: Package Kolla deployment assets artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Upload Kolla deployment assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: kolla-deployment-assets
+          path: deploy/kolla/
+          if-no-files-found: error

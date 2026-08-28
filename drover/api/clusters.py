@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import openstack
 import asyncio
+import hashlib
+import json
 import logging
 import random
 import string
@@ -34,28 +36,16 @@ from drover.models.schemas import (
     K3sProgressStep,
     ScaleK3sClusterRequest,
 )
-from drover.services import (
-    cinder,
-    neutron,
-    nova,
-    octavia,
-)
-from drover.services import (
-    cloudinit as k3s_cloudinit,
-)
+from drover.policy import authorize
 from drover.services import instance_orchestration as _instance_orch
 from drover.services import jobs as _jobs
-from drover.services import (
-    kube as k3s_kube,
-)
-from drover.services import (
-    plugins as k3s_plugins,
-)
+from drover.services import nova, operations
 from drover.services import store as k3s_cluster
 from drover.services.activity import rec
 from drover.services.cache import cached_call, invalidate, ttl_normal, ttl_slow
 from drover.services.cache import invalidation as cache_invalidation
 from drover.services.cache import keys as cache_keys
+from drover.services.deletion import delete_cluster_progress as _delete_cluster_progress
 
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
@@ -109,6 +99,8 @@ def _cluster_to_info(c: dict) -> K3sClusterInfo:
         api_fip_address=c.get("api_fip_address") or None,
         master_count=int(c.get("master_count") or 1),
         stampede_enabled=bool(c.get("stampede_enabled", False)),
+        last_reconciled_at=c.get("last_reconciled_at") or None,
+        drift_status=c.get("drift_status") or None,
     )
 
 
@@ -119,6 +111,7 @@ async def list_k3s_clusters(
     cm: CacheMode = Depends(cache_mode),
 ):
     project_id = token_info["project_id"]
+    authorize("drover:clusters:get", {"project_id": project_id}, token_info)
     sub = "all" if include_deleted else None
     cache_key = cache_keys.project_key("k3s", project_id, "clusters", sub=sub)
 
@@ -146,6 +139,7 @@ async def get_k3s_cluster(
     cm: CacheMode = Depends(cache_mode),
 ):
     project_id = token_info["project_id"]
+    authorize("drover:clusters:get", {"project_id": project_id}, token_info)
     cache_key = cache_keys.project_key("k3s", project_id, "clusters", sub=cluster_id)
 
     async def _fetch():
@@ -174,6 +168,7 @@ async def download_kubeconfig(
     from drover.services.cache import get_backend
 
     project_id = token_info["project_id"]
+    authorize("drover:clusters:get", {"project_id": project_id}, token_info)
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
@@ -249,541 +244,271 @@ async def head_kubeconfig(
     return await download_kubeconfig(request, cluster_id, token_info, cm)
 
 
+def compute_request_hash(req: CreateK3sClusterRequest) -> str:
+    data = req.model_dump(mode="json")
+    canonical_json = json.dumps(data, sort_keys=True)
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
+def _map_phase_to_step(phase: str) -> K3sProgressStep:
+    try:
+        return K3sProgressStep(phase)
+    except ValueError:
+        if phase == "job_enqueued":
+            return K3sProgressStep.SECURITY_GROUP
+        if phase == "waiting_callback":
+            return K3sProgressStep.WAITING_CALLBACK
+        if phase == "completed":
+            return K3sProgressStep.COMPLETED
+        if phase == "failed":
+            return K3sProgressStep.FAILED
+        return K3sProgressStep.SERVER_CREATING
+
+
 @router.post("/async")
 @limiter.limit("5/minute")
 async def create_k3s_cluster_async(
     request: Request,
     req: CreateK3sClusterRequest,
     conn: openstack.connection.Connection = Depends(get_os_conn),
+    token_info: dict = Depends(get_token_info),
 ):
     """k3s 클러스터 생성 — SSE 스트리밍 진행률 반환."""
-    token_info_obj = getattr(request.state, "token_info", None)
     project_id = conn._afterglow_project_id
+    authorize("drover:clusters:create", {"project_id": project_id}, token_info)
     s = get_settings()
 
-    # Apply template defaults before resolving any policy. Explicit request
-    # values retain precedence over the template and administrator defaults.
-    _template_snapshot: dict | None = None
-    template_default_image_id: str | None = None
-    if req.template_id:
-        from drover.services import template as _tmpl_svc
+    idempotency_key = request.headers.get("idempotency-key") or request.headers.get("Idempotency-Key")
+    req_hash = compute_request_hash(req)
 
-        _tmpl = await _tmpl_svc.get_template(req.template_id)
-        if not _tmpl:
-            raise HTTPException(status_code=400, detail=f"템플릿을 찾을 수 없습니다: {req.template_id}")
-        _template_snapshot = dict(_tmpl)
-        if req.agent_count == 1 and _tmpl.get("default_node_count") is not None:
-            req = req.model_copy(update={"agent_count": _tmpl["default_node_count"]})
-        if not req.agent_flavor_id and _tmpl.get("default_agent_flavor_id"):
-            req = req.model_copy(update={"agent_flavor_id": _tmpl["default_agent_flavor_id"]})
-        if req.os_type == "ubuntu" and _tmpl.get("os_type") and _tmpl["os_type"] != "ubuntu":
-            req = req.model_copy(update={"os_type": _tmpl["os_type"]})
-        template_default_image_id = _tmpl.get("default_image_id") or None
+    existing_op = None
+    if idempotency_key:
+        existing_op = await operations.get_operation_by_idempotency_key(project_id, idempotency_key)
+        if existing_op:
+            if existing_op.request_hash != req_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Idempotency key {idempotency_key!r} reused with a different request hash",
+                )
+            cluster_id = existing_op.cluster_id
+            operation_id = existing_op.id
 
-    from drover.services.resource_policies import validate_existing_selection
-    from drover.services.resource_policy_store import (
-        ResourcePolicyStorageUnavailable,
-        get_required_runtime_setting,
-        resolve_policy_snapshot,
-    )
+    if not existing_op:
+        # Apply template defaults before resolving any policy. Explicit request
+        # values retain precedence over the template and administrator defaults.
+        _template_snapshot: dict | None = None
+        template_default_image_id: str | None = None
+        if req.template_id:
+            from drover.services import template as _tmpl_svc
 
-    os_type = req.os_type
-    image_policy_key = "k3s.fcos_image" if os_type == "fcos" else "k3s.server_image"
-    try:
-        policy_snapshot = await resolve_policy_snapshot(
-            conn=conn,
-            keys=(
-                image_policy_key,
-                "k3s.server_flavor",
-                "k3s.default_agent_flavor",
-                "k3s.volume_availability_zone",
-            ),
+            _tmpl = await _tmpl_svc.get_template(req.template_id)
+            if not _tmpl:
+                raise HTTPException(status_code=400, detail=f"템플릿을 찾을 수 없습니다: {req.template_id}")
+            _template_snapshot = dict(_tmpl)
+            if req.agent_count == 1 and _tmpl.get("default_node_count") is not None:
+                req = req.model_copy(update={"agent_count": _tmpl["default_node_count"]})
+            if not req.agent_flavor_id and _tmpl.get("default_agent_flavor_id"):
+                req = req.model_copy(update={"agent_flavor_id": _tmpl["default_agent_flavor_id"]})
+            if req.os_type == "ubuntu" and _tmpl.get("os_type") and _tmpl["os_type"] != "ubuntu":
+                req = req.model_copy(update={"os_type": _tmpl["os_type"]})
+            template_default_image_id = _tmpl.get("default_image_id") or None
+
+        from drover.services.resource_policies import validate_existing_selection
+        from drover.services.resource_policy_store import (
+            ResourcePolicyStorageUnavailable,
+            get_policy_snapshot,
+            get_required_runtime_setting,
+            resolve_policy_snapshot,
         )
-    except ResourcePolicyStorageUnavailable as exc:
-        raise HTTPException(status_code=503, detail="resource policy storage is unavailable") from exc
-    server_image_id = policy_snapshot[image_policy_key]["id"]
-    server_flavor_id = policy_snapshot["k3s.server_flavor"]["id"]
-    volume_availability_zone = policy_snapshot["k3s.volume_availability_zone"]["id"]
 
-    if req.agent_flavor_id:
-        agent_selection = await validate_existing_selection(conn, "k3s.default_agent_flavor", req.agent_flavor_id)
-        agent_flavor_id = agent_selection["id"]
-        policy_snapshot["k3s.default_agent_flavor"] = {"id": agent_selection["id"], "name": agent_selection["name"]}
-    else:
-        agent_flavor_id = policy_snapshot["k3s.default_agent_flavor"]["id"]
-    if req.agent_count > 0 and not agent_flavor_id:
-        raise HTTPException(status_code=503, detail="에이전트 플레이버가 설정되지 않았습니다. 관리자에게 문의하세요.")
+        os_type = req.os_type
+        image_policy_key = "k3s.fcos_image" if os_type == "fcos" else "k3s.server_image"
+        try:
+            policy_snapshot = await resolve_policy_snapshot(
+                conn=conn,
+                keys=(
+                    image_policy_key,
+                    "k3s.server_flavor",
+                    "k3s.default_agent_flavor",
+                    "k3s.volume_availability_zone",
+                ),
+            )
+        except ResourcePolicyStorageUnavailable as exc:
+            raise HTTPException(status_code=503, detail="resource policy storage is unavailable") from exc
 
-    agent_image_snapshot = dict(policy_snapshot[image_policy_key])
-    if template_default_image_id:
-        agent_image = await validate_existing_selection(conn, image_policy_key, template_default_image_id)
-        agent_image_id = agent_image["id"]
-        agent_image_snapshot = {"id": agent_image["id"], "name": agent_image["name"]}
-    policy_snapshot["effective_agent_image"] = agent_image_snapshot
-    optional_policy_keys = (
-        "k3s.occm_floating_network",
-        "k3s.occm_public_network",
-        "k3s.lb_subnet",
-        "k3s.api_lb_vip_network",
-        "k3s.api_lb_floating_network",
-        "k3s.octavia_ingress_floating_network",
-    )
-    from drover.services.resource_policy_store import get_policy_snapshot
+        server_image_id = policy_snapshot[image_policy_key]["id"]
+        server_flavor_id = policy_snapshot["k3s.server_flavor"]["id"]
+        policy_snapshot["k3s.volume_availability_zone"]["id"]
 
-    stored_optional = await get_policy_snapshot(optional_policy_keys)
-    for optional_key, stored_selection in stored_optional.items():
-        if stored_selection is None:
-            continue
-        selection = await validate_existing_selection(conn, optional_key, stored_selection["id"])
-        policy_snapshot[optional_key] = {"id": selection["id"], "name": selection["name"]}
+        if req.agent_flavor_id:
+            agent_selection = await validate_existing_selection(conn, "k3s.default_agent_flavor", req.agent_flavor_id)
+            agent_flavor_id = agent_selection["id"]
+            policy_snapshot["k3s.default_agent_flavor"] = {"id": agent_selection["id"], "name": agent_selection["name"]}
+        else:
+            agent_flavor_id = policy_snapshot["k3s.default_agent_flavor"]["id"]
 
-    plugin_settings = k3s_plugins.with_resource_policy_snapshot(s, policy_snapshot)
-    network_id = req.network_id or await _instance_orch.resolve_default_network(conn, s)
-    k3s_version = await get_required_runtime_setting("k3s.version")
-    boot_volume_size = s.drover_boot_volume_size_gb
-    cluster_id = str(uuid.uuid4())
+        if req.agent_count > 0 and not agent_flavor_id:
+            raise HTTPException(status_code=503, detail="에이전트 플레이버가 설정되지 않았습니다. 관리자에게 문의하세요.")
+
+        agent_image_snapshot = dict(policy_snapshot[image_policy_key])
+        if template_default_image_id:
+            agent_image = await validate_existing_selection(conn, image_policy_key, template_default_image_id)
+            agent_image["id"]
+            agent_image_snapshot = {"id": agent_image["id"], "name": agent_image["name"]}
+        policy_snapshot["effective_agent_image"] = agent_image_snapshot
+
+        optional_policy_keys = (
+            "k3s.occm_floating_network",
+            "k3s.occm_public_network",
+            "k3s.lb_subnet",
+            "k3s.api_lb_vip_network",
+            "k3s.api_lb_floating_network",
+            "k3s.octavia_ingress_floating_network",
+        )
+        stored_optional = await get_policy_snapshot(optional_policy_keys)
+        for optional_key, stored_selection in stored_optional.items():
+            if stored_selection is None:
+                continue
+            selection = await validate_existing_selection(conn, optional_key, stored_selection["id"])
+            policy_snapshot[optional_key] = {"id": selection["id"], "name": selection["name"]}
+
+        network_id = req.network_id or await _instance_orch.resolve_default_network(conn, s)
+        k3s_version = await get_required_runtime_setting("k3s.version")
+
+        cluster_id = str(uuid.uuid4())
+        now = datetime.now(UTC).isoformat()
+        _creator_user_id = conn._afterglow_user_id if hasattr(conn, "_afterglow_user_id") else None
+        _creator_username = None
+        if token_info and isinstance(token_info, dict):
+            _creator_user_id = _creator_user_id or token_info.get("user_id")
+            _creator_username = token_info.get("username")
+
+        cluster_data = {
+            "name": req.name,
+            "status": "CREATING",
+            "status_reason": "",
+            "server_vm_id": None,
+            "agent_vm_ids": [],
+            "agent_count": req.agent_count,
+            "server_flavor_id": server_flavor_id,
+            "agent_flavor_id": agent_flavor_id,
+            "server_image_id": server_image_id,
+            "default_agent_image_id": agent_image_snapshot.get("id"),
+            "network_id": network_id,
+            "security_group_id": None,
+            "server_ip": "",
+            "api_address": "",
+            "key_name": req.key_name or "",
+            "ssh_public_key": None,
+            "k3s_version": k3s_version,
+            "occm_enabled": False,
+            "plugins_enabled": None,
+            "created_by_user_id": _creator_user_id or "",
+            "created_by_username": _creator_username or "",
+            "created_at": now,
+            "updated_at": now,
+            "master_count": req.master_count,
+            "os_type": os_type,
+            "template_id": req.template_id or None,
+            "template_snapshot": _template_snapshot,
+            "resource_policy_snapshot": policy_snapshot,
+            "stampede_enabled": req.stampede_enabled,
+            "allowed_cidrs": req.allowed_cidrs,
+        }
+
+        await k3s_cluster.create_cluster_record(project_id, cluster_id, cluster_data)
+
+        request_id = getattr(request.state, "correlation_id", None) or request.headers.get("x-openstack-request-id")
+        job_payload = dict(cluster_data)
+
+        await _jobs.enqueue_job(
+            cluster_id=cluster_id,
+            project_id=project_id,
+            kind="create",
+            payload=job_payload,
+            user_id=_creator_user_id,
+            username=_creator_username,
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            request_hash=req_hash,
+            op_kind="create",
+        )
+
+        try:
+            await invalidate(f"afterglow:k3s:{project_id}:*")
+            await cache_invalidation.invalidate_mutation_count("k3s", project_id)
+        except Exception:
+            pass
+
+        active_op = await operations.get_active_operation(None, cluster_id, kind="create")
+        operation_id = active_op.id if active_op else ""
 
     async def progress_generator() -> AsyncGenerator[str, None]:
         _start_time = time.monotonic()
-
-        def event(step: K3sProgressStep, progress: int, message: str, **kw) -> str:
-            elapsed = round(time.monotonic() - _start_time, 1)
-            msg = K3sProgressMessage(step=step, progress=progress, message=message, elapsed_seconds=elapsed, **kw)
-            return f"data: {msg.model_dump_json()}\n\n"
-
-        # 프록시/CDN 버퍼 우회: 첫 chunk를 즉시 flush하기 위한 SSE 주석 패딩
         yield ": " + " " * 2048 + "\n\n"
 
-        # 롤백 추적
-        sg_id: str | None = None
-        boot_volume_id: str | None = None
-        server_vm_id: str | None = None
-        app_credential_id: str | None = None
-        ha_lb_id: str | None = None
-        ha_lb_pool_id: str | None = None
-        ha_fip_id: str | None = None
-        ha_fip_address: str | None = None
+        seen_sequences = set()
+        while True:
+            events = await operations.get_operation_events(None, operation_id)
+            for ev in events:
+                if ev.sequence in seen_sequences:
+                    continue
+                seen_sequences.add(ev.sequence)
+                elapsed = round(time.monotonic() - _start_time, 1)
 
-        try:
-            # --- Step 1: 보안 그룹 생성 ---
-            yield event(K3sProgressStep.SECURITY_GROUP, 5, "k3s 보안 그룹 생성 중...")
-            sg_name = f"k3s-{req.name}-{cluster_id[:8]}"
-            sg = await asyncio.to_thread(
-                neutron.create_security_group, conn, sg_name, f"k3s cluster {req.name} security group"
-            )
-            sg_id = sg["id"]
+                pj = ev.payload_json if isinstance(ev.payload_json, dict) else {}
+                step_val = pj.get("step") or ev.phase
+                step = _map_phase_to_step(step_val)
+                progress = pj.get("progress") if "progress" in pj else 10
+                msg = ev.message or ""
+                error = pj.get("error")
 
-            # 보안 그룹 규칙 추가
-            # SSH/K3s API는 allowed_cidrs가 있으면 해당 CIDR만, 없으면 0.0.0.0/0 허용
-            mgmt_cidrs = req.allowed_cidrs or ["0.0.0.0/0"]
-            rules = []
-            for cidr in mgmt_cidrs:
-                # SSH
-                rules.append(
-                    dict(
-                        direction="ingress", protocol="tcp", port_range_min=22, port_range_max=22, remote_ip_prefix=cidr
+                progress_msg = K3sProgressMessage(
+                    step=step,
+                    progress=progress,
+                    message=msg,
+                    cluster_id=cluster_id,
+                    operation_id=operation_id,
+                    sequence=ev.sequence,
+                    error=error,
+                    elapsed_seconds=elapsed,
+                )
+                yield f"data: {progress_msg.model_dump_json()}\n\n"
+
+            op = await operations.get_operation(None, operation_id)
+            if op and op.status in {"WAITING_CALLBACK", "SUCCEEDED", "FAILED", "CANCELLED"}:
+                final_events = await operations.get_operation_events(None, operation_id)
+                for ev in final_events:
+                    if ev.sequence in seen_sequences:
+                        continue
+                    seen_sequences.add(ev.sequence)
+                    elapsed = round(time.monotonic() - _start_time, 1)
+                    pj = ev.payload_json if isinstance(ev.payload_json, dict) else {}
+                    step_val = pj.get("step") or ev.phase
+                    step = _map_phase_to_step(step_val)
+                    progress = pj.get("progress") if "progress" in pj else 10
+                    msg = ev.message or ""
+                    error = pj.get("error")
+
+                    progress_msg = K3sProgressMessage(
+                        step=step,
+                        progress=progress,
+                        message=msg,
+                        cluster_id=cluster_id,
+                        operation_id=operation_id,
+                        sequence=ev.sequence,
+                        error=error,
+                        elapsed_seconds=elapsed,
                     )
-                )
-                # k3s API server
-                rules.append(
-                    dict(
-                        direction="ingress",
-                        protocol="tcp",
-                        port_range_min=6443,
-                        port_range_max=6443,
-                        remote_ip_prefix=cidr,
-                    )
-                )
-            rules += [
-                # Kubelet (SG 내부)
-                dict(
-                    direction="ingress",
-                    protocol="tcp",
-                    port_range_min=10250,
-                    port_range_max=10250,
-                    remote_group_id=sg_id,
-                ),
-                # VXLAN (SG 내부)
-                dict(
-                    direction="ingress", protocol="udp", port_range_min=8472, port_range_max=8472, remote_group_id=sg_id
-                ),
-                # WireGuard (SG 내부)
-                dict(
-                    direction="ingress",
-                    protocol="udp",
-                    port_range_min=51820,
-                    port_range_max=51820,
-                    remote_group_id=sg_id,
-                ),
-                # HTTP (Traefik)
-                dict(
-                    direction="ingress",
-                    protocol="tcp",
-                    port_range_min=80,
-                    port_range_max=80,
-                    remote_ip_prefix="0.0.0.0/0",
-                ),
-                # HTTPS (Traefik)
-                dict(
-                    direction="ingress",
-                    protocol="tcp",
-                    port_range_min=443,
-                    port_range_max=443,
-                    remote_ip_prefix="0.0.0.0/0",
-                ),
-                # NodePort
-                dict(
-                    direction="ingress",
-                    protocol="tcp",
-                    port_range_min=30000,
-                    port_range_max=32767,
-                    remote_ip_prefix="0.0.0.0/0",
-                ),
-            ]
-            for rule_kwargs in rules:
-                await asyncio.to_thread(neutron.create_security_group_rule, conn, sg_id, **rule_kwargs)
-            yield event(K3sProgressStep.SECURITY_GROUP, 10, "보안 그룹 생성 완료")
-
-            extra_tls_sans: list[str] = []
-
-            # --- Step 1-B: HA LB + FIP 생성 (master_count >= 3) ---
-            if req.master_count >= 3:
-                lb_subnet_id = (policy_snapshot.get("k3s.lb_subnet") or {}).get("id")
-                if not lb_subnet_id:
-                    raise RuntimeError("K3s API load-balancer subnet policy is required for HA clusters")
-                ha_lb = await asyncio.to_thread(
-                    octavia.create_load_balancer,
-                    conn,
-                    f"k3s-ha-{req.name}-{cluster_id[:8]}",
-                    lb_subnet_id,
-                    vip_network_id=(policy_snapshot.get("k3s.api_lb_vip_network") or {}).get("id"),
-                )
-                ha_lb_id = ha_lb["id"]
-                await asyncio.to_thread(octavia.wait_for_load_balancer, conn, ha_lb_id)
-                listener = await asyncio.to_thread(
-                    octavia.create_listener, conn, ha_lb_id, "TCP", 6443, name=f"k3s-ha-{req.name}-6443"
-                )
-                ha_lb_pool_id_raw = await asyncio.to_thread(
-                    octavia.create_pool,
-                    conn,
-                    ha_lb_id,
-                    "TCP",
-                    name=f"k3s-ha-{req.name}-pool",
-                    listener_id=listener["id"],
-                )
-                ha_lb_pool_id = ha_lb_pool_id_raw["id"]
-
-                # FIP allocation uses the dedicated API load-balancer policy.
-                _fip_net = (policy_snapshot.get("k3s.api_lb_floating_network") or {}).get("id", "")
-                if _fip_net:
-                    _lb_vip_port = ha_lb.get("vip_port_id")
-                    _fip = await asyncio.to_thread(
-                        lambda: conn.network.create_ip(
-                            floating_network_id=_fip_net,
-                            port_id=_lb_vip_port,
-                        )
-                    )
-                    ha_fip_id = _fip["id"]
-                    ha_fip_address = _fip["floating_ip_address"]
-                    extra_tls_sans.append(ha_fip_address)
-                    yield event(K3sProgressStep.SERVER_HA_BOOTSTRAP, 18, f"HA API LB 준비 완료 (FIP: {ha_fip_address})")
-                else:
-                    yield event(K3sProgressStep.SERVER_HA_BOOTSTRAP, 18, "HA API LB 준비 완료")
-
-            # --- Step 2: 서버 부트 볼륨 생성 ---
-            # K8s 스타일: 매 생성마다 고유한 suffix로 이름 충돌 방지
-            server_suffix = _rand_suffix()
-            server_vm_name = f"{req.name}-{server_suffix}"
-            yield event(K3sProgressStep.SERVER_VOLUME, 28, "서버 노드 부트 볼륨 생성 중...")
-            boot_vol = await asyncio.to_thread(
-                cinder.create_volume_from_image,
-                conn,
-                f"{server_vm_name}-boot",
-                server_image_id,
-                boot_volume_size,
-                volume_availability_zone,
-            )
-            boot_volume_id = boot_vol.id
-            yield event(K3sProgressStep.SERVER_VOLUME, 35, "서버 부트 볼륨 생성 완료")
-
-            # --- Step 3: 콜백 토큰 + cloud-init 생성 ---
-            yield event(K3sProgressStep.SERVER_CREATING, 40, "서버 VM cloud-init 생성 중...")
-            # 공개키 미리 조회 (에이전트 VM은 admin conn으로 생성하므로 cloud-init에 직접 주입)
-            ssh_public_key = ""
-            if req.key_name:
-                try:
-                    kp = await asyncio.to_thread(conn.compute.find_keypair, req.key_name)
-                    if kp:
-                        ssh_public_key = kp.public_key or ""
-                except Exception:
-                    pass
-            callback_token = await k3s_cluster.create_callback_token(project_id, cluster_id)
-            callback_url = s.drover_callback_base_url.rstrip("/")
-
-            # 플러그인 레지스트리로 활성 플러그인 집계
-            from drover.services import keystone as _keystone
-
-            _internal_network_name = ""
-            try:
-                _net_obj = await asyncio.to_thread(lambda: conn.network.get_network(network_id))
-                _internal_network_name = _net_obj.name or ""
-            except Exception:
-                pass
-            cloud_conf = k3s_plugins.aggregate_cloud_conf(
-                project_id, plugin_settings, internal_network_name=_internal_network_name
-            )
-            active_plugins = k3s_plugins.get_active_plugin_names(plugin_settings)
-            occm_active = active_plugins.get("occm", False)
-
-            # PR1 — KMS 또는 Octavia Ingress 활성 시 cluster 별 App Credential 발급 (1회).
-            # KMS plugin 의 cloud.conf 에 admin password 대신 app cred 사용 → 노드 한 대
-            # compromise 시 OpenStack admin 권한 노출 방지.
-            app_cred: dict | None = None
-            needs_app_cred = active_plugins.get("octavia_ingress", False) or active_plugins.get("barbican_kms", False)
-            if needs_app_cred:
-                yield event(K3sProgressStep.SERVER_CREATING, 38, "App Credential 발급 중...")
-                app_cred = await _keystone.create_app_credential_for_cluster(project_id, req.name)
-                app_credential_id = app_cred["id"]
-
-            # KMS keys are project-owned; inability to obtain one is fatal.
-            kek_id: str | None = None
-            if active_plugins.get("barbican_kms", False):
-                yield event(K3sProgressStep.SERVER_CREATING, 39, "KEK (Barbican) 조회/발급 중...")
-                from drover.services import barbican as _barbican
-
-                try:
-                    kek_id = await _barbican.ensure_project_kek(project_id)
-                except Exception as exc:
-                    raise RuntimeError("project Barbican KEK could not be resolved") from exc
-
-            # Octavia Ingress derives its subnet from the cluster network.
-            manifest_kwargs: dict = {}
-            if active_plugins.get("octavia_ingress", False):
-                subnets = await asyncio.to_thread(lambda: list(conn.network.subnets(network_id=network_id)))
-                if not subnets:
-                    raise RuntimeError(
-                        f"네트워크 {network_id}에 subnet이 없습니다. Octavia Ingress를 위한 subnet 도출 실패."
-                    )
-                floating_network_id = (policy_snapshot.get("k3s.octavia_ingress_floating_network") or {}).get("id")
-                if not floating_network_id:
-                    raise RuntimeError("Octavia ingress floating network policy is required when the plugin is enabled")
-                manifest_kwargs = {
-                    "subnet_id": subnets[0].id,
-                    "app_credential": app_cred,
-                    "floating_network_id": floating_network_id,
-                }
-
-            plugin_manifests, manifest_failures = k3s_plugins.aggregate_manifests(
-                req.name, project_id, plugin_settings, **manifest_kwargs
-            )
-            if manifest_failures:
-                err_msg = f"플러그인 매니페스트 생성 실패: {', '.join(manifest_failures)}"
-                _logger.error("k3s cluster %s: %s", cluster_id, err_msg)
-                await rec(
-                    token_info_obj or {},
-                    conn,
-                    resource_type="k3s_cluster",
-                    action="create",
-                    status="failed",
-                    resource_name=req.name,
-                    error_message=err_msg[:500],
-                )
-                yield event(K3sProgressStep.FAILED, 0, err_msg, cluster_id=cluster_id)
-                return
-            extra_server_args = k3s_plugins.aggregate_server_args(plugin_settings)
-            extra_write_files = k3s_plugins.aggregate_extra_write_files(
-                project_id, req.name, plugin_settings, app_credential=app_cred, kek_id=kek_id
-            )
-
-            userdata_result = k3s_cloudinit.generate_server_userdata(
-                cluster_name=req.name,
-                k3s_version=k3s_version,
-                callback_url=callback_url,
-                callback_token=callback_token,
-                cloud_conf=cloud_conf,
-                primary_network_id=network_id,
-                plugin_manifests=plugin_manifests,
-                extra_server_args=extra_server_args,
-                extra_write_files=extra_write_files,
-                extra_tls_sans=extra_tls_sans,
-                needs_external_cloud_provider=k3s_plugins.needs_external_cloud_provider(plugin_settings),
-                os_type=os_type,
-                server_node_name=server_vm_name,
-                barbican_kms_enabled=any(p.name == "barbican_kms" for p in k3s_plugins.get_active_plugins(s)),
-                cluster_init=req.master_count >= 3,
-            )
-
-            # --- Step 4: 서버 VM 생성 ---
-            yield event(K3sProgressStep.SERVER_CREATING, 48, "서버 VM 생성 중 (완료까지 수 분 소요)...")
-            server_vm = await asyncio.to_thread(
-                nova.create_server,
-                conn,
-                server_vm_name,
-                server_flavor_id,
-                network_id,
-                boot_volume_id,
-                userdata=userdata_result.data,
-                key_name=req.key_name,
-                metadata={
-                    "k3s_horse_generator_role": "k3s_server",
-                    "k3s_horse_generator_cluster_id": cluster_id,
-                    "k3s_horse_generator_cluster_name": req.name,
-                },
-                delete_boot_volume_on_termination=True,
-                security_groups=[sg_id],
-                config_drive=userdata_result.config_drive,
-            )
-            server_vm_id = server_vm.id
-            yield event(K3sProgressStep.SERVER_CREATING, 60, f"서버 VM 생성 완료: {server_vm_id}")
-
-            # --- Step 5: Redis에 클러스터 레코드 저장 ---
-            yield event(K3sProgressStep.WAITING_CALLBACK, 65, "k3s 초기화 대기 중 (서버 VM에서 k3s 설치 중)...")
-            now = datetime.now(UTC).isoformat()
-            # 생성자 정보 추출
-            _creator_user_id = conn._afterglow_user_id if hasattr(conn, "_afterglow_user_id") else None
-            _creator_username = None
-            if token_info_obj and isinstance(token_info_obj, dict):
-                _creator_user_id = _creator_user_id or token_info_obj.get("user_id")
-                _creator_username = token_info_obj.get("username")
-            await k3s_cluster.create_cluster_record(
-                project_id,
-                cluster_id,
-                {
-                    "name": req.name,
-                    "status": "CREATING",
-                    "status_reason": "",
-                    "server_vm_id": server_vm_id,
-                    "agent_vm_ids": [],
-                    "agent_count": req.agent_count,
-                    "server_flavor_id": server_flavor_id,
-                    "agent_flavor_id": agent_flavor_id,
-                    "server_image_id": server_image_id,
-                    "default_agent_image_id": agent_image_id,
-                    "network_id": network_id,
-                    "security_group_id": sg_id,
-                    "server_ip": "",
-                    "api_address": "",
-                    "key_name": req.key_name or "",
-                    "ssh_public_key": ssh_public_key,
-                    "k3s_version": k3s_version,
-                    "occm_enabled": occm_active,
-                    "plugins_enabled": active_plugins,
-                    "created_by_user_id": _creator_user_id or "",
-                    "created_by_username": _creator_username or "",
-                    "created_at": now,
-                    "updated_at": now,
-                    "api_lb_id": ha_lb_id or "",
-                    "api_lb_pool_id": ha_lb_pool_id or "",
-                    "api_fip_id": ha_fip_id or "",
-                    "api_fip_address": ha_fip_address or "",
-                    "master_count": req.master_count,
-                    "os_type": os_type,
-                    "server_vm_name": server_vm_name,
-                    "app_credential_id": app_credential_id or "",
-                    "template_id": req.template_id or None,
-                    "template_snapshot": _template_snapshot,
-                    "resource_policy_snapshot": policy_snapshot,
-                    "stampede_enabled": req.stampede_enabled,
-                },
-            )
-            try:
-                await invalidate(f"afterglow:k3s:{project_id}:*")
-                await cache_invalidation.invalidate_mutation_count("k3s", project_id)
-            except Exception:
-                pass
-
-            await rec(
-                token_info_obj or {},
-                conn,
-                resource_type="k3s_cluster",
-                action="create",
-                status="success",
-                resource_id=cluster_id,
-                resource_name=req.name,
-            )
-            yield event(
-                K3sProgressStep.COMPLETED,
-                100,
-                f"클러스터 생성 요청 완료. 서버 VM이 k3s를 설치한 후 에이전트 {req.agent_count}개가 자동으로 생성됩니다.",
-                cluster_id=cluster_id,
-            )
-
-        except Exception as e:
-            _logger.error("k3s cluster creation failed: %s", e, exc_info=True)
-            await rec(
-                token_info_obj or {},
-                conn,
-                resource_type="k3s_cluster",
-                action="create",
-                status="failed",
-                resource_name=req.name,
-                error_message=str(e)[:500],
-            )
-            yield event(K3sProgressStep.FAILED, 0, f"클러스터 생성 실패: {e}", error=str(e))
-            # 롤백
-            await _rollback(
-                conn,
-                server_vm_id,
-                boot_volume_id,
-                sg_id,
-                app_credential_id,
-                project_id,
-                lb_id=ha_lb_id,
-                fip_id=ha_fip_id,
-            )
+                    yield f"data: {progress_msg.model_dump_json()}\n\n"
+                break
+            await asyncio.sleep(0.1)
 
     return StreamingResponse(
         progress_generator(),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
-
-
-async def _rollback(
-    conn: openstack.connection.Connection,
-    server_vm_id: str | None,
-    boot_volume_id: str | None,
-    sg_id: str | None,
-    app_credential_id: str | None = None,
-    project_id: str | None = None,
-    lb_id: str | None = None,
-    fip_id: str | None = None,
-) -> None:
-    """생성 실패 시 리소스 역순 삭제."""
-    if server_vm_id:
-        try:
-            await asyncio.to_thread(nova.delete_server, conn, server_vm_id)
-        except Exception as e:
-            _logger.warning("Rollback: delete server %s failed: %s", server_vm_id, e)
-    if boot_volume_id:
-        try:
-            await asyncio.sleep(3)
-            await asyncio.to_thread(cinder.delete_volume, conn, boot_volume_id)
-        except Exception as e:
-            _logger.warning("Rollback: delete volume %s failed: %s", boot_volume_id, e)
-    if fip_id:
-        try:
-            await asyncio.to_thread(lambda: conn.network.delete_ip(fip_id, ignore_missing=True))
-        except Exception as e:
-            _logger.warning("Rollback: delete FIP %s failed: %s", fip_id, e)
-    if lb_id:
-        try:
-            await asyncio.to_thread(octavia.delete_load_balancer, conn, lb_id, cascade=True)
-        except Exception as e:
-            _logger.warning("Rollback: delete LB %s failed: %s", lb_id, e)
-    if sg_id:
-        try:
-            await asyncio.to_thread(neutron.delete_security_group, conn, sg_id)
-        except Exception as e:
-            _logger.warning("Rollback: delete SG %s failed: %s", sg_id, e)
-    if app_credential_id and project_id:
-        try:
-            from drover.services import keystone as _keystone
-
-            await _keystone.delete_app_credential(project_id, app_credential_id)
-        except Exception as e:
-            _logger.warning("Rollback: delete app credential %s failed: %s", app_credential_id, e)
-
 
 @router.patch("/{cluster_id}/scale")
 @limiter.limit("10/minute")
@@ -795,6 +520,7 @@ async def scale_k3s_cluster(
 ):
     """에이전트 수 변경. 현재 ACTIVE 상태에서만 허용."""
     project_id = token_info["project_id"]
+    authorize("drover:clusters:scale", {"project_id": project_id}, token_info)
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
@@ -841,168 +567,7 @@ async def scale_k3s_cluster(
     return {"message": f"스케일링 시작: {current} → {desired}", "agent_count": desired}
 
 
-async def _delete_cluster_progress(
-    conn: openstack.connection.Connection,
-    project_id: str,
-    cluster: dict,
-    token_info: dict | None,
-) -> AsyncGenerator[K3sProgressMessage, None]:
-    """k3s 클러스터 삭제 단계별 진행. 각 단계 진입 시 K3sProgressMessage 를 yield."""
-    import json
 
-    cluster_id: str = cluster["id"]
-    cluster_name: str = cluster.get("name") or ""
-
-    yield K3sProgressMessage(step=K3sProgressStep.DELETE_INIT, progress=5, message="클러스터 삭제 준비 중...")
-    await k3s_cluster.update_cluster_status(project_id, cluster_id, "DELETING")
-
-    # API LB + FIP 정리
-    yield K3sProgressMessage(
-        step=K3sProgressStep.DELETE_LB_CLEANUP, progress=15, message="API LoadBalancer / Floating IP 정리 중..."
-    )
-    _api_lb_id = cluster.get("api_lb_id") or ""
-    _api_fip_id = cluster.get("api_fip_id") or ""
-    if _api_lb_id:
-        try:
-            await asyncio.to_thread(octavia.delete_load_balancer, conn, _api_lb_id, cascade=True)
-            _logger.info("Deleted API LB %s for cluster %s", _api_lb_id, cluster_id)
-        except Exception as e:
-            _logger.warning("Delete API LB %s failed: %s", _api_lb_id, e)
-    if _api_fip_id:
-        try:
-            await asyncio.to_thread(neutron.delete_floating_ip, conn, _api_fip_id)
-            _logger.info("Deleted API FIP %s for cluster %s", _api_fip_id, cluster_id)
-        except Exception as e:
-            _logger.warning("Delete API FIP %s failed: %s", _api_fip_id, e)
-
-    # OCCM/Ingress가 생성한 Octavia LB 정리
-    plugins_enabled = cluster.get("plugins_enabled") or {}
-    occm_enabled = cluster.get("occm_enabled") or plugins_enabled.get("occm", False)
-    ingress_enabled = plugins_enabled.get("octavia_ingress", False)
-    if occm_enabled or ingress_enabled:
-        lb_prefixes = []
-        if occm_enabled:
-            lb_prefixes.append(f"kube_service_{cluster_name}_")
-        if ingress_enabled:
-            lb_prefixes.append(f"kube_ingress_{cluster_name}_")
-        try:
-            all_lbs = await asyncio.to_thread(octavia.list_load_balancers, conn)
-            for lb in all_lbs:
-                lb_name = lb.get("name", "")
-                if any(lb_name.startswith(p) for p in lb_prefixes):
-                    try:
-                        await asyncio.to_thread(octavia.delete_load_balancer, conn, lb["id"], cascade=True)
-                        _logger.info("Deleted LB %s (%s) for cluster %s", lb["id"], lb_name, cluster_id)
-                    except Exception as e:
-                        _logger.warning("Delete LB %s failed: %s", lb["id"], e)
-        except Exception as e:
-            _logger.warning("Failed to list/delete LBs for cluster %s: %s", cluster_id, e)
-
-    # App Credential 회수
-    yield K3sProgressMessage(
-        step=K3sProgressStep.DELETE_APP_CREDENTIAL, progress=25, message="App Credential 회수 중..."
-    )
-    _app_cred_id = cluster.get("app_credential_id") or ""
-    if _app_cred_id:
-        try:
-            from drover.services import keystone as _keystone
-
-            await _keystone.delete_app_credential(project_id, _app_cred_id)
-            _logger.info("Deleted App Credential %s for cluster %s", _app_cred_id, cluster_id)
-        except Exception as e:
-            _logger.warning("Delete App Credential %s failed: %s", _app_cred_id, e)
-
-    # 에이전트 VM id 파싱
-    agent_vm_ids = cluster.get("agent_vm_ids") or []
-    if isinstance(agent_vm_ids, str):
-        try:
-            agent_vm_ids = json.loads(agent_vm_ids)
-        except Exception:
-            agent_vm_ids = []
-
-    # K8s 노드 삭제 (VM 삭제 전 먼저 수행, best-effort)
-    yield K3sProgressMessage(step=K3sProgressStep.DELETE_K8S_NODES, progress=35, message="Kubernetes 노드 정리 중...")
-    all_node_names: list[str] = []
-    if agent_vm_ids:
-        vm_name_map = await k3s_cluster.get_agent_vm_names(cluster_id, agent_vm_ids)
-        all_node_names.extend([name for name in vm_name_map.values() if name])
-    server_node_name = cluster.get("server_vm_name") or ""
-    if server_node_name:
-        all_node_names.append(server_node_name)
-    if all_node_names:
-        _logger.info("k3s delete: K8s 노드 삭제 시작: %s", all_node_names)
-        try:
-            await k3s_kube.delete_k8s_nodes(cluster_id, all_node_names)
-        except Exception as e:
-            _logger.warning("k3s delete: K8s 노드 삭제 중 오류 (무시): %s", e)
-
-    # 에이전트 VM 병렬 삭제
-    n_agents = len(agent_vm_ids)
-    yield K3sProgressMessage(
-        step=K3sProgressStep.DELETE_AGENT_VMS,
-        progress=55,
-        message=f"에이전트 VM 삭제 중 ({n_agents}개)...",
-    )
-
-    async def _del_vm_and_wait(vm_id: str) -> None:
-        try:
-            await asyncio.to_thread(nova.delete_server, conn, vm_id)
-        except Exception as e:
-            _logger.warning("Delete agent VM %s failed: %s", vm_id, e)
-            return
-        try:
-            await asyncio.to_thread(nova.wait_server_deleted, conn, vm_id)
-            _logger.info("k3s delete: VM %s fully deleted", vm_id)
-        except TimeoutError as e:
-            _logger.warning("k3s delete: VM %s 삭제 대기 타임아웃 (계속 진행): %s", vm_id, e)
-        except Exception as e:
-            _logger.warning("k3s delete: VM %s 대기 중 오류 (계속 진행): %s", vm_id, e)
-
-    await asyncio.gather(*[_del_vm_and_wait(vid) for vid in agent_vm_ids], return_exceptions=True)
-
-    # 서버 VM 삭제 + 완료 대기
-    yield K3sProgressMessage(step=K3sProgressStep.DELETE_SERVER_VM, progress=80, message="서버 VM 삭제 중...")
-    server_vm_id = cluster.get("server_vm_id")
-    if server_vm_id:
-        try:
-            await asyncio.to_thread(nova.delete_server, conn, server_vm_id)
-        except Exception as e:
-            _logger.warning("Delete server VM %s failed: %s", server_vm_id, e)
-        else:
-            try:
-                await asyncio.to_thread(nova.wait_server_deleted, conn, server_vm_id)
-                _logger.info("k3s delete: server VM %s fully deleted", server_vm_id)
-            except TimeoutError as e:
-                _logger.warning("k3s delete: server VM %s 삭제 대기 타임아웃 (계속 진행): %s", server_vm_id, e)
-            except Exception as e:
-                _logger.warning("k3s delete: server VM %s 대기 중 오류 (계속 진행): %s", server_vm_id, e)
-
-    # 보안 그룹 삭제 (VM 삭제 완료 후, 재시도 포함)
-    yield K3sProgressMessage(step=K3sProgressStep.DELETE_SECURITY_GROUP, progress=92, message="보안 그룹 삭제 중...")
-    sg_id = cluster.get("security_group_id")
-    if sg_id:
-        for attempt in range(3):
-            try:
-                if attempt > 0:
-                    await asyncio.sleep(5)
-                await asyncio.to_thread(neutron.delete_security_group, conn, sg_id)
-                _logger.info("k3s delete: SG %s deleted", sg_id)
-                break
-            except Exception as e:
-                _logger.warning("Delete SG %s attempt %d failed: %s", sg_id, attempt + 1, e)
-
-    # soft-delete: 상태를 DELETED로 기록
-    yield K3sProgressMessage(step=K3sProgressStep.DELETE_RECORD, progress=98, message="삭제 이력 기록 중...")
-    user_id = token_info.get("user_id") if isinstance(token_info, dict) else None
-    await k3s_cluster.delete_cluster_record(project_id, cluster_id, user_id=user_id, reason="사용자 삭제 요청")
-    if token_info is not None:
-        await rec(token_info, conn, resource_type="k3s_cluster", action="delete", resource_id=cluster_id)
-
-    yield K3sProgressMessage(
-        step=K3sProgressStep.COMPLETED,
-        progress=100,
-        message=f'클러스터 "{cluster_name}" 삭제 완료',
-    )
 
 
 @router.delete("/{cluster_id}", status_code=204)
@@ -1015,6 +580,7 @@ async def delete_k3s_cluster(
 ):
     """Persist a durable cluster-deletion job and return after it is queued."""
     project_id = conn._afterglow_project_id
+    authorize("drover:clusters:delete", {"project_id": project_id}, token_info)
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")

@@ -4,12 +4,13 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from drover.auth import get_token_info, require_admin
+from drover.auth import get_token_info
 from drover.models.schemas import (
     CreateK3sClusterTemplateRequest,
     K3sClusterTemplateInfo,
     UpdateK3sClusterTemplateRequest,
 )
+from drover.policy import require_policy
 from drover.services import template as _svc
 
 router = APIRouter()
@@ -34,7 +35,7 @@ async def get_k3s_cluster_template(template_id: str, token_info: dict = Depends(
     return t
 
 
-@router.post("", response_model=K3sClusterTemplateInfo, status_code=201, dependencies=[Depends(require_admin)])
+@router.post("", response_model=K3sClusterTemplateInfo, status_code=201, dependencies=[Depends(require_policy("drover:templates:manage"))])
 async def create_k3s_cluster_template(req: CreateK3sClusterTemplateRequest, token_info: dict = Depends(get_token_info)):
     """admin 전용: 템플릿 생성."""
     user_id = token_info.get("user_id") or token_info.get("sub") or ""
@@ -44,7 +45,7 @@ async def create_k3s_cluster_template(req: CreateK3sClusterTemplateRequest, toke
         raise HTTPException(status_code=503, detail=str(e))
 
 
-@router.patch("/{template_id}", response_model=K3sClusterTemplateInfo, dependencies=[Depends(require_admin)])
+@router.patch("/{template_id}", response_model=K3sClusterTemplateInfo, dependencies=[Depends(require_policy("drover:templates:manage"))])
 async def update_k3s_cluster_template(template_id: str, req: UpdateK3sClusterTemplateRequest):
     """admin 전용: 템플릿 수정."""
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
@@ -54,7 +55,7 @@ async def update_k3s_cluster_template(template_id: str, req: UpdateK3sClusterTem
     return t
 
 
-@router.delete("/{template_id}", status_code=204, dependencies=[Depends(require_admin)])
+@router.delete("/{template_id}", status_code=204, dependencies=[Depends(require_policy("drover:templates:manage"))])
 async def delete_k3s_cluster_template(template_id: str):
     """admin 전용: 템플릿 삭제 (soft delete)."""
     deleted = await _svc.delete_template(template_id)

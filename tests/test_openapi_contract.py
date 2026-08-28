@@ -142,3 +142,61 @@ async def test_kubeconfig_head_operation():
             res = await client.request("HEAD", "/v1/clusters/c1/kubeconfig", headers=headers)
             assert res.status_code == 200
             assert res.content == b""
+
+
+def test_liveness_and_readiness_schema():
+    schema = app.openapi()
+    paths = schema["paths"]
+
+    for path in ("/v1/health/live", "/v1/health/ready"):
+        assert path in paths
+        assert paths[path]["get"].get("security") is None
+
+
+@pytest.mark.asyncio
+async def test_readiness_reflects_dependency_availability():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        live = await client.get("/v1/health/live")
+        assert live.status_code == 200
+        assert live.json() == {"status": "ok"}
+
+        with patch(
+            "drover.main.readiness_checks",
+            new=AsyncMock(
+                return_value={
+                    "database": "ok",
+                    "redis": "unavailable",
+                    "migrations": "ok",
+                    "keystone": "ok",
+                }
+            ),
+        ):
+            readiness = await client.get("/v1/health/ready")
+
+    assert readiness.status_code == 503
+    assert readiness.json() == {
+        "status": "unavailable",
+        "checks": {
+            "database": "ok",
+            "redis": "unavailable",
+            "migrations": "ok",
+            "keystone": "ok",
+        },
+    }
+def test_operations_and_admin_endpoints_require_keystone_token_and_valid_schema():
+    """Verify operations, admin managed-resources, and async cluster creation endpoints mandate KeystoneToken security in OpenAPI."""
+    schema = app.openapi()
+    paths = schema.get("paths", {})
+
+    target_endpoints = [
+        ("/v1/operations/{operation_id}", "get"),
+        ("/v1/operations/{operation_id}/events", "get"),
+        ("/v1/admin/managed-resources", "get"),
+        ("/v1/clusters/async", "post"),
+    ]
+
+    for path, method in target_endpoints:
+        assert path in paths, f"Path {path} missing from OpenAPI schema"
+        op = paths[path][method]
+        assert op.get("security") == [{"KeystoneToken": []}], f"KeystoneToken missing for {method.upper()} {path}"
+        assert "200" in op.get("responses", {}), f"200 response missing for {method.upper()} {path}"

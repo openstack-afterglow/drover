@@ -11,6 +11,7 @@ from sqlalchemy import (
     JSON,
     TEXT,
     VARCHAR,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -79,12 +80,20 @@ class K3sCluster(Base):
     stampede_enabled: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
     last_rotation_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_rotation_initiated_by: Mapped[str | None] = mapped_column(VARCHAR(64), nullable=True)
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    drift_status: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     agent_vms: Mapped[list[K3sAgentVM]] = relationship(
         "K3sAgentVM", back_populates="cluster", cascade="all, delete-orphan"
     )
     nodegroups: Mapped[list[K3sNodegroup]] = relationship(
         "K3sNodegroup", back_populates="cluster", cascade="all, delete-orphan"
+    )
+    operations: Mapped[list[DroverOperation]] = relationship(
+        "DroverOperation", back_populates="cluster", cascade="all, delete-orphan"
+    )
+    managed_resources: Mapped[list[ManagedOpenStackResource]] = relationship(
+        "ManagedOpenStackResource", back_populates="cluster", cascade="all, delete-orphan"
     )
 
     __table_args__ = (Index("idx_k3s_cluster_project_created", "project_id", "created_at"),)
@@ -191,6 +200,11 @@ class DroverJob(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    operation_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("drover_operations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
+    operation: Mapped[DroverOperation | None] = relationship("DroverOperation", back_populates="jobs")
 
     __table_args__ = (Index("idx_drover_jobs_claim", "status", "created_at"),)
 
@@ -231,3 +245,94 @@ class GpuQuota(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
     __table_args__ = (Index("idx_gpu_quota_project_type", "project_id", "gpu_type", unique=True),)
+
+
+class DroverOperation(Base):
+    __tablename__ = "drover_operations"
+
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False, index=True)
+    cluster_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("k3s_clusters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(VARCHAR(32), nullable=False)
+    status: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="QUEUED")
+    request_id: Mapped[str | None] = mapped_column(VARCHAR(64), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(VARCHAR(128), nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(VARCHAR(64), nullable=True)
+    error: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    cluster: Mapped[K3sCluster] = relationship("K3sCluster", back_populates="operations")
+    events: Mapped[list[DroverOperationEvent]] = relationship(
+        "DroverOperationEvent", back_populates="operation", cascade="all, delete-orphan"
+    )
+    resources: Mapped[list[ManagedOpenStackResource]] = relationship(
+        "ManagedOpenStackResource", back_populates="operation"
+    )
+    jobs: Mapped[list[DroverJob]] = relationship("DroverJob", back_populates="operation")
+
+    __table_args__ = (
+        Index("idx_drover_op_project_created", "project_id", "created_at"),
+        Index("idx_drover_op_cluster_created", "cluster_id", "created_at"),
+        Index("idx_drover_op_proj_idemp", "project_id", "idempotency_key", unique=True),
+        CheckConstraint(
+            "kind IN ('create', 'scale', 'nodegroup_reconcile', 'delete', 'rotate_certificates', 'reconcile')",
+            name="ck_drover_op_kind",
+        ),
+        CheckConstraint(
+            "status IN ('QUEUED', 'RUNNING', 'WAITING_CALLBACK', 'SUCCEEDED', 'FAILED', 'CANCELLED')",
+            name="ck_drover_op_status",
+        ),
+    )
+
+
+class DroverOperationEvent(Base):
+    __tablename__ = "drover_operation_events"
+
+    id: Mapped[int] = mapped_column(INT, primary_key=True, autoincrement=True)
+    operation_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("drover_operations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sequence: Mapped[int] = mapped_column(INT, nullable=False)
+    phase: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    message: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    payload_json: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+
+    operation: Mapped[DroverOperation] = relationship("DroverOperation", back_populates="events")
+
+    __table_args__ = (
+        Index("idx_drover_op_event_seq", "operation_id", "sequence", unique=True),
+    )
+
+
+class ManagedOpenStackResource(Base):
+    __tablename__ = "managed_openstack_resources"
+
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    cluster_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("k3s_clusters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    operation_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("drover_operations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    service: Mapped[str] = mapped_column(VARCHAR(32), nullable=False)
+    resource_type: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    resource_id: Mapped[str] = mapped_column(VARCHAR(128), nullable=False)
+    name: Mapped[str | None] = mapped_column(VARCHAR(255), nullable=True)
+    state: Mapped[str | None] = mapped_column(VARCHAR(32), nullable=True)
+    metadata_json: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+    cluster: Mapped[K3sCluster] = relationship("K3sCluster", back_populates="managed_resources")
+    operation: Mapped[DroverOperation | None] = relationship("DroverOperation", back_populates="resources")
+
+    __table_args__ = (
+        Index("idx_managed_res_identity", "service", "resource_type", "resource_id", unique=True),
+    )

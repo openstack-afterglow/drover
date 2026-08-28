@@ -6,24 +6,28 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncGenerator
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 
-from drover.auth import require_admin
+from drover.models.orm import ManagedOpenStackResource
 from drover.models.schemas import (
     K3sClusterInfo,
     K3sClusterTemplateInfo,
     K3sProgressMessage,
     K3sProgressStep,
+    ManagedOpenStackResourceInfo,
     ScaleK3sClusterRequest,
 )
+from drover.policy import require_policy
 from drover.services import cert_rotation, certs
+from drover.services import inventory as _inventory_svc
 from drover.services import jobs as _jobs_svc
 from drover.services import store as k3s_cluster
 from drover.services import template as _tmpl_svc
 
-router = APIRouter(dependencies=[Depends(require_admin)])
+router = APIRouter(dependencies=[Depends(require_policy("drover:admin"))])
 _logger = logging.getLogger(__name__)
 
 _SSE_HEADERS = {
@@ -250,3 +254,120 @@ async def rotate_admin_certs(cluster_id: str):
 @router.get("/cluster-templates", response_model=list[K3sClusterTemplateInfo])
 async def list_admin_cluster_templates():
     return await _tmpl_svc.list_templates(admin=True)
+_SENSITIVE_PATTERNS = (
+    "kubeconfig",
+    "token",
+    "password",
+    "secret",
+    "credential",
+    "private_key",
+    "auth",
+    "payload",
+)
+
+
+def _is_sensitive(text: str) -> bool:
+    low = text.lower()
+    return any(p in low for p in _SENSITIVE_PATTERNS)
+
+
+def _sanitize_dict(d: dict) -> dict:
+    clean = {}
+    for k, v in d.items():
+        if not isinstance(k, str) or _is_sensitive(k):
+            continue
+        if isinstance(v, str):
+            if _is_sensitive(v) or any(prefix in v.lower() for prefix in ("bearer ", "ssh-rsa")):
+                continue
+            clean[k] = v
+        elif isinstance(v, dict):
+            sub_clean = _sanitize_dict(v)
+            if sub_clean:
+                clean[k] = sub_clean
+        elif isinstance(v, list):
+            clean_list = []
+            for item in v:
+                if isinstance(item, str) and not _is_sensitive(item):
+                    clean_list.append(item)
+                elif isinstance(item, dict):
+                    sub = _sanitize_dict(item)
+                    if sub:
+                        clean_list.append(sub)
+                elif isinstance(item, (int, float, bool)):
+                    clean_list.append(item)
+            if clean_list:
+                clean[k] = clean_list
+        elif isinstance(v, (int, float, bool)):
+            clean[k] = v
+    return clean
+
+
+def _extract_tags_and_metadata(metadata_raw: dict | list | None) -> tuple[list[str], dict | None]:
+    if metadata_raw is None:
+        return [], None
+
+    if isinstance(metadata_raw, list):
+        tags = [str(item) for item in metadata_raw if isinstance(item, str) and not _is_sensitive(str(item))]
+        meta = {"tags": tags} if tags else None
+        return tags, meta
+
+    if isinstance(metadata_raw, dict):
+        clean_meta = _sanitize_dict(metadata_raw)
+        tags: list[str] = []
+        if "tags" in clean_meta and isinstance(clean_meta["tags"], list):
+            tags = [str(t) for t in clean_meta["tags"] if isinstance(t, str) and not _is_sensitive(str(t))]
+        else:
+            for k, v in clean_meta.items():
+                if isinstance(v, (str, int, float, bool)):
+                    tags.append(f"{k}={v}")
+        return tags, clean_meta if clean_meta else None
+
+    return [], None
+
+
+def _format_dt(dt: object) -> str | None:
+    if isinstance(dt, datetime):
+        return dt.isoformat()
+    if dt is not None:
+        return str(dt)
+    return None
+
+
+def _resource_to_info(r: ManagedOpenStackResource) -> ManagedOpenStackResourceInfo:
+    tags, clean_meta = _extract_tags_and_metadata(r.metadata_json)
+    return ManagedOpenStackResourceInfo(
+        id=r.id,
+        cluster_id=r.cluster_id,
+        operation_id=r.operation_id,
+        service=r.service,
+        resource_type=r.resource_type,
+        resource_id=r.resource_id,
+        name=r.name,
+        state=r.state,
+        tags=tags,
+        metadata=clean_meta,
+        created_at=_format_dt(r.created_at),
+        last_seen_at=_format_dt(r.last_seen_at),
+        deleted_at=_format_dt(r.deleted_at),
+    )
+
+
+@router.get("/managed-resources", response_model=list[ManagedOpenStackResourceInfo])
+@router.get("/resources", response_model=list[ManagedOpenStackResourceInfo], include_in_schema=False)
+@router.get("/inventory", response_model=list[ManagedOpenStackResourceInfo], include_in_schema=False)
+async def list_admin_managed_resources(
+    cluster_id: str | None = Query(default=None, alias="cluster_id"),
+    cluster: str | None = Query(default=None),
+    operation_id: str | None = Query(default=None, alias="operation_id"),
+    operation: str | None = Query(default=None),
+    include_deleted: bool = Query(default=False),
+):
+    target_cluster = cluster_id or cluster or ""
+    target_operation = operation_id or operation or ""
+    resources = await _inventory_svc.list_managed_resources(
+        None,
+        cluster_id=target_cluster,
+        operation_id=target_operation,
+        active_only=not include_deleted,
+    )
+    return [_resource_to_info(r) for r in resources]

@@ -78,8 +78,7 @@ async def test_enqueue_persists_supported_job_before_return(monkeypatch):
         username="alice",
     )
 
-    assert len(session.added) == 1
-    job = session.added[0]
+    job = [obj for obj in session.added if isinstance(obj, DroverJob)][0]
     assert isinstance(job, DroverJob)
     assert job.id == job_id
     assert job.status == "queued"

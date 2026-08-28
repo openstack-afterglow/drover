@@ -252,3 +252,239 @@ async def test_handle_ha_joiner_no_agents_if_not_all_joined():
         req = K3sCallbackRequest(token="dummytoken456", success=True, server_ip="10.0.0.7")
         await _handle_ha_joiner("proj1", "clus1", 3, req)
         enqueue_job.assert_not_awaited()
+@pytest.mark.asyncio
+async def test_three_master_topology_inventory_deletion_reconciliation(monkeypatch):
+    """Test 3-master HA topology inventory recording, reconciliation, and deletion.
+
+    Creates a 3-master topology:
+    - Master 1: server VM, boot volume, Octavia pool member
+    - Master 2: server VM, boot volume, Octavia pool member
+    - Master 3: server VM, boot volume, Octavia pool member
+
+    Asserts all master/volume/member inventory records and metadata, then verifies
+    both reconcile and delete consume all 3 master server, volume, and member IDs.
+    """
+    from drover.api.callback import _handle_ha_joiner
+    from drover.models.schemas import K3sCallbackRequest
+    from drover.services import (
+        deletion,
+        inventory,
+        provisioner,
+        reconciliation,
+    )
+    from tests.test_managed_resources_lifecycle import _factory, _TestSession
+
+    project_id = "proj-ha-3m"
+    cluster_id = "clus-ha-3m"
+    op_id = "op-ha-create-999"
+    cluster_name = "ha-3m-cluster"
+
+    session = _TestSession()
+    monkeypatch.setattr("drover.services.inventory.get_session_factory", lambda: (lambda: _factory(session)))
+
+    cluster_info = {
+        "id": cluster_id,
+        "project_id": project_id,
+        "name": cluster_name,
+        "master_count": 3,
+        "k3s_version": "v1.28.0+k3s1",
+        "os_type": "ubuntu",
+        "server_image_id": "img-ubuntu",
+        "server_flavor_id": "flavor-m1",
+        "network_id": "net-primary",
+        "resource_policy_snapshot": {
+            "k3s.volume_availability_zone": {"id": "nova-az"}
+        },
+        "api_lb_id": "lb-ha-1",
+        "api_lb_pool_id": "pool-ha-1",
+        "api_fip_address": "198.51.100.50",
+        "server_vm_id": "srv-vm-master-1",
+        "server_vm_name": f"{cluster_name}-server-1",
+        "server_ip": "10.0.0.10",
+        "node_token": "K10node::token123",
+    }
+    # Record primary server#1 VM and boot volume as created by create_cluster_job
+    await inventory.record_resource(
+        session,
+        cluster_id=cluster_id,
+        service="nova",
+        resource_type="server",
+        resource_id="srv-vm-master-1",
+        operation_id=op_id,
+        name=f"{cluster_name}-server-1",
+        metadata={"role": "primary_server", "server_index": 1},
+    )
+    await inventory.record_resource(
+        session,
+        cluster_id=cluster_id,
+        service="cinder",
+        resource_type="volume",
+        resource_id="vol-master-1",
+        operation_id=op_id,
+        name=f"{cluster_name}-server-1-boot",
+        metadata={"role": "primary_server_boot_volume", "server_index": 1},
+    )
+
+    # Mock OpenStack SDK for provisioner.bootstrap_ha_servers
+    mock_conn = MagicMock()
+    mock_conn.network.subnets.return_value = [MagicMock(id="sub-1")]
+
+    # Octavia member #1
+    mock_mem1 = {"id": "member-master-1"}
+    # Cinder volumes for server #2 and #3
+    mock_vol2 = MagicMock(id="vol-master-2")
+    mock_vol3 = MagicMock(id="vol-master-3")
+    # Nova VMs for server #2 and #3
+    mock_vm2 = MagicMock(id="srv-vm-master-2")
+    mock_vm3 = MagicMock(id="srv-vm-master-3")
+
+    with (
+        patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
+        patch("drover.services.keystone.get_admin_connection_for_project", return_value=mock_conn),
+        patch("drover.services.octavia.add_member", return_value=mock_mem1),
+        patch("drover.services.cinder.create_volume_from_image", side_effect=[mock_vol2, mock_vol3]),
+        patch("drover.services.nova.create_server", side_effect=[mock_vm2, mock_vm3]),
+        patch("drover.services.store.create_ha_callback_token", new=AsyncMock(return_value="ha-tok-123")),
+    ):
+        await provisioner.bootstrap_ha_servers(
+            project_id=project_id,
+            cluster_id=cluster_id,
+            server_ip="10.0.0.10",
+            node_token="K10node::token123",
+            master_count=3,
+            lb_pool_id="pool-ha-1",
+            lb_fip_address="198.51.100.50",
+            operation_id=op_id,
+        )
+
+    # Server #2 and Server #3 callback -> _handle_ha_joiner
+    mock_mem2 = {"id": "member-master-2"}
+    mock_mem3 = {"id": "member-master-3"}
+
+    with (
+        patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
+        patch("drover.services.store.incr_ha_join_count", new=AsyncMock(side_effect=[1, 2])),
+        patch("drover.services.keystone.get_admin_connection_for_project", return_value=mock_conn),
+        patch("drover.services.octavia.add_member", side_effect=[mock_mem2, mock_mem3]),
+        patch("drover.services.operations.get_active_operation", new=AsyncMock(return_value=MagicMock(id=op_id))),
+        patch("drover.api.callback._jobs_svc.enqueue_job", new=AsyncMock()),
+    ):
+        req2 = K3sCallbackRequest(token="ha-tok-2", success=True, server_ip="10.0.0.11")
+        await _handle_ha_joiner(project_id, cluster_id, 2, req2)
+
+        req3 = K3sCallbackRequest(token="ha-tok-3", success=True, server_ip="10.0.0.12")
+        await _handle_ha_joiner(project_id, cluster_id, 3, req3)
+
+    # Assert active inventory records for all 3 masters
+    active_resources = await inventory.list_managed_resources(session, cluster_id=cluster_id, active_only=True)
+
+    servers = [r for r in active_resources if r.service == "nova" and r.resource_type == "server"]
+    volumes = [r for r in active_resources if r.service == "cinder" and r.resource_type == "volume"]
+    members = [r for r in active_resources if r.service == "octavia" and r.resource_type == "member"]
+
+    assert len(servers) == 3
+    assert {s.resource_id for s in servers} == {"srv-vm-master-1", "srv-vm-master-2", "srv-vm-master-3"}
+
+    assert len(volumes) == 3
+    assert {v.resource_id for v in volumes} == {"vol-master-1", "vol-master-2", "vol-master-3"}
+
+    assert len(members) == 3
+    assert {m.resource_id for m in members} == {"member-master-1", "member-master-2", "member-master-3"}
+
+    # Assert metadata distinguishes HA resources
+    server2_rec = next(s for s in servers if s.resource_id == "srv-vm-master-2")
+    assert server2_rec.metadata_json == {"role": "ha_server", "server_index": 2}
+
+    volume2_rec = next(v for v in volumes if v.resource_id == "vol-master-2")
+    assert volume2_rec.metadata_json == {"role": "ha_server_boot_volume", "server_index": 2}
+
+    member2_rec = next(m for m in members if m.resource_id == "member-master-2")
+    assert member2_rec.metadata_json == {"pool_id": "pool-ha-1", "role": "ha_server_member", "server_index": 2}
+
+    # Verify reconciliation consumes all 3 master IDs
+    checked_servers = []
+    checked_volumes = []
+    checked_members = []
+
+    def mock_fetch(conn, svc, rtype, rid, metadata=None):
+        if svc == "nova" and rtype == "server":
+            checked_servers.append(rid)
+            srv = MagicMock()
+            srv.project_id = project_id
+            srv.metadata = {"drover.cluster_id": cluster_id, "drover.managed": "true"}
+            srv.status = "ACTIVE"
+            return srv
+        elif svc == "cinder" and rtype == "volume":
+            checked_volumes.append(rid)
+            vol = MagicMock()
+            vol.project_id = project_id
+            vol.metadata = {"drover.cluster_id": cluster_id, "drover.managed": "true"}
+            vol.status = "in-use"
+            return vol
+        elif svc == "octavia" and rtype == "member":
+            checked_members.append(rid)
+            mem = MagicMock()
+            mem.project_id = project_id
+            mem.provisioning_status = "ACTIVE"
+            mem.operating_status = "ONLINE"
+            return mem
+        elif svc == "octavia" and rtype == "load_balancer":
+            lb = MagicMock()
+            lb.project_id = project_id
+            lb.provisioning_status = "ACTIVE"
+            lb.operating_status = "ONLINE"
+            return lb
+    with (
+        patch("drover.services.reconciliation.fetch_recorded_resource", side_effect=mock_fetch),
+        patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
+        patch("drover.services.store.update_cluster_reconciliation", new=AsyncMock()),
+        patch("drover.services.operations.append_operation_event", new=AsyncMock()),
+    ):
+        drift = await reconciliation.reconcile_cluster(project_id, cluster_id, conn=mock_conn)
+        assert len(drift["missing"]) == 0
+        assert set(checked_servers) == {"srv-vm-master-1", "srv-vm-master-2", "srv-vm-master-3"}
+        assert set(checked_volumes) == {"vol-master-1", "vol-master-2", "vol-master-3"}
+        assert set(checked_members) == {"member-master-1", "member-master-2", "member-master-3"}
+
+    # Verify deletion consumes all 3 master IDs
+    deleted_servers = []
+    deleted_volumes = []
+    deleted_members = []
+
+    def mock_del_srv(conn, vid, proj, cid):
+        deleted_servers.append(vid)
+
+    def mock_del_vol(conn, vid, proj, cid):
+        deleted_volumes.append(vid)
+
+    def mock_del_mem(conn, pid, mid):
+        deleted_members.append(mid)
+
+    with (
+        patch("drover.services.nova.delete_server_safe", side_effect=mock_del_srv),
+        patch("drover.services.cinder.delete_volume_safe", side_effect=mock_del_vol),
+        patch("drover.services.octavia.remove_member", side_effect=mock_del_mem),
+        patch("drover.services.octavia.delete_pool", return_value=None),
+        patch("drover.services.octavia.delete_listener", return_value=None),
+        patch("drover.services.octavia.delete_load_balancer_safe", return_value=None),
+        patch("drover.services.neutron.delete_floating_ip_safe", return_value=None),
+        patch("drover.services.neutron.wait_port_deleted", return_value=None),
+        patch("drover.services.neutron.delete_security_group_rule", return_value=None),
+        patch("drover.services.neutron.delete_security_group_safe", return_value=None),
+        patch("drover.services.keystone.delete_app_credential", AsyncMock()),
+        patch("drover.services.kube.delete_k8s_nodes", AsyncMock()),
+        patch("drover.services.store.delete_cluster_record", AsyncMock()),
+        patch("drover.services.operations.append_operation_event", AsyncMock()),
+    ):
+        async for _ in deletion.delete_cluster_progress(mock_conn, project_id, cluster_info, token_info={"user_id": "u1"}):
+            pass
+
+    assert set(deleted_servers) == {"srv-vm-master-1", "srv-vm-master-2", "srv-vm-master-3"}
+    assert set(deleted_volumes) == {"vol-master-1", "vol-master-2", "vol-master-3"}
+    assert set(deleted_members) == {"member-master-1", "member-master-2", "member-master-3"}
+
+    # Verify inventory marked deleted for all resources
+    all_resources = await inventory.list_managed_resources(session, cluster_id=cluster_id, active_only=False)
+    assert len(all_resources) > 0
+    for r in all_resources:
+        assert r.deleted_at is not None
