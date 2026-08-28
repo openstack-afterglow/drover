@@ -63,6 +63,7 @@ def test_ci_workflow_structure():
 
     readiness_step = next((s for s in db_steps if "readiness_checks" in s.get("run", "")), None)
     assert readiness_step is not None, "Missing readiness check smoke step"
+    assert "init_db(os.environ['DATABASE_URL'])" in readiness_step["run"]
 
     # Validate package-kolla-assets
     kolla_job = jobs["package-kolla-assets"]

@@ -123,12 +123,13 @@ jobs:
           OS_PASSWORD: secret
         run: |
           uv run python -c "
-          import asyncio, sys
+          import asyncio
+          import os
           from drover.db import init_db
-          from drover.main import readiness_checks, liveness_check
+          from drover.main import readiness_checks
 
           async def main():
-              await init_db()
+              init_db(os.environ['DATABASE_URL'])
               checks = await readiness_checks()
               print('Readiness checks result:', checks)
               assert checks['database'] == 'ok', 'Database check failed'
