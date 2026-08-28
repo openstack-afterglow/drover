@@ -20,9 +20,10 @@ class FlavorInfo(BaseModel):
     id: str
     name: str
     vcpus: int
-    ram_mb: int
-    disk_gb: int
+    ram: int
+    disk: int
     is_public: bool = True
+    extra_specs: dict[str, str] = Field(default_factory=dict)
 
 
 class IpAddress(BaseModel):

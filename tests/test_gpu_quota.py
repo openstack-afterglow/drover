@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from drover.services import nova
 from drover.services.gpu_quota import (
     DEFAULT_PROJECT_ID,
     _parse_alias_counts,
@@ -44,6 +45,32 @@ def test_validate_quota_params():
     with pytest.raises(ValueError, match="-1 이상"):
         validate_quota_params("RTX3090", -2)
     assert validate_quota_params("rtx-3090", 5) == "RTX3090"
+
+
+def test_list_flavors_preserves_gpu_specs():
+    flavor = MagicMock()
+    flavor.id = "flavor-gpu"
+    flavor.name = "gpu.1080ti_4c_8g"
+    flavor.vcpus = 4
+    flavor.ram = 8192
+    flavor.disk = 0
+    flavor.is_public = False
+    flavor.extra_specs = {"pci_passthrough:alias": "GTX-1080ti:1,GP102-audio:1"}
+    conn = MagicMock()
+    conn.compute.flavors.return_value = [flavor]
+
+    result = nova.list_flavors(conn)
+
+    assert len(result) == 1
+    assert result[0].model_dump() == {
+        "id": "flavor-gpu",
+        "name": "gpu.1080ti_4c_8g",
+        "vcpus": 4,
+        "ram": 8192,
+        "disk": 0,
+        "is_public": False,
+        "extra_specs": {"pci_passthrough:alias": "GTX-1080ti:1,GP102-audio:1"},
+    }
 
 
 @pytest.mark.asyncio
@@ -170,12 +197,18 @@ async def test_admin_endpoints_require_admin(non_admin_client):
 
 @pytest.mark.asyncio
 async def test_admin_endpoints_success(admin_client, mock_conn):
-    with patch("drover.api.gpu_quotas.get_project_gpu_quotas", new=AsyncMock(return_value=[{"gpu_type": "RTX3090", "limit": 4}])):
+    with patch(
+        "drover.api.gpu_quotas.get_project_gpu_quotas",
+        new=AsyncMock(return_value=[{"gpu_type": "RTX3090", "limit": 4}]),
+    ):
         resp = await admin_client.get("/v1/admin/gpu-quotas/defaults")
         assert resp.status_code == 200
         assert resp.json() == [{"gpu_type": "RTX3090", "limit": 4}]
 
-    with patch("drover.api.gpu_quotas.set_project_gpu_quota", new=AsyncMock(return_value={"project_id": "__default__", "gpu_type": "RTX3090", "limit": 4})):
+    with patch(
+        "drover.api.gpu_quotas.set_project_gpu_quota",
+        new=AsyncMock(return_value={"project_id": "__default__", "gpu_type": "RTX3090", "limit": 4}),
+    ):
         resp = await admin_client.put("/v1/admin/gpu-quotas/defaults", json={"gpu_type": "RTX3090", "limit": 4})
         assert resp.status_code == 200
         assert resp.json()["limit"] == 4
@@ -193,7 +226,9 @@ async def test_admin_endpoints_success(admin_client, mock_conn):
 
 @pytest.mark.asyncio
 async def test_api_db_unavailable_returns_503(client, admin_client):
-    with patch("drover.api.gpu_quotas.get_effective_gpu_quotas", side_effect=RuntimeError("DB가 초기화되지 않았습니다")):
+    with patch(
+        "drover.api.gpu_quotas.get_effective_gpu_quotas", side_effect=RuntimeError("DB가 초기화되지 않았습니다")
+    ):
         resp = await client.get("/v1/gpu-quotas/effective")
         assert resp.status_code == 503
 
