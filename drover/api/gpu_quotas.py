@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from drover.auth import get_os_conn, require_admin, require_token
+from drover.auth import get_os_conn, require_token
+from drover.policy import require_policy
 from drover.services.gpu_quota import (
     DEFAULT_PROJECT_ID,
     check_gpu_quota,
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
     import openstack
 
 tenant_router = APIRouter()
-admin_router = APIRouter()
+admin_router = APIRouter(dependencies=[Depends(require_policy("drover:admin"))])
 
 
 class GpuQuotaRequest(BaseModel):
@@ -99,7 +100,7 @@ async def check_my_gpu_quota(
 # -----------------------------------------------------------------------------
 
 
-@admin_router.get("/defaults", dependencies=[Depends(require_admin)])
+@admin_router.get("/defaults")
 async def get_default_gpu_quotas():
     try:
         quotas = await get_project_gpu_quotas(DEFAULT_PROJECT_ID)
@@ -108,7 +109,7 @@ async def get_default_gpu_quotas():
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@admin_router.put("/defaults", dependencies=[Depends(require_admin)])
+@admin_router.put("/defaults")
 async def set_default_gpu_quota(req: GpuQuotaRequest):
     try:
         return await set_project_gpu_quota(DEFAULT_PROJECT_ID, req.gpu_type, req.limit)
@@ -118,7 +119,7 @@ async def set_default_gpu_quota(req: GpuQuotaRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.delete("/defaults/{gpu_type}", dependencies=[Depends(require_admin)], status_code=204)
+@admin_router.delete("/defaults/{gpu_type}", status_code=204)
 async def delete_default_gpu_quota(gpu_type: str):
     try:
         await delete_project_gpu_quota(DEFAULT_PROJECT_ID, gpu_type)
@@ -126,7 +127,7 @@ async def delete_default_gpu_quota(gpu_type: str):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@admin_router.get("/{project_id}", dependencies=[Depends(require_admin)])
+@admin_router.get("/{project_id}")
 async def get_project_gpu_quotas_admin(
     project_id: str,
     conn: openstack.connection.Connection = Depends(get_os_conn),
@@ -157,7 +158,7 @@ async def get_project_gpu_quotas_admin(
     return result
 
 
-@admin_router.put("/{project_id}", dependencies=[Depends(require_admin)])
+@admin_router.put("/{project_id}")
 async def set_project_gpu_quota_admin(project_id: str, req: GpuQuotaRequest):
     try:
         return await set_project_gpu_quota(project_id, req.gpu_type, req.limit)
@@ -167,7 +168,7 @@ async def set_project_gpu_quota_admin(project_id: str, req: GpuQuotaRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.delete("/{project_id}/{gpu_type}", dependencies=[Depends(require_admin)], status_code=204)
+@admin_router.delete("/{project_id}/{gpu_type}", status_code=204)
 async def delete_project_gpu_quota_admin(project_id: str, gpu_type: str):
     try:
         await delete_project_gpu_quota(project_id, gpu_type)

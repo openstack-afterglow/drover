@@ -8,9 +8,8 @@ metadata:
 stringData:
   os-authURL: {{ os_auth_url }}
   os-region: {{ os_region }}
-  os-userName: {{ os_username }}
-  os-password: {{ os_password }}
-  os-domainName: {{ os_domain }}
+  os-applicationCredentialID: {{ app_credential_id }}
+  os-applicationCredentialSecret: {{ app_credential_secret }}
   os-projectID: {{ project_id }}
 ---
 # ServiceAccount
@@ -111,21 +110,16 @@ spec:
                 secretKeyRef:
                   name: manila-cloud-secret
                   key: os-authURL
-            - name: OS_USERNAME
+            - name: OS_APPLICATION_CREDENTIAL_ID
               valueFrom:
                 secretKeyRef:
                   name: manila-cloud-secret
-                  key: os-userName
-            - name: OS_PASSWORD
+                  key: os-applicationCredentialID
+            - name: OS_APPLICATION_CREDENTIAL_SECRET
               valueFrom:
                 secretKeyRef:
                   name: manila-cloud-secret
-                  key: os-password
-            - name: OS_DOMAIN_NAME
-              valueFrom:
-                secretKeyRef:
-                  name: manila-cloud-secret
-                  key: os-domainName
+                  key: os-applicationCredentialSecret
             - name: OS_PROJECT_ID
               valueFrom:
                 secretKeyRef:
@@ -210,21 +204,16 @@ spec:
                 secretKeyRef:
                   name: manila-cloud-secret
                   key: os-authURL
-            - name: OS_USERNAME
+            - name: OS_APPLICATION_CREDENTIAL_ID
               valueFrom:
                 secretKeyRef:
                   name: manila-cloud-secret
-                  key: os-userName
-            - name: OS_PASSWORD
+                  key: os-applicationCredentialID
+            - name: OS_APPLICATION_CREDENTIAL_SECRET
               valueFrom:
                 secretKeyRef:
                   name: manila-cloud-secret
-                  key: os-password
-            - name: OS_DOMAIN_NAME
-              valueFrom:
-                secretKeyRef:
-                  name: manila-cloud-secret
-                  key: os-domainName
+                  key: os-applicationCredentialSecret
             - name: OS_PROJECT_ID
               valueFrom:
                 secretKeyRef:

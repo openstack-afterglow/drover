@@ -9,9 +9,9 @@ from datetime import UTC, datetime
 
 from sqlalchemy import delete, select
 
+from drover.crypto import decrypt_kubeconfig, decrypt_node_token, encrypt_kubeconfig, encrypt_node_token
 from drover.db import get_session_factory, is_db_available
 from drover.models.orm import K3sAgentVM, K3sCluster
-from drover.crypto import decrypt_kubeconfig, decrypt_node_token, encrypt_kubeconfig, encrypt_node_token
 
 _logger = logging.getLogger(__name__)
 
@@ -65,6 +65,8 @@ def _cluster_to_dict(cluster: K3sCluster) -> dict:
         "resource_policy_snapshot": cluster.resource_policy_snapshot or None,
         "master_count": cluster.master_count if hasattr(cluster, "master_count") else 1,
         "stampede_enabled": bool(cluster.stampede_enabled) if hasattr(cluster, "stampede_enabled") else False,
+        "last_reconciled_at": cluster.last_reconciled_at.isoformat() if getattr(cluster, "last_reconciled_at", None) else None,
+        "drift_status": cluster.drift_status if getattr(cluster, "drift_status", None) is not None else None,
     }
 
 
@@ -278,6 +280,40 @@ async def update_cluster_status(
             # agent_vm_ids는 add_agent_vms()로 별도 처리
 
         await session.commit()
+async def update_cluster_reconciliation(
+    cluster_id: str,
+    last_reconciled_at: datetime,
+    drift_status: dict,
+    status: str | None = None,
+    status_reason: str | None = None,
+) -> None:
+    """Update cluster reconciliation timestamp, drift_status, and optional status/status_reason."""
+    if not is_db_available():
+        from drover.services import redis_store as _redis
+
+        if hasattr(_redis, "update_cluster_reconciliation"):
+            return await _redis.update_cluster_reconciliation(
+                cluster_id, last_reconciled_at, drift_status, status, status_reason
+            )
+        return
+
+    factory = get_session_factory()
+    if factory is None:
+        return
+
+    async with factory() as session:
+        stmt = select(K3sCluster).where(K3sCluster.id == cluster_id)
+        result = await session.execute(stmt)
+        cluster = result.scalar_one_or_none()
+        if cluster is not None:
+            cluster.last_reconciled_at = last_reconciled_at
+            cluster.drift_status = drift_status
+            if status is not None:
+                cluster.status = status
+            if status_reason is not None:
+                cluster.status_reason = status_reason
+            cluster.updated_at = datetime.now(UTC)
+            await session.commit()
 
 
 async def delete_cluster_record(
@@ -508,31 +544,10 @@ async def consume_callback_token(token: str) -> dict | None:
 
 
 async def check_stale_clusters(timeout_minutes: int = 30) -> None:
-    """CREATING/PROVISIONING 상태에서 timeout_minutes 초과 시 ERROR로 변경."""
-    if not is_db_available():
-        from drover.services import redis_store as _redis
+    """Scan and recover expired WAITING_CALLBACK operations and their clusters."""
+    from drover.services import operations
 
-        return await _redis.check_stale_clusters(timeout_minutes)
-
-    from datetime import timedelta
-
-    cutoff = datetime.now(UTC) - timedelta(minutes=timeout_minutes)
-    factory = get_session_factory()
-    async with factory() as session:
-        stmt = select(K3sCluster).where(
-            K3sCluster.status.in_(["CREATING", "PROVISIONING"]),
-            K3sCluster.created_at < cutoff,
-        )
-        result = await session.execute(stmt)
-        stale = result.scalars().all()
-        for cluster in stale:
-            cluster.status = "ERROR"
-            cluster.status_reason = "콜백 타임아웃: 서버 VM이 k3s 설치 후 응답하지 않았습니다."
-            cluster.updated_at = datetime.now(UTC)
-            _logger.warning("k3s cluster %s marked as ERROR (stale)", cluster.id)
-        if stale:
-            await session.commit()
-
+    await operations.recover_expired_callback_operations(timeout_seconds=timeout_minutes * 60)
 
 # ---------------------------------------------------------------------------
 # Project Manager Credentials (Octavia Ingress App Cred 관리용)

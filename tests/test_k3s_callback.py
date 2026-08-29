@@ -1,7 +1,7 @@
 """K3s callback 엔드포인트 테스트 (/api/k3s/callback)."""
 
 import shlex
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -187,7 +187,7 @@ async def test_callback_stores_plugin_status_dict():
             mock_db.update_cluster_status = AsyncMock()
             mock_db.store_kubeconfig = AsyncMock()
             mock_db.get_cluster = AsyncMock(return_value={"master_count": 1})
-            resp = await ac.post(
+            await ac.post(
                 "/v1/callback",
                 json={
                     "token": "valid-token",
@@ -219,7 +219,7 @@ async def test_callback_accepts_legacy_string_plugin_status():
             mock_db.update_cluster_status = AsyncMock()
             mock_db.store_kubeconfig = AsyncMock()
             mock_db.get_cluster = AsyncMock(return_value={"master_count": 1})
-            resp = await ac.post(
+            await ac.post(
                 "/v1/callback",
                 json={
                     "token": "valid-token",
@@ -317,3 +317,183 @@ def test_callback_script_exits_on_restart_loop():
     loop_pos = script.find("restart loop detected")
     exit_pos = script.find("exit 1", loop_pos)
     assert exit_pos != -1, "restart loop 감지 후 exit 1이 있어야 한다"
+@pytest.mark.asyncio
+async def test_trusted_client_ip_resolution_direct_untrusted():
+    from unittest.mock import MagicMock
+
+    from drover.rate_limit import get_trusted_client_ip
+
+    req = MagicMock()
+    req.client.host = "203.0.113.50"
+    req.headers = {"X-Forwarded-For": "10.0.0.1, 10.0.0.2", "X-Real-IP": "10.0.0.1"}
+
+    # Direct peer 203.0.113.50 is not in trusted_proxies ("127.0.0.1/32")
+    resolved_ip = get_trusted_client_ip(req, trusted_proxies="127.0.0.1/32")
+    assert resolved_ip == "203.0.113.50"
+
+
+@pytest.mark.asyncio
+async def test_trusted_client_ip_resolution_trusted_proxy_chain():
+    from unittest.mock import MagicMock
+
+    from drover.rate_limit import get_trusted_client_ip
+
+    req = MagicMock()
+    req.client.host = "127.0.0.1"
+    req.headers = {"X-Forwarded-For": "198.51.100.10, 10.0.0.1"}
+
+    # Direct peer 127.0.0.1 is trusted proxy, 10.0.0.1 is trusted proxy in 10.0.0.0/8
+    resolved_ip = get_trusted_client_ip(req, trusted_proxies="127.0.0.1/32,10.0.0.0/8")
+    assert resolved_ip == "198.51.100.10"
+
+
+@pytest.mark.asyncio
+async def test_callback_disallowed_cidr_rejected_without_token_consume_or_job():
+    """Callback from disallowed CIDR returns 403 without consuming token or enqueuing job."""
+    mock_settings = MagicMock()
+    mock_settings.drover_callback_allowed_cidrs = ["10.0.0.0/8"]
+    mock_settings.trusted_proxies = "127.0.0.1/32"
+
+    with (
+        patch("drover.api.callback.get_settings", return_value=mock_settings),
+        patch("drover.api.callback.k3s_cluster") as mock_db,
+        patch("drover.api.callback._jobs_svc") as mock_jobs,
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/callback",
+                json={
+                    "token": "valid-token-12345",
+                    "success": True,
+                    "kubeconfig": "apiVersion: v1",
+                    "node_token": "token123",
+                    "server_ip": "10.0.0.5",
+                },
+                headers={"X-Forwarded-For": "192.168.1.100"},
+            )
+
+        assert resp.status_code == 403
+        assert "outside allowed callback CIDRs" in resp.json().get("detail", "")
+        mock_db.consume_ha_callback_token.assert_not_called()
+        mock_db.consume_callback_token.assert_not_called()
+        mock_jobs.enqueue_job.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_callback_allowed_cidr_succeeds_and_consumes_token():
+    """Callback from allowed CIDR proceeds to token consumption and job creation."""
+    mock_settings = MagicMock()
+    mock_settings.drover_callback_allowed_cidrs = ["10.0.0.0/8"]
+    mock_settings.trusted_proxies = "127.0.0.1/32"
+
+    with (
+        patch("drover.api.callback.get_settings", return_value=mock_settings),
+        patch("drover.api.callback.k3s_cluster") as mock_db,
+        patch("drover.api.callback.operations") as mock_ops,
+        patch("drover.api.callback._jobs_svc") as mock_jobs,
+    ):
+        mock_db.consume_ha_callback_token = AsyncMock(return_value=None)
+        mock_db.consume_callback_token = AsyncMock(
+            return_value={"project_id": "proj-1", "cluster_id": "cluster-1"}
+        )
+        mock_db.store_kubeconfig = AsyncMock()
+        mock_db.update_cluster_status = AsyncMock()
+        mock_db.get_cluster = AsyncMock(return_value={"master_count": 1})
+        mock_ops.get_active_operation = AsyncMock(return_value=None)
+        mock_jobs.enqueue_job = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/callback",
+                json={
+                    "token": "valid-token-12345",
+                    "success": True,
+                    "kubeconfig": "apiVersion: v1",
+                    "node_token": "token123",
+                    "server_ip": "10.0.0.5",
+                },
+                headers={"X-Forwarded-For": "10.1.2.3"},
+            )
+
+        assert resp.status_code == 200
+        mock_db.consume_callback_token.assert_called_once_with("valid-token-12345")
+        mock_jobs.enqueue_job.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_callback_invalid_expired_reused_token_fails_waiting_operation():
+    """Expired/invalid/reused token fails waiting operation and enqueues no job."""
+    with (
+        patch("drover.api.callback.k3s_cluster") as mock_db,
+        patch("drover.api.callback.operations") as mock_ops,
+        patch("drover.api.callback._jobs_svc") as mock_jobs,
+    ):
+        mock_db.consume_ha_callback_token = AsyncMock(return_value=None)
+        mock_db.consume_callback_token = AsyncMock(return_value=None)
+        mock_ops.fail_waiting_callback_operations = AsyncMock(return_value=["op-123"])
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/callback",
+                json={
+                    "token": "reused-or-expired-token",
+                    "success": True,
+                },
+                headers={"X-Openstack-Request-Id": "req-callback-test-123"},
+            )
+
+        assert resp.status_code == 403
+        mock_ops.fail_waiting_callback_operations.assert_called_once()
+        call_kwargs = mock_ops.fail_waiting_callback_operations.call_args.kwargs
+        assert call_kwargs["request_id"] == "req-callback-test-123"
+        assert "source_ip" in call_kwargs
+        mock_jobs.enqueue_job.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_callback_event_contains_request_id_and_source_ip():
+    """Valid callback appends operation event containing request_id and source_ip."""
+    mock_op = MagicMock()
+    mock_op.id = "op-active-456"
+
+    with (
+        patch("drover.api.callback.k3s_cluster") as mock_db,
+        patch("drover.api.callback.operations") as mock_ops,
+        patch("drover.api.callback._jobs_svc") as mock_jobs,
+    ):
+        mock_db.consume_ha_callback_token = AsyncMock(return_value=None)
+        mock_db.consume_callback_token = AsyncMock(
+            return_value={"project_id": "proj-1", "cluster_id": "cluster-1"}
+        )
+        mock_db.store_kubeconfig = AsyncMock()
+        mock_db.update_cluster_status = AsyncMock()
+        mock_db.get_cluster = AsyncMock(return_value={"master_count": 1})
+        mock_ops.get_active_operation = AsyncMock(return_value=mock_op)
+        mock_ops.update_operation_status = AsyncMock()
+        mock_ops.append_operation_event = AsyncMock()
+        mock_jobs.enqueue_job = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/callback",
+                json={
+                    "token": "valid-token-999",
+                    "success": True,
+                    "kubeconfig": "apiVersion: v1",
+                    "node_token": "token123",
+                    "server_ip": "127.0.0.1",
+                },
+                headers={"X-Openstack-Request-Id": "req-correlation-id-789"},
+            )
+
+        assert resp.status_code == 200
+        mock_ops.update_operation_status.assert_called_once_with(None, "op-active-456", "RUNNING")
+        mock_ops.append_operation_event.assert_called_once()
+        event_kwargs = mock_ops.append_operation_event.call_args.kwargs
+        assert event_kwargs["phase"] == "callback_received"
+        payload = event_kwargs["payload_json"]
+        assert payload["request_id"] == "req-correlation-id-789"
+        assert "source_ip" in payload
+        assert payload["server_ip"] == "127.0.0.1"
+        enqueue_kwargs = mock_jobs.enqueue_job.call_args.kwargs
+        assert enqueue_kwargs["operation_id"] == "op-active-456"

@@ -27,20 +27,24 @@ class OccmPlugin:
         if not settings.os_auth_url:
             _logger.warning("OCCM 활성화됨이지만 os_auth_url 미설정")
             return False
-        if not settings.os_username or not settings.os_password:
-            _logger.warning("OCCM 활성화됨이지만 OpenStack 인증 정보 미설정")
-            return False
         return True
 
-    def cloud_conf_sections(self, project_id: str, settings: Settings, internal_network_name: str = "") -> str:
+    def cloud_conf_sections(
+        self,
+        project_id: str,
+        settings: Settings,
+        internal_network_name: str = "",
+        app_credential: dict | None = None,
+    ) -> str:
         """OCCM의 cloud.conf 전체 내용 반환 (Global + LoadBalancer + Networking)."""
+        if not app_credential or not app_credential.get("id") or not app_credential.get("secret"):
+            raise ValueError("app_credential containing id and secret is required for OCCM plugin")
         tmpl = _jinja.get_template("occm/cloud_config.conf.j2")
         return tmpl.render(
             auth_url=settings.os_auth_url,
             region=settings.os_region_name,
-            username=settings.os_username,
-            password=settings.os_password,
-            user_domain_name=settings.os_user_domain_name,
+            app_credential_id=app_credential["id"],
+            app_credential_secret=app_credential["secret"],
             project_id=project_id,
             ca_file="" if settings.os_insecure else (settings.os_cacert or ""),
             floating_network_id=settings.resource_id("k3s.occm_floating_network"),
@@ -48,6 +52,7 @@ class OccmPlugin:
             lb_subnet_id=settings.resource_id("k3s.lb_subnet"),
             internal_network_name=internal_network_name,
         )
+
 
     def generate_manifests(self, cluster_name: str, project_id: str, settings: Settings, **kwargs) -> str:
         tmpl = _jinja.get_template("occm/manifests.yaml.j2")

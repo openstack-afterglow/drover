@@ -13,15 +13,20 @@ from slowapi.util import get_remote_address
 from drover.auth import get_token_info
 from drover.models.schemas import K3sClusterHealth
 from drover.rate_limit import limiter
-from drover.services import store as k3s_cluster
 from drover.services import health as k3s_health
+from drover.services import store as k3s_cluster
 
 router = APIRouter()
 _logger = logging.getLogger(__name__)
 _limiter = Limiter(key_func=get_remote_address)
 
 
-@router.get("", response_model=list[K3sClusterHealth])
+@router.get(
+    "/health",
+    response_model=list[K3sClusterHealth],
+    summary="List cluster health status",
+    description="프로젝트 내 모든 K3s 클러스터의 헬스 상태 목록 반환.",
+)
 async def list_cluster_health(
     token_info: dict = Depends(get_token_info),
 ):

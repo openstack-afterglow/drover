@@ -21,6 +21,10 @@ _logger = logging.getLogger(__name__)
 
 DEFAULT_PROJECT_ID = "__default__"
 
+_NON_GPU_PCI_ALIAS_TOKENS = frozenset(
+    {"audio", "crypto", "fpga", "infiniband", "network", "nic", "nvme", "qat", "rdma", "sriov"}
+)
+
 
 def normalize_gpu_alias(alias: str) -> str:
     """GPU alias를 대표(canonical) 이름으로 정규화.
@@ -63,17 +67,23 @@ def _parse_alias_counts(extra_specs: dict) -> dict[str, int]:
         return result
     for entry in alias_str.split(","):
         entry = entry.strip()
-        if ":" not in entry:
+        if not entry:
             continue
-        alias, _, num_str = entry.rpartition(":")
-        alias = alias.strip()
-        if "audio" in alias.lower():
+        if ":" in entry:
+            alias, _, num_str = entry.rpartition(":")
+            alias = alias.strip()
+            try:
+                count = max(int(num_str), 1)
+            except ValueError:
+                count = 1
+        else:
+            alias = entry
+            count = 1
+        alias_lower = alias.lower()
+        alias_tokens = {token for token in re.split(r"[^a-z0-9]+", alias_lower) if token}
+        if not alias or "audio" in alias_lower or not alias_tokens.isdisjoint(_NON_GPU_PCI_ALIAS_TOKENS):
             continue
-        try:
-            cnt = int(num_str)
-        except ValueError:
-            cnt = 1
-        result[alias] = result.get(alias, 0) + cnt
+        result[alias] = result.get(alias, 0) + count
     return result
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
-import fnmatch
 
+import fnmatch
 from collections.abc import AsyncIterator
 from typing import Any
 

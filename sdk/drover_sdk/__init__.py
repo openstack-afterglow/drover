@@ -3,25 +3,24 @@
 import os
 
 from drover_sdk.service import DroverService
-__version__ = "0.1.0"
+
+__version__ = "0.2.0"
 
 
 def register(conn):
-    """Enable Drover and return ``conn.drover``.
+    """Enable Drover catalog discovery and return ``conn.drover``.
 
-    ``drover`` is not an official OpenStack service type, so
-    ``CloudRegion.has_service()`` would otherwise fall back to
-    ``os_service_types.is_official()`` and report it disabled — every
-    ``conn.drover.*`` access would then raise ``ServiceDisabledException``
-    instead of issuing a request. ``enable_service`` must run before
-    ``add_service`` attaches the proxy.
+    Drover is registered in Keystone under the ``drover`` service type. The
+    optional ``SERVICE_DROVER_INTERNAL_URL`` override may point either at the
+    service root or at a versioned API base.
     """
-    conn.config.enable_service("drover")
-    conn.add_service(DroverService())
-    proxy = conn.drover
+    service_type = "drover"
+    conn.config.enable_service(service_type)
     if endpoint_override := os.environ.get("SERVICE_DROVER_INTERNAL_URL", "").strip().rstrip("/"):
-        proxy.endpoint_override = endpoint_override
-    return proxy
+        conn.config.set_service_value("endpoint_override", service_type, endpoint_override)
+        conn.config.set_service_value("api_version", service_type, "1")
+    conn.add_service(DroverService())
+    return conn.drover
 
 
 __all__ = ["DroverService", "register"]

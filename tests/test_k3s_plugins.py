@@ -90,11 +90,24 @@ def test_occm_cloud_conf_sections_contains_global():
     from drover.services.plugins.occm import OccmPlugin
 
     s = _base_settings(drover_occm_enabled=True)
-    result = OccmPlugin().cloud_conf_sections("proj-1", s)
+    result = OccmPlugin().cloud_conf_sections("proj-1", s, app_credential=_FAKE_APP_CRED)
     assert "[Global]" in result
     assert "auth-url=https://keystone.example.com:5000/v3" in result
+    assert "application-credential-id=appcred-id-123" in result
+    assert "application-credential-secret=appcred-secret-xyz" in result
     assert "tenant-id=proj-1" in result
+    assert "password" not in result
+    assert "username" not in result
 
+
+def test_occm_cloud_conf_missing_app_cred_raises():
+    import pytest
+
+    from drover.services.plugins.occm import OccmPlugin
+
+    s = _base_settings(drover_occm_enabled=True)
+    with pytest.raises(ValueError, match="app_credential"):
+        OccmPlugin().cloud_conf_sections("proj-1", s, app_credential=None)
 
 def test_occm_manifests_valid_yaml():
     from drover.services.plugins.occm import OccmPlugin
@@ -185,17 +198,29 @@ def test_manila_csi_manifests_valid_yaml():
     from drover.services.plugins.manila_csi import ManilaCsiPlugin
 
     s = _base_settings(drover_manila_csi_enabled=True)
-    manifests = ManilaCsiPlugin().generate_manifests("test-cluster", "proj-1", s)
+    manifests = ManilaCsiPlugin().generate_manifests("test-cluster", "proj-1", s, app_credential=_FAKE_APP_CRED)
     docs = [d for d in yaml.safe_load_all(manifests) if d]
     kinds = {d["kind"] for d in docs}
     assert "CSIDriver" in kinds
     assert "StatefulSet" in kinds
     assert "StorageClass" in kinds
+    assert "os-applicationCredentialID" in manifests
+    assert "os-applicationCredentialSecret" in manifests
+    assert "os-userName" not in manifests
+    assert "os-password" not in manifests
     # NFS CSI 드라이버도 포함되어야 함
     names = {d.get("metadata", {}).get("name") for d in docs}
     assert "nfs.csi.k8s.io" in names
 
 
+def test_manila_csi_manifests_missing_app_cred_raises():
+    import pytest
+
+    from drover.services.plugins.manila_csi import ManilaCsiPlugin
+
+    s = _base_settings(drover_manila_csi_enabled=True)
+    with pytest.raises(ValueError, match="app_credential"):
+        ManilaCsiPlugin().generate_manifests("test-cluster", "proj-1", s, app_credential=None)
 def test_manila_csi_no_cloud_conf_sections():
     from drover.services.plugins.manila_csi import ManilaCsiPlugin
 
@@ -424,7 +449,7 @@ def test_barbican_kms_extra_write_files_systemd_pattern():
     from drover.services.plugins.barbican_kms import BarbicanKmsPlugin
 
     s = _base_settings(drover_barbican_kms_enabled=True, drover_barbican_kms_kek_id="kek-uuid-123")
-    files = BarbicanKmsPlugin().extra_write_files("proj-1", "test-cluster", s)
+    files = BarbicanKmsPlugin().extra_write_files("proj-1", "test-cluster", s, app_credential=_FAKE_APP_CRED)
     paths = {f["path"] for f in files}
     assert paths == {
         "/etc/kubernetes/encryption-config.yaml",
@@ -441,7 +466,7 @@ def test_barbican_kms_systemd_unit_runs_before_drover_with_correct_args():
     from drover.services.plugins.barbican_kms import BarbicanKmsPlugin
 
     s = _base_settings(drover_barbican_kms_enabled=True, drover_barbican_kms_kek_id="kek-uuid-123")
-    files = BarbicanKmsPlugin().extra_write_files("proj-1", "test-cluster", s)
+    files = BarbicanKmsPlugin().extra_write_files("proj-1", "test-cluster", s, app_credential=_FAKE_APP_CRED)
     unit = next(f["content"] for f in files if f["path"].endswith("barbican-kms.service"))
     assert "Before=k3s.service" in unit, "데드락 방지 — k3s.service 보다 먼저 시작되어야 함"
     assert "ExecStart=/usr/local/bin/barbican-kms-plugin" in unit
@@ -471,7 +496,7 @@ def test_barbican_kms_arg_path_matches_write_file():
     plugin = BarbicanKmsPlugin()
     args = plugin.server_install_args(s)
     arg_path = next(a.split("=", 2)[2] for a in args if "encryption-provider-config" in a)
-    files = plugin.extra_write_files("proj-1", "test-cluster", s)
+    files = plugin.extra_write_files("proj-1", "test-cluster", s, app_credential=_FAKE_APP_CRED)
     file_paths = {f["path"] for f in files}
     assert arg_path in file_paths
 
@@ -500,7 +525,7 @@ def test_registry_occm_only():
     assert len(active) == 1
     assert active[0].name == "occm"
     assert drover_plugins.needs_external_cloud_provider(s) is True
-    cloud_conf = drover_plugins.aggregate_cloud_conf("proj-1", s)
+    cloud_conf = drover_plugins.aggregate_cloud_conf("proj-1", s, app_credential=_FAKE_APP_CRED)
     assert cloud_conf is not None
     assert "[Global]" in cloud_conf
 
@@ -511,16 +536,15 @@ def test_registry_occm_plus_cinder():
     s = _base_settings(drover_occm_enabled=True, drover_cinder_csi_enabled=True)
     active = drover_plugins.get_active_plugins(s)
     assert len(active) == 2
-    cloud_conf = drover_plugins.aggregate_cloud_conf("proj-1", s)
+    cloud_conf = drover_plugins.aggregate_cloud_conf("proj-1", s, app_credential=_FAKE_APP_CRED)
     assert "[Global]" in cloud_conf
     assert "[BlockStorage]" in cloud_conf
-    manifests, failures = drover_plugins.aggregate_manifests("test-cluster", "proj-1", s)
+    manifests, failures = drover_plugins.aggregate_manifests("test-cluster", "proj-1", s, app_credential=_FAKE_APP_CRED)
     assert not failures
     assert len(manifests) == 2
     names = [m["name"] for m in manifests]
     assert "occm" in names
     assert "cinder_csi" in names
-
 
 def test_registry_server_args_dedup():
     """동일 인자가 여러 플러그인에서 반환되어도 중복 없어야 함."""

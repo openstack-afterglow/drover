@@ -416,21 +416,20 @@ def _rewrite_cluster_policy_snapshot(row: dict[str, Any]) -> None:
             is_json_str = True
         except json.JSONDecodeError:
             return
-    if isinstance(snapshot, dict):
-        if "cinder.default_volume_availability_zone" in snapshot:
-            cinder_val = snapshot["cinder.default_volume_availability_zone"]
-            if "k3s.volume_availability_zone" in snapshot:
-                k3s_val = snapshot["k3s.volume_availability_zone"]
-                if _canonical(cinder_val) != _canonical(k3s_val):
-                    raise CutoverError(
-                        f"conflicting volume_availability_zone keys in cluster {row.get('id')!r} resource_policy_snapshot"
-                    )
-            snapshot["k3s.volume_availability_zone"] = cinder_val
-            del snapshot["cinder.default_volume_availability_zone"]
-            if is_json_str:
-                row["resource_policy_snapshot"] = json.dumps(snapshot, separators=(",", ":"), sort_keys=True)
-            else:
-                row["resource_policy_snapshot"] = snapshot
+    if isinstance(snapshot, dict) and "cinder.default_volume_availability_zone" in snapshot:
+        cinder_val = snapshot["cinder.default_volume_availability_zone"]
+        if "k3s.volume_availability_zone" in snapshot:
+            k3s_val = snapshot["k3s.volume_availability_zone"]
+            if _canonical(cinder_val) != _canonical(k3s_val):
+                raise CutoverError(
+                    f"conflicting volume_availability_zone keys in cluster {row.get('id')!r} resource_policy_snapshot"
+                )
+        snapshot["k3s.volume_availability_zone"] = cinder_val
+        del snapshot["cinder.default_volume_availability_zone"]
+        if is_json_str:
+            row["resource_policy_snapshot"] = json.dumps(snapshot, separators=(",", ":"), sort_keys=True)
+        else:
+            row["resource_policy_snapshot"] = snapshot
 
 
 def _database_identity(url: URL) -> tuple[Any, ...]:

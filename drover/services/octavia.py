@@ -100,6 +100,7 @@ def create_load_balancer(
     description: str = "",
     *,
     vip_network_id: str | None = None,
+    tags: list[str] | None = None,
 ) -> dict:
     """Octavia LB 생성.
 
@@ -111,6 +112,8 @@ def create_load_balancer(
         kwargs["vip_network_id"] = vip_network_id
     else:
         kwargs["vip_subnet_id"] = vip_subnet_id
+    if tags:
+        kwargs["tags"] = tags
     lb = conn.load_balancer.create_load_balancer(**kwargs)
     return _lb_to_dict(lb)
 
@@ -118,6 +121,41 @@ def create_load_balancer(
 def delete_load_balancer(conn: openstack.connection.Connection, lb_id: str, cascade: bool = True) -> None:
     conn.load_balancer.delete_load_balancer(lb_id, cascade=cascade, ignore_missing=True)
 
+def wait_load_balancer_deleted(conn: openstack.connection.Connection, lb_id: str, timeout: int = 120) -> None:
+    """LB가 완전히 삭제될 때까지 폴링."""
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            lb = conn.load_balancer.find_load_balancer(lb_id, ignore_missing=True)
+            if lb is None or getattr(lb, "provisioning_status", "") in {"DELETED", ""}:
+                return
+        except Exception:
+            return
+        time.sleep(3)
+    raise TimeoutError(f"LB {lb_id} 삭제 대기 타임아웃 ({timeout}s)")
+
+
+def delete_load_balancer_safe(
+    conn: openstack.connection.Connection,
+    lb_id: str,
+    expected_project_id: str,
+    expected_cluster_id: str,
+    cascade: bool = True,
+) -> None:
+    """프로젝트 및 Drover 소유권 검증 후 LB를 안전하게 삭제."""
+    from drover.services.inventory import validate_resource_ownership
+
+    try:
+        lb = conn.load_balancer.find_load_balancer(lb_id, ignore_missing=True)
+    except Exception:
+        lb = None
+    if lb is None:
+        return
+    if not validate_resource_ownership(lb, expected_project_id, expected_cluster_id, "load_balancer"):
+        raise ValueError(f"Load balancer {lb_id} ownership validation failed for project {expected_project_id}")
+    delete_load_balancer(conn, lb_id, cascade=cascade)
+    wait_load_balancer_deleted(conn, lb_id)
 
 def wait_for_load_balancer(
     conn: openstack.connection.Connection,

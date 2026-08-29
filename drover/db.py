@@ -54,6 +54,10 @@ def init_db(
 
 def get_session_factory() -> async_sessionmaker[AsyncSession] | None:
     return _session_factory
+def set_session_factory(factory: async_sessionmaker[AsyncSession] | None) -> None:
+    global _session_factory
+    _session_factory = factory
+
 
 
 def is_db_available() -> bool:

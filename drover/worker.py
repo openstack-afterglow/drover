@@ -6,22 +6,26 @@ import asyncio
 import logging
 import signal
 
-from drover.config import get_settings
+from drover.config import get_settings, validate_config
 from drover.db import close_db, init_db
 
 _logger = logging.getLogger("drover.worker")
 
 
-async def _stale_cleanup_loop():
-    from drover.services import store
+async def _reconcile_worker_loop():
+    from drover.services import operations, reconciliation
 
-    await asyncio.sleep(120)
+    s = get_settings()
+    interval = getattr(s, "drover_reconcile_interval", 300)
+    concurrency = getattr(s, "drover_reconcile_concurrency_per_project", 2)
+    await asyncio.sleep(10)
     while True:
         try:
-            await store.check_stale_clusters(timeout_minutes=30)
+            await operations.recover_expired_callback_operations(timeout_seconds=1800)
+            await reconciliation.schedule_worker_reconciliations(max_per_project=concurrency)
         except Exception as exc:
-            _logger.warning("Stale cluster cleanup error: %s", exc)
-        await asyncio.sleep(300)
+            _logger.warning("Reconcile worker loop error: %s", exc)
+        await asyncio.sleep(interval)
 
 
 async def _jobs_worker_loop():
@@ -44,11 +48,11 @@ async def _health_worker_loop():
     from drover.services import health
 
     s = get_settings()
-    interval = getattr(s, "k3s_health_interval", 180)
+    interval = s.k3s_health_interval
     await asyncio.sleep(10)
     while True:
         try:
-            await health.check_all_clusters_health()
+            await health.check_all_active_clusters()
         except Exception as exc:
             _logger.warning("Health worker loop error: %s", exc)
         await asyncio.sleep(interval)
@@ -58,11 +62,11 @@ async def _stampede_worker_loop():
     from drover.services import stampede
 
     s = get_settings()
-    interval = s.drover_stampede_interval or s.drover_stampede_interval or 60
+    interval = s.drover_stampede_interval or 60
     await asyncio.sleep(15)
     while True:
         try:
-            if s.drover_stampede_enabled or s.drover_stampede_enabled:
+            if s.drover_stampede_enabled:
                 await stampede.run_all()
         except Exception as exc:
             _logger.warning("Stampede worker loop error: %s", exc)
@@ -74,6 +78,7 @@ async def _main_async():
     _logger.info("Starting Drover background worker...")
 
     settings = get_settings()
+    validate_config(settings)
     init_db(
         settings.database_url,
         pool_size=settings.database_pool_size,
@@ -96,7 +101,7 @@ async def _main_async():
             pass
 
     tasks = [
-        asyncio.create_task(_stale_cleanup_loop()),
+        asyncio.create_task(_reconcile_worker_loop()),
         asyncio.create_task(_jobs_worker_loop()),
         asyncio.create_task(_health_worker_loop()),
         asyncio.create_task(_stampede_worker_loop()),

@@ -348,10 +348,19 @@ def list_floating_ips(conn: openstack.connection.Connection, project_id: str | N
     return out
 
 
-def create_floating_ip(conn: openstack.connection.Connection, floating_network_id: str) -> FloatingIpInfo:
-    fip = conn.network.create_ip(floating_network_id=floating_network_id)
+def create_floating_ip(
+    conn: openstack.connection.Connection,
+    floating_network_id: str,
+    port_id: str | None = None,
+    tags: list[str] | None = None,
+) -> FloatingIpInfo:
+    kwargs: dict = {"floating_network_id": floating_network_id}
+    if port_id:
+        kwargs["port_id"] = port_id
+    if tags:
+        kwargs["tags"] = tags
+    fip = conn.network.create_ip(**kwargs)
     return _fip_to_info(fip)
-
 
 def find_external_network_for_subnets(
     conn: openstack.connection.Connection,
@@ -406,6 +415,46 @@ def disassociate_floating_ip(conn: openstack.connection.Connection, floating_ip_
 
 def delete_floating_ip(conn: openstack.connection.Connection, floating_ip_id: str) -> None:
     conn.network.delete_ip(floating_ip_id, ignore_missing=True)
+def wait_floating_ip_deleted(conn: openstack.connection.Connection, floating_ip_id: str, timeout: int = 120) -> None:
+    """Floating IP가 완전히 삭제될 때까지 폴링."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        fip = conn.network.find_ip(floating_ip_id, ignore_missing=True)
+        if fip is None:
+            return
+        time.sleep(3)
+    raise TimeoutError(f"Floating IP {floating_ip_id} 삭제 대기 타임아웃 ({timeout}s)")
+
+
+def delete_floating_ip_safe(
+    conn: openstack.connection.Connection,
+    floating_ip_id: str,
+    expected_project_id: str,
+    expected_cluster_id: str,
+) -> None:
+    """프로젝트 및 Drover 소유권 검증 후 Floating IP를 안전하게 삭제."""
+    from drover.services.inventory import validate_resource_ownership
+
+    fip = conn.network.find_ip(floating_ip_id, ignore_missing=True)
+    if fip is None:
+        return
+    if not validate_resource_ownership(fip, expected_project_id, expected_cluster_id, "floating_ip"):
+        raise ValueError(f"Floating IP {floating_ip_id} ownership validation failed for project {expected_project_id}")
+    delete_floating_ip(conn, floating_ip_id)
+    wait_floating_ip_deleted(conn, floating_ip_id)
+
+
+def wait_port_deleted(conn: openstack.connection.Connection, port_id: str, timeout: int = 120) -> None:
+    """Neutron port가 완전히 삭제될 때까지 폴링."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        port = conn.network.find_port(port_id, ignore_missing=True)
+        if port is None:
+            return
+        time.sleep(3)
+    raise TimeoutError(f"Port {port_id} 삭제 대기 타임아웃 ({timeout}s)")
 
 
 def get_topology(conn: openstack.connection.Connection) -> TopologyData:
@@ -687,14 +736,51 @@ def list_security_groups(conn: openstack.connection.Connection, project_id: str 
     return [_sg_to_dict(sg) for sg in conn.network.security_groups(**kwargs)]
 
 
-def create_security_group(conn: openstack.connection.Connection, name: str, description: str = "") -> dict:
-    sg = conn.network.create_security_group(name=name, description=description)
+def create_security_group(
+    conn: openstack.connection.Connection,
+    name: str,
+    description: str = "",
+    tags: list[str] | None = None,
+) -> dict:
+    kwargs: dict = {"name": name, "description": description}
+    if tags:
+        kwargs["tags"] = tags
+    sg = conn.network.create_security_group(**kwargs)
     return _sg_to_dict(sg)
 
 
 def delete_security_group(conn: openstack.connection.Connection, sg_id: str) -> None:
     conn.network.delete_security_group(sg_id, ignore_missing=True)
 
+
+def wait_security_group_deleted(conn: openstack.connection.Connection, sg_id: str, timeout: int = 120) -> None:
+    """보안 그룹이 완전히 삭제될 때까지 폴링."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sg = conn.network.find_security_group(sg_id, ignore_missing=True)
+        if sg is None:
+            return
+        time.sleep(3)
+    raise TimeoutError(f"보안 그룹 {sg_id} 삭제 대기 타임아웃 ({timeout}s)")
+
+
+def delete_security_group_safe(
+    conn: openstack.connection.Connection,
+    sg_id: str,
+    expected_project_id: str,
+    expected_cluster_id: str,
+) -> None:
+    """프로젝트 및 Drover 소유권 검증 후 보안 그룹을 안전하게 삭제."""
+    from drover.services.inventory import validate_resource_ownership
+
+    sg = conn.network.find_security_group(sg_id, ignore_missing=True)
+    if sg is None:
+        return
+    if not validate_resource_ownership(sg, expected_project_id, expected_cluster_id, "security_group"):
+        raise ValueError(f"Security group {sg_id} ownership validation failed for project {expected_project_id}")
+    delete_security_group(conn, sg_id)
+    wait_security_group_deleted(conn, sg_id)
 
 def create_security_group_rule(
     conn: openstack.connection.Connection,

@@ -14,15 +14,18 @@ def create_volume_from_image(
     image_id: str,
     size_gb: int,
     availability_zone: str | None = None,
+    metadata: dict | None = None,
 ) -> VolumeInfo:
     """OS 이미지를 소스로 부트 볼륨 생성."""
-    kwargs = {
+    kwargs: dict = {
         "name": name,
         "size": size_gb,
         "imageRef": image_id,
     }
     if availability_zone:
         kwargs["availability_zone"] = availability_zone
+    if metadata:
+        kwargs["metadata"] = metadata
 
     vol = conn.block_storage.create_volume(**kwargs)
     vol = conn.block_storage.wait_for_status(vol, status="available", wait=300)
@@ -34,16 +37,18 @@ def create_empty_volume(
     name: str,
     size_gb: int,
     availability_zone: str | None = None,
+    metadata: dict | None = None,
 ) -> VolumeInfo:
     """upperdir 용 빈 볼륨 생성."""
-    kwargs = {"name": name, "size": size_gb}
+    kwargs: dict = {"name": name, "size": size_gb}
     if availability_zone:
         kwargs["availability_zone"] = availability_zone
+    if metadata:
+        kwargs["metadata"] = metadata
 
     vol = conn.block_storage.create_volume(**kwargs)
     vol = conn.block_storage.wait_for_status(vol, status="available", wait=120)
     return _vol_to_info(vol)
-
 
 def rename_volume(conn: openstack.connection.Connection, volume_id: str, new_name: str) -> None:
     conn.block_storage.update_volume(volume_id, name=new_name)
@@ -52,6 +57,35 @@ def rename_volume(conn: openstack.connection.Connection, volume_id: str, new_nam
 def delete_volume(conn: openstack.connection.Connection, volume_id: str) -> None:
     conn.block_storage.delete_volume(volume_id, ignore_missing=True)
 
+
+def wait_volume_deleted(conn: openstack.connection.Connection, volume_id: str, timeout: int = 120) -> None:
+    """볼륨이 완전히 삭제될 때까지 폴링."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        vol = conn.block_storage.find_volume(volume_id, ignore_missing=True)
+        if vol is None:
+            return
+        time.sleep(3)
+    raise TimeoutError(f"볼륨 {volume_id} 삭제 대기 타임아웃 ({timeout}s)")
+
+
+def delete_volume_safe(
+    conn: openstack.connection.Connection,
+    volume_id: str,
+    expected_project_id: str,
+    expected_cluster_id: str,
+) -> None:
+    """프로젝트 및 Drover 소유권 검증 후 볼륨을 안전하게 삭제."""
+    from drover.services.inventory import validate_resource_ownership
+
+    vol = conn.block_storage.find_volume(volume_id, ignore_missing=True)
+    if vol is None:
+        return
+    if not validate_resource_ownership(vol, expected_project_id, expected_cluster_id, "volume"):
+        raise ValueError(f"Volume {volume_id} ownership validation failed for project {expected_project_id}")
+    delete_volume(conn, volume_id)
+    wait_volume_deleted(conn, volume_id)
 
 def reset_volume_status(
     conn: openstack.connection.Connection,

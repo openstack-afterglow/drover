@@ -1,0 +1,28 @@
+---
+# Deployment tasks for Drover workload containers (API and Worker)
+
+- name: Start drover-api container
+  community.docker.docker_container:
+    name: "{{ drover_services['drover-api'].container_name }}"
+    image: "{{ drover_services['drover-api'].image }}"
+    state: started
+    restart_policy: unless-stopped
+    volumes: "{{ drover_services['drover-api'].volumes }}"
+    env: "{{ drover_services['drover-api'].environment }}"
+    healthcheck: "{{ drover_services['drover-api'].healthcheck | default(omit) }}"
+  when:
+    - inventory_hostname in groups[drover_services['drover-api'].group] | default([])
+    - drover_services['drover-api'].enabled | bool
+
+- name: Start drover-worker container
+  community.docker.docker_container:
+    name: "{{ drover_services['drover-worker'].container_name }}"
+    image: "{{ drover_services['drover-worker'].image }}"
+    state: started
+    restart_policy: unless-stopped
+    volumes: "{{ drover_services['drover-worker'].volumes }}"
+    env: "{{ drover_services['drover-worker'].environment }}"
+    healthcheck: "{{ drover_services['drover-worker'].healthcheck | default(omit) }}"
+  when:
+    - inventory_hostname in groups[drover_services['drover-worker'].group] | default([])
+    - drover_services['drover-worker'].enabled | bool

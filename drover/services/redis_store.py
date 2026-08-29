@@ -6,8 +6,8 @@ import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 
-from drover.services.cache import _get_client
 from drover.crypto import decrypt_kubeconfig, encrypt_kubeconfig
+from drover.services.cache import _get_client
 
 _logger = logging.getLogger(__name__)
 

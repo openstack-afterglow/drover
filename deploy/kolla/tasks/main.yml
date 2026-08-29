@@ -1,0 +1,28 @@
+---
+# Main entrypoint for Kolla-Ansible Drover role deployment.
+# Enforces strict admission ordering:
+# 1. Prechecks
+# 2. Host Configuration rendering
+# 3. Keystone Service Catalog registration
+# 4. Migration Gate (`drover-migrate` must run and complete successfully before any workload admission)
+# 5. Deployment of workload containers (`drover-api` and `drover-worker`)
+
+- name: Run prechecks
+  ansible.builtin.import_tasks: precheck.yml
+  when: stage | default('deploy') in ['precheck', 'deploy']
+
+- name: Render service configurations
+  ansible.builtin.import_tasks: config.yml
+  when: stage | default('deploy') in ['config', 'deploy']
+
+- name: Register Keystone service catalog and endpoints
+  ansible.builtin.import_tasks: register.yml
+  when: stage | default('deploy') in ['register', 'deploy']
+
+- name: Run database migration gate
+  ansible.builtin.import_tasks: bootstrap.yml
+  when: stage | default('deploy') in ['bootstrap', 'deploy']
+
+- name: Deploy workload containers
+  ansible.builtin.import_tasks: deploy.yml
+  when: stage | default('deploy') in ['deploy']

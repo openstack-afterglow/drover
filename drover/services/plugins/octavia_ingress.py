@@ -24,8 +24,8 @@ class OctaviaIngressPlugin:
     def should_deploy(self, settings: Settings) -> bool:
         if not settings.drover_octavia_ingress_enabled:
             return False
-        if not settings.os_auth_url or not settings.os_username or not settings.os_password:
-            _logger.warning("OctaviaIngress 활성화됨이지만 OpenStack 인증 정보 미설정")
+        if not settings.os_auth_url:
+            _logger.warning("OctaviaIngress 활성화됨이지만 os_auth_url 미설정")
             return False
         return True
 

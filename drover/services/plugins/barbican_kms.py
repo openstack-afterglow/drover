@@ -67,24 +67,10 @@ class BarbicanKmsPlugin:
         app_credential: dict | None = None,
         kek_id: str | None = None,
     ) -> list[dict]:
-        """KMS 운영에 필요한 host file 4건 작성.
-
-        1. encryption-config.yaml — apiserver 가 부팅 시 읽음
-        2. systemd unit `barbican-kms.service` — k3s.service 보다 먼저 시작
-        3. install script — k3s ctr 로 image pull + binary 추출 (runcmd 에서 호출)
-        4. barbican-cloud.conf — KMS plugin 이 Barbican 인증에 사용
-
-        Args:
-            app_credential: PR1 app credential dict {"id", "secret", "user_id"} 또는 None.
-                None 이면 admin password fallback (deprecated, dev 전용).
-            kek_id: PR2 cluster owner project 의 동적 KEK UUID. None 이면
-                settings.drover_barbican_kms_kek_id (글로벌 fallback) 사용.
-
-        실제 service 시작은 cloud-init runcmd 에서 (k3s_server.yaml.j2 참조).
-        """
+        """KMS 운영에 필요한 host file 4건 작성."""
+        if not app_credential or not app_credential.get("id") or not app_credential.get("secret"):
+            raise ValueError("app_credential containing id and secret is required for Barbican KMS plugin")
         encryption_config = _jinja.get_template("k3s_plugins/barbican_kms/encryption_config.yaml.j2").render()
-        # PR2 — 동적 KEK 우선, 글로벌 settings fallback. KEK ID 는 cloud.conf [KeyManager] key-id 로 전달
-        # (barbican-kms-plugin CLI 는 --key-id flag 를 지원하지 않음 — v1.34.1 검증 완료).
         effective_kek_id = kek_id or settings.drover_barbican_kms_kek_id
         systemd_unit = _jinja.get_template("k3s_plugins/barbican_kms/systemd_unit.j2").render()
         install_script = _jinja.get_template("k3s_plugins/barbican_kms/install_kms.sh.j2").render(
@@ -93,17 +79,9 @@ class BarbicanKmsPlugin:
         cloud_conf = _jinja.get_template("k3s_plugins/barbican_kms/cloud_conf.yaml.j2").render(
             auth_url=settings.os_auth_url,
             region=settings.os_region_name,
-            # § PR1 app credential 우선 (admin password 노출 차단)
-            app_credential_id=(app_credential or {}).get("id", ""),
-            app_credential_secret=(app_credential or {}).get("secret", ""),
-            # Fallback — admin password (app_credential 없을 때만)
-            username=settings.os_username,
-            password=settings.os_password,
-            user_domain_name=settings.os_user_domain_name,
-            project_name=settings.os_project_name,
-            project_domain_name=getattr(settings, "os_project_domain_name", "") or "",
+            app_credential_id=app_credential["id"],
+            app_credential_secret=app_credential["secret"],
             ca_file="" if settings.os_insecure else (settings.os_cacert or ""),
-            # § PR2 — KEK ID 를 [KeyManager] key-id 로 전달
             kek_id=effective_kek_id,
         )
         return [

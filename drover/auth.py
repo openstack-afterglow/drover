@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
 import logging
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
 from fastapi import Depends, Header, HTTPException, Request
+from fastapi.security import APIKeyHeader
 from keystoneauth1 import session as ks_session
 from keystoneauth1.identity import v3
 
@@ -15,6 +16,12 @@ from drover.config import get_settings
 
 _logger = logging.getLogger(__name__)
 _admin_role_id_cache: str | None = None
+keystone_token_scheme = APIKeyHeader(
+    name="X-Auth-Token",
+    auto_error=False,
+    scheme_name="KeystoneToken",
+    description="Keystone authentication token",
+)
 
 
 @dataclass
@@ -101,7 +108,7 @@ def validate_token(token: str, project_id: str = "") -> dict:
 
 async def require_token(
     request: Request,
-    x_auth_token: str | None = Header(default=None, alias="X-Auth-Token"),
+    x_auth_token: str | None = Depends(keystone_token_scheme),
     x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
 ) -> dict:
     if not x_auth_token:
@@ -122,8 +129,9 @@ def get_token_info(token_info: dict = Depends(require_token)) -> dict:
 
 
 def require_admin(token_info: dict = Depends(require_token)) -> dict:
-    if not token_info.get("is_system_admin"):
-        raise HTTPException(status_code=403, detail="관리자 권한이 필요합니다")
+    from drover.policy import authorize
+
+    authorize("drover:admin", {"project_id": token_info.get("project_id", "")}, token_info)
     return token_info
 
 
@@ -146,7 +154,7 @@ def get_admin_connection_for_project(project_id: str):
         api_timeout=30,
         verify=settings.ssl_verify,
     )
-    setattr(conn, "_afterglow_project_id", project_id)
+    conn._afterglow_project_id = project_id
     return conn
 
 
@@ -172,9 +180,9 @@ async def get_os_conn(
             api_timeout=30,
             verify=settings.ssl_verify,
         )
-        setattr(conn, "_afterglow_token", scoped_token)
-        setattr(conn, "_afterglow_project_id", project_id)
-        setattr(conn, "_afterglow_user_id", token_info.get("user_id", ""))
+        conn._afterglow_token = scoped_token
+        conn._afterglow_project_id = project_id
+        conn._afterglow_user_id = token_info.get("user_id", "")
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid scoped Keystone token") from None
 

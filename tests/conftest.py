@@ -29,6 +29,12 @@ def make_mock_conn(project_id: str = "test-project-123") -> MagicMock:
     conn._afterglow_project_id = project_id
     conn._afterglow_user_id = "test-user-123"
     conn.close = MagicMock()
+    conn.compute.find_server.return_value = None
+    conn.load_balancer.find_load_balancer.return_value = None
+    conn.network.find_ip.return_value = None
+    conn.block_storage.find_volume.return_value = None
+    conn.network.find_security_group.return_value = None
+    conn.network.find_port.return_value = None
     return conn
 
 

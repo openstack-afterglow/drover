@@ -1,0 +1,25 @@
+{
+    "command": "uvicorn drover.main:app --host 0.0.0.0 --port {{ drover_api_port }}",
+    "config_files": [
+        {
+            "source": "/var/lib/kolla/config_files/drover.conf",
+            "dest": "/etc/drover/drover.conf",
+            "owner": "appuser",
+            "perm": "0600"
+        },
+        {
+            "source": "/var/lib/kolla/config_files/policy.yaml",
+            "dest": "/etc/drover/policy.yaml",
+            "owner": "appuser",
+            "perm": "0600",
+            "optional": true
+        }
+    ],
+    "permissions": [
+        {
+            "path": "/var/log/kolla/drover",
+            "owner": "appuser:appuser",
+            "recurse": true
+        }
+    ]
+}

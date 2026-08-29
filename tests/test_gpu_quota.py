@@ -3,8 +3,8 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
 
+from drover.services import nova
 from drover.services.gpu_quota import (
     DEFAULT_PROJECT_ID,
     _parse_alias_counts,
@@ -32,6 +32,11 @@ def test_audio_exclusion():
     assert normalize_gpu_alias("rtx-audio") == ""
     parsed = _parse_alias_counts({"pci_passthrough:alias": "RTX3090:1,RTX3090Audio:1"})
     assert parsed == {"RTX3090": 1}
+
+    parsed = _parse_alias_counts(
+        {"pci_passthrough:alias": "RTX3090,sriov_nic:1,A100:0"}
+    )
+    assert parsed == {"RTX3090": 1, "A100": 1}
 
     with pytest.raises(ValueError, match="오디오"):
         validate_quota_params("RTX3090Audio", 1)
@@ -95,6 +100,40 @@ async def test_usage_calculation(mock_conn):
         usage = await get_project_gpu_usage(mock_conn, "test-project-123")
         assert usage == {"RTX3090": 2}
 
+
+@pytest.mark.asyncio
+async def test_gpu_usage_calculation_with_real_flavor_info_model(mock_conn):
+    """Regression test for FlavorInfo constructed by nova.list_flavors with ram/disk/extra_specs."""
+    from drover.models.openstack import FlavorInfo
+
+    server = MagicMock()
+    server.status = "ACTIVE"
+    server.flavor = {"id": "flv-1", "original_name": "gpu.rtx3090"}
+
+    sdk_flavor = MagicMock()
+    sdk_flavor.id = "flv-1"
+    sdk_flavor.name = "gpu.rtx3090"
+    sdk_flavor.vcpus = 8
+    sdk_flavor.ram = 16384
+    sdk_flavor.disk = 100
+    sdk_flavor.is_public = True
+    sdk_flavor.extra_specs = {"pci_passthrough:alias": "RTX-3090:2"}
+
+    mock_conn.compute.flavors.return_value = [sdk_flavor]
+    mock_conn.compute.servers.return_value = [server]
+
+    flavors = nova.list_flavors(mock_conn)
+    assert len(flavors) == 1
+    flavor_info = flavors[0]
+    assert isinstance(flavor_info, FlavorInfo)
+    assert flavor_info.ram == 16384
+    assert flavor_info.ram_mb == 16384
+    assert flavor_info.disk == 100
+    assert flavor_info.disk_gb == 100
+    assert flavor_info.extra_specs == {"pci_passthrough:alias": "RTX-3090:2"}
+
+    usage = await get_project_gpu_usage(mock_conn, "test-project-123")
+    assert usage == {"RTX3090": 2}
 
 @pytest.mark.asyncio
 async def test_check_gpu_quota_rejection_and_unlimited(mock_conn):

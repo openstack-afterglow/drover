@@ -36,15 +36,23 @@ async def provision_nodegroup_vms(
     """
     from drover.services import (
         cinder,
-        cloudinit as k3s_cloudinit,
+        inventory,
         keystone,
-        nodegroup as k3s_nodegroup,
         nova,
+    )
+    from drover.services import (
+        cloudinit as k3s_cloudinit,
+    )
+    from drover.services import (
+        nodegroup as k3s_nodegroup,
+    )
+    from drover.services import (
         plugins as k3s_plugins,
-        store as k3s_db,
     )
     from drover.services import redis_store as k3s_cluster_svc
-
+    from drover.services import (
+        store as k3s_db,
+    )
     s = get_settings()
 
     # 클러스터 기본 정보 조회 (admin: project_id 필터 없음)
@@ -113,6 +121,7 @@ async def provision_nodegroup_vms(
     for _i in range(add_count):
         agent_name = f"{cluster_name}-{_rand_suffix()}"
         try:
+            vol_metadata = inventory.build_drover_metadata(cluster_id, None, "volume")
             vol = await asyncio.to_thread(
                 cinder.create_volume_from_image,
                 conn,
@@ -120,6 +129,10 @@ async def provision_nodegroup_vms(
                 image_id,
                 boot_volume_size,
                 volume_availability_zone,
+                metadata=vol_metadata,
+            )
+            await inventory.record_resource(
+                None, cluster_id=cluster_id, service="cinder", resource_type="volume", resource_id=vol.id, name=f"{agent_name}-boot"
             )
             userdata = k3s_cloudinit.generate_agent_userdata(
                 cluster_name=cluster_name,
@@ -131,6 +144,12 @@ async def provision_nodegroup_vms(
                 extra_agent_args=_agent_args,
                 os_type=os_type,
             )
+            agent_metadata = inventory.build_drover_metadata(cluster_id, None, "server")
+            agent_metadata.update({
+                "k3s_horse_generator_role": "k3s_agent",
+                "k3s_horse_generator_cluster_id": cluster_id,
+                "k3s_horse_generator_nodegroup_id": nodegroup_id,
+            })
             vm = await asyncio.to_thread(
                 nova.create_server,
                 conn,
@@ -139,14 +158,13 @@ async def provision_nodegroup_vms(
                 network_id,
                 vol.id,
                 userdata=userdata.data,
-                metadata={
-                    "k3s_horse_generator_role": "k3s_agent",
-                    "k3s_horse_generator_cluster_id": cluster_id,
-                    "k3s_horse_generator_nodegroup_id": nodegroup_id,
-                },
+                metadata=agent_metadata,
                 delete_boot_volume_on_termination=True,
                 security_groups=[sg_id] if sg_id else None,
                 config_drive=userdata.config_drive,
+            )
+            await inventory.record_resource(
+                None, cluster_id=cluster_id, service="nova", resource_type="server", resource_id=vm.id, name=agent_name
             )
             new_entries.append({"vm_id": vm.id, "name": agent_name})
             _logger.info("stampede: nodegroup %s — agent %s (%s) 생성됨", nodegroup_id, agent_name, vm.id)
@@ -170,7 +188,9 @@ async def delete_nodegroup_vms(
 
     vm_entries: [{"vm_id": ..., "name": ...}, ...]
     """
-    from drover.services import keystone, kube as k3s_kube, nodegroup as k3s_nodegroup, nova
+    from drover.services import keystone, nova
+    from drover.services import kube as k3s_kube
+    from drover.services import nodegroup as k3s_nodegroup
 
     # cordon + drain
     node_names = [e["name"] for e in vm_entries if e.get("name")]
@@ -223,14 +243,73 @@ async def delete_nodegroup_vms(
             pass
 
 
+async def reconcile_nodegroup_vms(
+    project_id: str,
+    cluster_id: str,
+    nodegroup_id: str,
+) -> list[dict]:
+    """Reconcile recorded nodegroup VM rows against OpenStack Nova server tags/metadata."""
+    from drover.services import keystone, nova
+    from drover.services import nodegroup as nodegroup_store
+
+    ng = await nodegroup_store.get_nodegroup(cluster_id, nodegroup_id)
+    if not ng:
+        return []
+
+    vms = ng.get("vms") or []
+    if not vms:
+        if ng.get("node_count", 0) != 0:
+            await nodegroup_store.set_nodegroup_count(cluster_id, nodegroup_id, 0)
+        return []
+
+    verified_vms: list[dict] = []
+    conn = None
+    try:
+        conn = keystone.get_admin_connection_for_project(project_id)
+    except Exception as exc:
+        _logger.debug("reconcile_nodegroup_vms: OpenStack connection unavailable: %s", exc)
+
+    cluster_tag = f"drover.cluster_id={cluster_id}"
+    for vm_entry in vms:
+        vm_id = vm_entry.get("vm_id")
+        if not vm_id:
+            continue
+        if conn is not None:
+            try:
+                s = await asyncio.to_thread(nova.get_server, conn, vm_id)
+                if s:
+                    status = str(getattr(s, "status", None) or (s.get("status") if isinstance(s, dict) else "")).upper()
+                    meta = getattr(s, "metadata", None) or (s.get("metadata") if isinstance(s, dict) else {})
+                    tags = getattr(s, "tags", None) or (s.get("tags") if isinstance(s, dict) else [])
+                    has_tag = (
+                        (isinstance(meta, dict) and (meta.get("drover.cluster_id") == cluster_id or meta.get("k3s_horse_generator_nodegroup_id") == nodegroup_id))
+                        or (isinstance(tags, (list, tuple, set)) and cluster_tag in tags)
+                    )
+                    if status in ("ACTIVE", "BUILD") or (has_tag and status not in ("ERROR", "DELETED", "SOFT_DELETED")):
+                        verified_vms.append(vm_entry)
+            except Exception as e:
+                _logger.debug("reconcile_nodegroup_vms: VM %s check failed: %s", vm_id, e)
+        else:
+            if vm_entry.get("status") != "ERROR":
+                verified_vms.append(vm_entry)
+
+    actual_count = len(verified_vms)
+    if ng.get("node_count") != actual_count:
+        await nodegroup_store.set_nodegroup_count(cluster_id, nodegroup_id, actual_count)
+    return verified_vms
+
+
 async def provision_nodegroup_and_reconcile(
     project_id: str,
     cluster_id: str,
     nodegroup: dict,
     add_count: int,
+    *,
+    operation_id: str | None = None,
+    triggering_metric: str | dict | None = None,
 ) -> None:
     """Provision a nodegroup and reconcile its desired count to tracked VMs."""
-    from drover.services import nodegroup as nodegroup_store
+    from drover.services import operations
 
     created = await provision_nodegroup_vms(
         project_id=project_id,
@@ -242,10 +321,26 @@ async def provision_nodegroup_and_reconcile(
         labels=nodegroup.get("labels"),
         taints=nodegroup.get("taints"),
     )
+    verified = await reconcile_nodegroup_vms(project_id, cluster_id, nodegroup["id"])
+    result_vm_ids = [v["vm_id"] for v in created]
+
+    if operation_id:
+        await operations.append_operation_event(
+            None,
+            operation_id,
+            phase="nodegroup_reconciled",
+            message=f"Nodegroup {nodegroup['id']} provisioned ({len(created)} created, {len(verified)} active)",
+            payload_json={
+                "nodegroup_id": nodegroup["id"],
+                "requested_add_count": add_count,
+                "created_count": len(created),
+                "actual_count": len(verified),
+                "vm_ids": result_vm_ids,
+                "triggering_metric": triggering_metric or "manual",
+            },
+        )
+
     if len(created) != add_count:
-        latest = await nodegroup_store.get_nodegroup(cluster_id, nodegroup["id"])
-        actual = len((latest or {}).get("vms") or [])
-        await nodegroup_store.set_nodegroup_count(cluster_id, nodegroup["id"], actual)
         raise RuntimeError(
             f"nodegroup {nodegroup['id']} provisioned {len(created)}/{add_count} requested nodes"
         )
@@ -258,9 +353,12 @@ async def delete_nodegroup_and_reconcile(
     remove_entries: list[dict],
     *,
     delete_group: bool = False,
+    operation_id: str | None = None,
+    triggering_metric: str | dict | None = None,
 ) -> None:
     """Delete tracked VMs, reconcile the count, and optionally soft-delete the group."""
     from drover.services import nodegroup as nodegroup_store
+    from drover.services import operations
 
     await delete_nodegroup_vms(
         project_id=project_id,
@@ -268,19 +366,40 @@ async def delete_nodegroup_and_reconcile(
         nodegroup_id=nodegroup["id"],
         vm_entries=remove_entries,
     )
-    latest = await nodegroup_store.get_nodegroup(cluster_id, nodegroup["id"])
-    actual = len((latest or {}).get("vms") or [])
-    await nodegroup_store.set_nodegroup_count(cluster_id, nodegroup["id"], actual)
+    verified = await reconcile_nodegroup_vms(project_id, cluster_id, nodegroup["id"])
+    removed_vm_ids = [v["vm_id"] for v in remove_entries if v.get("vm_id")]
+
+    if operation_id:
+        await operations.append_operation_event(
+            None,
+            operation_id,
+            phase="nodegroup_reconciled",
+            message=f"Nodegroup {nodegroup['id']} scale-down reconciled ({len(verified)} active)",
+            payload_json={
+                "nodegroup_id": nodegroup["id"],
+                "removed_count": len(remove_entries),
+                "actual_count": len(verified),
+                "vm_ids": removed_vm_ids,
+                "triggering_metric": triggering_metric or "manual",
+            },
+        )
+
     if delete_group:
         deleted = await nodegroup_store.delete_nodegroup(cluster_id, nodegroup["id"])
         if not deleted:
             raise RuntimeError(f"nodegroup {nodegroup['id']} disappeared before deletion")
 
 
-async def scale_agents(project_id: str, cluster_id: str, desired_count: int) -> None:
+async def scale_agents(
+    project_id: str,
+    cluster_id: str,
+    desired_count: int,
+    operation_id: str | None = None,
+    triggering_metric: str | dict | None = None,
+) -> None:
     """Durably reconcile the legacy cluster agent count through the default nodegroup."""
     from drover.services import nodegroup as nodegroup_store
-    from drover.services import store
+    from drover.services import operations, store
 
     cluster = await store.get_cluster(project_id, cluster_id)
     if not cluster:
@@ -295,6 +414,12 @@ async def scale_agents(project_id: str, cluster_id: str, desired_count: int) -> 
     if not nodegroup:
         raise RuntimeError(f"default agent nodegroup {default_nodegroup_id} not found")
 
+    min_size = int(nodegroup.get("min_size", 0) if nodegroup.get("min_size") is not None else 0)
+    max_size = int(nodegroup.get("max_size", 5) if nodegroup.get("max_size") is not None else 5)
+    if desired_count < min_size or desired_count > max_size:
+        raise ValueError(f"desired count {desired_count} is outside nodegroup bounds [{min_size}, {max_size}]")
+
+    result_vm_ids: list[str] = []
     if desired_count > current_count:
         add_count = desired_count - current_count
         created = await provision_nodegroup_vms(
@@ -307,15 +432,18 @@ async def scale_agents(project_id: str, cluster_id: str, desired_count: int) -> 
             labels=nodegroup.get("labels"),
             taints=nodegroup.get("taints"),
         )
+        result_vm_ids = [v["vm_id"] for v in created]
         if created:
             await store.add_agent_vms(cluster_id, created)
-        actual_count = current_count + len(created)
-        await nodegroup_store.set_nodegroup_count(cluster_id, default_nodegroup_id, actual_count)
+        await reconcile_nodegroup_vms(project_id, cluster_id, default_nodegroup_id)
+        latest = await nodegroup_store.get_nodegroup(cluster_id, default_nodegroup_id)
+        actual_count = len((latest or {}).get("vms") or [])
         await store.update_agent_count(project_id, cluster_id, actual_count)
         if len(created) != add_count:
             raise RuntimeError(f"cluster {cluster_id} created {len(created)}/{add_count} requested agents")
     elif desired_count < current_count:
         remove_ids = current_agent_ids[desired_count:]
+        result_vm_ids = list(remove_ids)
         name_map = await store.get_agent_vm_names(cluster_id, remove_ids)
         remove_entries = [{"vm_id": vm_id, "name": name_map.get(vm_id)} for vm_id in remove_ids]
         await delete_nodegroup_vms(
@@ -325,7 +453,22 @@ async def scale_agents(project_id: str, cluster_id: str, desired_count: int) -> 
             vm_entries=remove_entries,
         )
         await store.remove_agent_vms(cluster_id, remove_ids)
-        await nodegroup_store.set_nodegroup_count(cluster_id, default_nodegroup_id, desired_count)
-        await store.update_agent_count(project_id, cluster_id, desired_count)
+        await reconcile_nodegroup_vms(project_id, cluster_id, default_nodegroup_id)
+        latest = await nodegroup_store.get_nodegroup(cluster_id, default_nodegroup_id)
+        actual_count = len((latest or {}).get("vms") or [])
+        await store.update_agent_count(project_id, cluster_id, actual_count)
+
+    if operation_id:
+        await operations.append_operation_event(
+            None,
+            operation_id,
+            phase="scale_reconciled",
+            message=f"Cluster {cluster_id} scaled to {desired_count} agents",
+            payload_json={
+                "desired_count": desired_count,
+                "vm_ids": result_vm_ids,
+                "triggering_metric": triggering_metric or "manual",
+            },
+        )
 
     await store.update_cluster_status(project_id, cluster_id, "ACTIVE", "")

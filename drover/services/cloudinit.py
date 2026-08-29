@@ -5,9 +5,10 @@ import gzip
 import json
 import shlex
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
 from drover.utils.ssh_keys import validate_ssh_public_key
 
 TEMPLATE_DIR = Path(__file__).parent.parent / "templates"
@@ -43,6 +44,19 @@ def _validate_pin_input(name: str, value: str) -> str:
         raise ValueError(f"{name}이 비어 있거나 제어 문자를 포함합니다")
     return value
 
+
+def verify_no_service_password(text: str, settings: Any = None) -> None:
+    """Ensure rendered cloud-init or manifest content does not contain service password."""
+    from drover.config import get_settings
+    if settings is None:
+        try:
+            settings = get_settings()
+        except Exception:
+            settings = None
+    if settings and getattr(settings, "os_password", None) and settings.os_password.strip():
+        pwd = settings.os_password.strip()
+        if pwd in text:
+            raise ValueError("Rendered output contains service os_password")
 
 def _build_k3s_network_pin_script(
     *,
@@ -590,6 +604,7 @@ def generate_server_userdata(
         )
         # Ignition JSON 유효성 간단 확인
         json.loads(ign_str)
+        verify_no_service_password(ign_str)
         # Nova API는 user_data를 base64 디코딩 후 config drive에 기록.
         # raw JSON을 그대로 보내면 base64 디코딩 시 바이너리 garbage가 되므로
         # 반드시 base64 인코딩하여 전달해야 한다.
@@ -616,6 +631,7 @@ def generate_server_userdata(
         ha_node_token=ha_node_token or "",
     )
     yaml_str = _jinja.get_template("k3s_server.yaml.j2").render(**template_vars)
+    verify_no_service_password(yaml_str)
     encoded = base64.b64encode(gzip.compress(yaml_str.encode())).decode()
     return UserdataResult(data=encoded, config_drive=False)
 
@@ -659,6 +675,7 @@ def generate_agent_userdata(
             extra_agent_args=agent_args,
         )
         json.loads(ign_str)
+        verify_no_service_password(ign_str)
         encoded = base64.b64encode(ign_str.encode()).decode()
         return UserdataResult(data=encoded, config_drive=True)
 
@@ -673,4 +690,5 @@ def generate_agent_userdata(
         extra_agent_args=agent_args,
     )
     yaml_str = _jinja.get_template("k3s_agent.yaml.j2").render(**template_vars)
+    verify_no_service_password(yaml_str)
     return UserdataResult(data=base64.b64encode(gzip.compress(yaml_str.encode())).decode(), config_drive=False)

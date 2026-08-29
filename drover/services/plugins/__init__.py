@@ -62,7 +62,12 @@ def needs_external_cloud_provider(settings: Settings) -> bool:
     return any(p.needs_external_cloud_provider(settings) for p in get_active_plugins(settings))
 
 
-def aggregate_cloud_conf(project_id: str, settings: Settings, internal_network_name: str = "") -> str | None:
+def aggregate_cloud_conf(
+    project_id: str,
+    settings: Settings,
+    internal_network_name: str = "",
+    app_credential: dict | None = None,
+) -> str | None:
     """활성 플러그인의 cloud.conf를 합산 반환.
 
     cloud.conf가 필요한 플러그인이 없으면 None 반환.
@@ -73,7 +78,9 @@ def aggregate_cloud_conf(project_id: str, settings: Settings, internal_network_n
     sections: list[str] = []
     for plugin in active:
         if isinstance(plugin, OccmPlugin):
-            section = plugin.cloud_conf_sections(project_id, settings, internal_network_name=internal_network_name)
+            section = plugin.cloud_conf_sections(
+                project_id, settings, internal_network_name=internal_network_name, app_credential=app_credential
+            )
         else:
             section = plugin.cloud_conf_sections(project_id, settings)
         if section:
