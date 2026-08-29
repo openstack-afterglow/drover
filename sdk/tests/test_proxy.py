@@ -565,10 +565,10 @@ def test_gpu_quota_identifiers_are_escaped_in_paths():
     )
 
 
-def test_service_description_discovers_container_infra_through_drover_alias():
+def test_service_description_uses_live_drover_catalog_type():
     description = DroverService()
-    assert description.service_type == "container-infra"
-    assert description.aliases == ["drover"]
+    assert description.service_type == "drover"
+    assert description.aliases == ["container-infra"]
     assert description.supported_versions == {"1": Proxy}
 
 
@@ -578,6 +578,7 @@ def test_register_enables_catalog_service_before_attaching_drover_alias(monkeypa
     class Config:
         def __init__(self):
             self.enabled = set()
+
         def enable_service(self, service_type):
             self.enabled.add(service_type)
 
@@ -601,9 +602,8 @@ def test_register_enables_catalog_service_before_attaching_drover_alias(monkeypa
     catalog_proxy = register(catalog_connection)
 
     assert isinstance(catalog_proxy, Proxy)
-    assert catalog_connection.config.has_service("container-infra")
+    assert catalog_connection.config.has_service("drover")
     assert catalog_proxy.endpoint_override is None
-
 
 
 def test_register_configures_emergency_override_before_proxy_resolution(monkeypatch):
@@ -621,10 +621,12 @@ def test_register_configures_emergency_override_before_proxy_resolution(monkeypa
     class Connection:
         def __init__(self):
             self.config = Config()
-            self.drover = Proxy(session=MagicMock(), service_type="container-infra")
+            self.drover = Proxy(session=MagicMock(), service_type="drover")
 
         def add_service(self, service):
-            assert self.config.values[("endpoint_override", service.service_type)] == "https://drover.example/v1"
+            assert service.service_type in self.config.enabled
+            assert self.config.values[("endpoint_override", service.service_type)] == "https://drover.example"
+            assert self.config.values[("api_version", service.service_type)] == "1"
 
     monkeypatch.setenv("SERVICE_DROVER_INTERNAL_URL", "https://drover.example")
     register(Connection())
@@ -633,12 +635,95 @@ def test_register_configures_emergency_override_before_proxy_resolution(monkeypa
 def test_proxy_uses_catalog_relative_paths(monkeypatch):
     request = MagicMock(return_value=_response(200, payload=[]))
     monkeypatch.setattr("openstack.proxy.Proxy.request", request)
-    catalog_proxy = Proxy(session=MagicMock(), service_type="container-infra")
+    catalog_proxy = Proxy(session=MagicMock(), service_type="drover")
+    catalog_proxy.endpoint_override = "http://drover-api:8011/v1"
 
     catalog_proxy.clusters()
 
     request.assert_called_once_with("/clusters", "GET", raise_exc=True)
 
+
+@pytest.mark.parametrize(
+    ("endpoint", "url", "expected"),
+    [
+        # Unversioned endpoint retains request version
+        ("http://drover-api:8011", "/v1/clusters", "/v1/clusters"),
+        ("http://drover-api:8011/", "/v1/clusters", "/v1/clusters"),
+        ("http://drover-api:8011", "/v1", "/v1"),
+        ("http://drover-api:8011", "/v1?detail=true", "/v1?detail=true"),
+        ("http://drover-api:8011", "/v1#versions", "/v1#versions"),
+        # /v1 endpoint strips leading numeric version segment
+        ("http://drover-api:8011/v1", "/v1/clusters", "/clusters"),
+        ("http://drover-api:8011/v1", "/v1", "/"),
+        ("http://drover-api:8011/v1", "/v1/", "/"),
+        ("http://drover-api:8011/v1", "/v1?detail=true", "/?detail=true"),
+        ("http://drover-api:8011/v1", "/v1#versions", "/#versions"),
+        # Trailing slash in endpoint
+        ("http://drover-api:8011/v1/", "/v1/clusters", "/clusters"),
+        ("http://drover-api:8011/v1/", "/v1", "/"),
+        # /v2 endpoint strips leading numeric version segment
+        ("http://drover-api:8011/v2", "/v1/clusters", "/clusters"),
+        ("http://drover-api:8011/v2", "/v2/clusters", "/clusters"),
+        # /v2.1 endpoint strips leading numeric version segment
+        ("http://drover-api:8011/v2.1", "/v1/clusters", "/clusters"),
+        ("http://drover-api:8011/v2.1", "/v2.1/clusters", "/clusters"),
+        # /api/v2.1/project endpoint strips leading numeric version segment
+        ("http://drover-api:8011/api/v2.1/project", "/v1/clusters", "/clusters"),
+        ("http://drover-api:8011/api/v2.1/project", "/v1", "/"),
+        # /v1beta endpoint is unversioned (does not match exact numeric version segment)
+        ("http://drover-api:8011/v1beta", "/v1/clusters", "/v1/clusters"),
+        # /v10 endpoint matches exact numeric version segment
+        ("http://drover-api:8011/v10", "/v1/clusters", "/clusters"),
+        ("http://drover-api:8011/v10", "/v10/clusters", "/clusters"),
+        # Absolute request URL bypasses version transformation
+        ("http://drover-api:8011/v1", "https://drover.example/v1/clusters", "https://drover.example/v1/clusters"),
+        ("http://drover-api:8011", "https://drover.example/v1/clusters", "https://drover.example/v1/clusters"),
+        # Root / query / fragment request paths without leading version
+        ("http://drover-api:8011/v1", "/", "/"),
+        ("http://drover-api:8011/v1", "/clusters", "/clusters"),
+    ],
+)
+def test_request_version_contract(monkeypatch, endpoint, url, expected):
+    request = MagicMock(return_value=_response(200, payload={"ok": True}))
+    monkeypatch.setattr("openstack.proxy.Proxy.request", request)
+    catalog_proxy = Proxy(session=MagicMock(), service_type="drover")
+    catalog_proxy.endpoint_override = endpoint
+
+    catalog_proxy.request(url, "GET", "request failed", True)
+
+    request.assert_called_once_with(expected, "GET", "request failed", True)
+
+
+@pytest.mark.parametrize("malformed_endpoint", ["http://drover-api:8011/v1?query=1", "http://drover-api:8011/v1#fragment"])
+def test_request_rejects_malformed_endpoint_query_fragment(monkeypatch, malformed_endpoint):
+    catalog_proxy = Proxy(session=MagicMock(), service_type="drover")
+    catalog_proxy.endpoint_override = malformed_endpoint
+
+    with pytest.raises(ValueError, match="query or fragment"):
+        catalog_proxy.request("/v1/clusters", "GET")
+
+
+def test_request_preserves_positional_and_keyword_args(monkeypatch):
+    request = MagicMock(return_value=_response(200, payload={"ok": True}))
+    monkeypatch.setattr("openstack.proxy.Proxy.request", request)
+    catalog_proxy = Proxy(session=MagicMock(), service_type="drover")
+    catalog_proxy.endpoint_override = "http://drover-api:8011/v1"
+
+    catalog_proxy.request("/v1/clusters", "POST", "arg1", 123, key="val", json={"a": 1})
+
+    request.assert_called_once_with("/clusters", "POST", "arg1", 123, key="val", json={"a": 1})
+
+
+def test_request_inspects_effective_endpoint_from_get_endpoint(monkeypatch):
+    request = MagicMock(return_value=_response(200, payload={"ok": True}))
+    monkeypatch.setattr("openstack.proxy.Proxy.request", request)
+    catalog_proxy = Proxy(session=MagicMock(), service_type="drover")
+    catalog_proxy.endpoint_override = None
+    monkeypatch.setattr(catalog_proxy, "get_endpoint", lambda: "http://drover-api:8011/v1")
+
+    catalog_proxy.request("/v1/clusters", "GET")
+
+    request.assert_called_once_with("/clusters", "GET")
 def test_idempotency_key_header_forwarding():
     proxy = Proxy(session=MagicMock(), service_type="drover")
     response = SimpleNamespace(iter_lines=MagicMock(return_value=iter([])))

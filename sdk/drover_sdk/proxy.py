@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from openstack import proxy
+
+_VERSION_SEGMENT_RE = re.compile(r"^v[0-9]+(?:\.[0-9]+)*$")
 
 
 def _segment(value: object) -> str:
@@ -28,12 +31,40 @@ def _query(**kwargs: object) -> dict | None:
 class Proxy(proxy.Proxy):
     """Catalog-relative proxy for a Keystone endpoint registered at ``/v1``."""
 
-    def request(self, url, method, **kwargs):
-        if url == "/v1":
-            url = "/"
-        elif url.startswith("/v1/"):
-            url = url[3:]
-        return super().request(url, method, **kwargs)
+    def request(self, url, method, *args, **kwargs):
+        parsed_url = urlparse(url)
+        if parsed_url.scheme or parsed_url.netloc:
+            return super().request(url, method, *args, **kwargs)
+
+        endpoint = self.endpoint_override or self.get_endpoint()
+        has_version = False
+        if endpoint is not None:
+            if not isinstance(endpoint, str):
+                raise ValueError("Endpoint URL must be a string")
+            parsed_endpoint = urlparse(endpoint)
+            if parsed_endpoint.query or parsed_endpoint.fragment:
+                raise ValueError("Endpoint URL cannot contain a query or fragment")
+            has_version = any(
+                _VERSION_SEGMENT_RE.fullmatch(segment)
+                for segment in parsed_endpoint.path.split("/")
+                if segment
+            )
+
+        if has_version:
+            path_parts = parsed_url.path.split("/")
+            if (
+                parsed_url.path.startswith("/")
+                and len(path_parts) > 1
+                and _VERSION_SEGMENT_RE.fullmatch(path_parts[1])
+            ):
+                remaining = path_parts[2:]
+                url = "/" + "/".join(remaining) if remaining else "/"
+                if parsed_url.query:
+                    url += f"?{parsed_url.query}"
+                if parsed_url.fragment:
+                    url += f"#{parsed_url.fragment}"
+
+        return super().request(url, method, *args, **kwargs)
 
     def _json_request(self, method: str, path: str, *, body: dict | None = None, params: dict | None = None):
         kwargs: dict = {}

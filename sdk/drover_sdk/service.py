@@ -6,11 +6,11 @@ from drover_sdk.proxy import Proxy
 
 
 class DroverService(service_description.ServiceDescription):
-    """Expose catalog type ``container-infra`` as ``conn.drover``."""
+    """Expose catalog type ``drover`` as ``conn.drover``."""
 
     def __init__(self):
         super().__init__(
-            "container-infra",
+            "drover",
             supported_versions={"1": Proxy},
-            aliases=["drover"],
+            aliases=["container-infra"],
         )

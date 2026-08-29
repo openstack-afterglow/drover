@@ -8,19 +8,17 @@ __version__ = "0.1.0"
 
 
 def register(conn):
-    """Enable catalog discovery and return the ``conn.drover`` proxy.
+    """Enable Drover catalog discovery and return ``conn.drover``.
 
-    Drover is registered in Keystone as ``container-infra`` at its ``/v1``
-    base path, but exposed to callers through the stable ``drover`` alias.
-    ``SERVICE_DROVER_INTERNAL_URL`` remains an emergency endpoint override for
-    tests or catalog outages; it accepts either the service root or `/v1` base.
+    Drover is registered in Keystone under the ``drover`` service type. The
+    optional ``SERVICE_DROVER_INTERNAL_URL`` override may point either at the
+    service root or at a versioned API base.
     """
-    conn.config.enable_service("container-infra")
+    service_type = "drover"
+    conn.config.enable_service(service_type)
     if endpoint_override := os.environ.get("SERVICE_DROVER_INTERNAL_URL", "").strip().rstrip("/"):
-        if not endpoint_override.endswith("/v1"):
-            endpoint_override = f"{endpoint_override}/v1"
-        conn.config.set_service_value("endpoint_override", "container-infra", endpoint_override)
-        conn.config.set_service_value("api_version", "container-infra", "1")
+        conn.config.set_service_value("endpoint_override", service_type, endpoint_override)
+        conn.config.set_service_value("api_version", service_type, "1")
     conn.add_service(DroverService())
     return conn.drover
 

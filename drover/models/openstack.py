@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class VolumeInfo(BaseModel):
@@ -20,9 +20,28 @@ class FlavorInfo(BaseModel):
     id: str
     name: str
     vcpus: int
-    ram_mb: int
-    disk_gb: int
+    ram: int = 0
+    disk: int = 0
+    ram_mb: int = 0
+    disk_gb: int = 0
     is_public: bool = True
+    extra_specs: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_ram_disk(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        values = dict(data)
+        if "ram" in values and "ram_mb" not in values:
+            values["ram_mb"] = values["ram"]
+        elif "ram_mb" in values and "ram" not in values:
+            values["ram"] = values["ram_mb"]
+        if "disk" in values and "disk_gb" not in values:
+            values["disk_gb"] = values["disk"]
+        elif "disk_gb" in values and "disk" not in values:
+            values["disk"] = values["disk_gb"]
+        return values
 
 
 class IpAddress(BaseModel):
