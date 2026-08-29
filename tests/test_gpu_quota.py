@@ -33,6 +33,11 @@ def test_audio_exclusion():
     parsed = _parse_alias_counts({"pci_passthrough:alias": "RTX3090:1,RTX3090Audio:1"})
     assert parsed == {"RTX3090": 1}
 
+    parsed = _parse_alias_counts(
+        {"pci_passthrough:alias": "RTX3090,sriov_nic:1,A100:0"}
+    )
+    assert parsed == {"RTX3090": 1, "A100": 1}
+
     with pytest.raises(ValueError, match="오디오"):
         validate_quota_params("RTX3090Audio", 1)
 
