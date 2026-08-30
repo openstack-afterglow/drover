@@ -32,6 +32,7 @@ or /v1/operations/{op_id}/events until terminal status (SUCCEEDED / FAILED / CAN
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from typing import Any
@@ -64,6 +65,39 @@ def _poll_operation_until_terminal(
     )
 
 
+def _poll_cluster_agent_count(
+    conn: Any,
+    cluster_id: str,
+    expected_agent_count: int,
+    timeout: int = 300,
+    poll_interval: int = 5,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last_cluster = None
+    while time.monotonic() < deadline:
+        cluster = conn.drover.get_cluster(cluster_id)
+        if cluster:
+            last_cluster = cluster
+            agent_ids = cluster.get("agent_vm_ids") or []
+            if isinstance(agent_ids, str):
+                try:
+                    agent_ids = json.loads(agent_ids)
+                except ValueError:
+                    agent_ids = []
+            status = cluster.get("status")
+            if status == "ACTIVE" and len(agent_ids) == expected_agent_count:
+                cluster["agent_vm_ids"] = agent_ids
+                return cluster
+            if status in {"ERROR", "FAILED", "DELETED"}:
+                raise RuntimeError(f"Cluster {cluster_id} reached terminal status {status}")
+        time.sleep(poll_interval)
+
+    raise TimeoutError(
+        f"Cluster {cluster_id} did not reach ACTIVE with {expected_agent_count} agents "
+        f"within {timeout} seconds. Last state: {last_cluster}"
+    )
+
+
 @pytest.mark.integration
 def test_one_master_cluster_lifecycle(
     openstack_conn: Any,
@@ -90,14 +124,8 @@ def test_one_master_cluster_lifecycle(
         "master_count": 1,
         "agent_count": 1,
         "network_id": staging_env["network_id"],
-        "image_id": staging_env["image_id"],
-        "flavor_id": staging_env["flavor_id"],
         "idempotency_key": idempotency_key,
     }
-    if staging_env.get("subnet_id"):
-        create_payload["subnet_id"] = staging_env["subnet_id"]
-    if staging_env.get("external_net_id"):
-        create_payload["external_network_id"] = staging_env["external_net_id"]
 
     # Issue stream mutation request (yields SSE lines and captures operation_id)
     stream = conn.drover.create_cluster(**create_payload)
@@ -150,27 +178,13 @@ def test_one_master_cluster_lifecycle(
     # Verify ownership metadata/tags on recorded resources
     for res in managed_resources:
         assert res.get("cluster_id") == cluster_id
-        meta = res.get("metadata_json") or {}
+        meta = res.get("metadata") or {}
         if isinstance(meta, dict) and meta:
             assert meta.get("drover.managed") == "true" or meta.get("managed") == "true"
 
-    # Step 4: Scale nodegroup within bounds (agent count 1 -> 2)
-    scale_stream = conn.drover.scale_cluster(cluster_id, agent_count=2)
-    scale_op_id = None
-    for line in scale_stream:
-        if isinstance(line, str) and "operation_id" in line:
-            import json
-            try:
-                raw_data = line.replace("data:", "").strip()
-                parsed = json.loads(raw_data)
-                if isinstance(parsed, dict):
-                    scale_op_id = parsed.get("operation_id") or scale_op_id
-            except Exception:
-                pass
-
-    if scale_op_id:
-        scale_final_op = _poll_operation_until_terminal(conn, scale_op_id, timeout=300)
-        assert scale_final_op["status"] == "SUCCEEDED", f"Scale operation failed: {scale_final_op.get('error')}"
+    scale_result = conn.drover.scale_cluster(cluster_id, agent_count=2)
+    assert scale_result.get("agent_count") == 2
+    _poll_cluster_agent_count(conn, cluster_id, expected_agent_count=2)
 
     # Step 5: Delete cluster via native API
     del_stream = conn.drover.delete_cluster_async(cluster_id)
@@ -214,20 +228,13 @@ def test_three_master_ha_cluster_lifecycle(
     idempotency_key = f"int-test-3m-{uuid.uuid4().hex[:8]}"
     cluster_name = f"int-3m-{uuid.uuid4().hex[:6]}"
 
-    # Step 1: Submit 3-master HA cluster creation request
     create_payload = {
         "name": cluster_name,
         "master_count": 3,
         "agent_count": 1,
         "network_id": staging_env["network_id"],
-        "image_id": staging_env["image_id"],
-        "flavor_id": staging_env["flavor_id"],
         "idempotency_key": idempotency_key,
     }
-    if staging_env.get("subnet_id"):
-        create_payload["subnet_id"] = staging_env["subnet_id"]
-    if staging_env.get("external_net_id"):
-        create_payload["external_network_id"] = staging_env["external_net_id"]
 
     stream = conn.drover.create_cluster(**create_payload)
     operation_id = None
@@ -258,16 +265,22 @@ def test_three_master_ha_cluster_lifecycle(
     final_op = _poll_operation_until_terminal(conn, operation_id, timeout=900)
     assert final_op["status"] == "SUCCEEDED", f"3-master cluster creation failed: {final_op.get('error')}"
 
-    # Step 3: Verify HA inventory
+    # Step 3: Verify HA inventory across Nova, Cinder, Neutron, and Octavia.
     managed_resources = conn.drover.admin_managed_resources(cluster_id=cluster_id, include_deleted=False)
     assert len(managed_resources) > 0, "No managed resources recorded for 3-master cluster"
 
-    nova_servers = [
-        r for r in managed_resources
-        if r.get("resource_type") in ("nova_server", "server")
+    resource_types = [
+        resource.get("resource_type")
+        for resource in managed_resources
+        if isinstance(resource, dict)
     ]
-    # Expect 3 masters + 1 agent = 4 servers
-    assert len(nova_servers) >= 3, f"Expected at least 3 master Nova servers, found {len(nova_servers)}"
+    assert resource_types.count("server") >= 4, f"Expected 4 Nova servers, found: {resource_types}"
+    assert resource_types.count("volume") >= 4, f"Expected 4 Cinder boot volumes, found: {resource_types}"
+    assert "security_group" in resource_types, f"Neutron security group missing: {resource_types}"
+    assert "load_balancer" in resource_types, f"Octavia load balancer missing: {resource_types}"
+    assert "listener" in resource_types, f"Octavia listener missing: {resource_types}"
+    assert "pool" in resource_types, f"Octavia pool missing: {resource_types}"
+    assert resource_types.count("member") >= 3, f"Expected at least 3 Octavia members, found: {resource_types}"
 
     # Step 4: Delete HA cluster
     del_stream = conn.drover.delete_cluster_async(cluster_id)
