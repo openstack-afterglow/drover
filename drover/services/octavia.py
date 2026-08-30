@@ -235,7 +235,9 @@ def create_listener(
         kwargs["name"] = name
     if default_pool_id:
         kwargs["default_pool_id"] = default_pool_id
-    return _listener_to_dict(conn.load_balancer.create_listener(**kwargs))
+    listener = conn.load_balancer.create_listener(**kwargs)
+    wait_for_load_balancer(conn, lb_id)
+    return _listener_to_dict(listener)
 
 
 def delete_listener(conn: openstack.connection.Connection, listener_id: str) -> None:
@@ -271,7 +273,9 @@ def create_pool(
         kwargs["name"] = name
     if listener_id:
         kwargs["listener_id"] = listener_id
-    return _pool_to_dict(conn.load_balancer.create_pool(**kwargs))
+    pool = conn.load_balancer.create_pool(**kwargs)
+    wait_for_load_balancer(conn, lb_id)
+    return _pool_to_dict(pool)
 
 
 def delete_pool(conn: openstack.connection.Connection, pool_id: str) -> None:

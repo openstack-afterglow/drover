@@ -64,6 +64,10 @@ def test_declared_runtime_settings_defaults(monkeypatch):
     assert settings.os_service_project_id == ""
     assert settings.os_project_name == ""
     assert settings.admin_legacy_project_policy is False
+    assert settings.sentinel_enabled is False
+    assert settings.sentinel_master_name == ""
+    assert settings.sentinel_hosts == ""
+    assert settings.cache_ttl_fast == 15
 
 def test_declared_runtime_settings_toml_mapping(monkeypatch):
     monkeypatch.setattr(
@@ -74,6 +78,12 @@ def test_declared_runtime_settings_toml_mapping(monkeypatch):
                 "service_project_id": "service-proj-999",
                 "project_name": "drover-service",
                 "admin_legacy_project_policy": True,
+            },
+            "cache": {
+                "sentinel_enabled": True,
+                "sentinel_master_name": "valkey",
+                "sentinel_hosts": ["cache-1:26379", "cache-2:26379"],
+                "ttl_fast": 20,
             },
             "drover": {
                 "k3s_health_interval": 300,
@@ -88,9 +98,33 @@ def test_declared_runtime_settings_toml_mapping(monkeypatch):
     assert values["os_service_project_id"] == "service-proj-999"
     assert values["os_project_name"] == "drover-service"
     assert values["admin_legacy_project_policy"] is True
+    assert values["sentinel_enabled"] is True
+    assert values["sentinel_master_name"] == "valkey"
+    assert values["sentinel_hosts"] == "cache-1:26379,cache-2:26379"
+    assert values["cache_ttl_fast"] == 20
     assert values["k3s_health_interval"] == 300
     assert values["drover_reconcile_interval"] == 600
     assert values["drover_reconcile_concurrency_per_project"] == 4
+
+
+def test_sentinel_hosts_toml_string_is_preserved(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "load_raw_toml",
+        lambda: {"cache": {"sentinel_hosts": "cache-1:26379,cache-2:26379"}},
+    )
+
+    values = config._load_toml()
+
+    assert values["sentinel_hosts"] == "cache-1:26379,cache-2:26379"
+
+
+def test_sentinel_hosts_toml_null_becomes_empty(monkeypatch):
+    monkeypatch.setattr(config, "load_raw_toml", lambda: {"cache": {"sentinel_hosts": None}})
+
+    values = config._load_toml()
+
+    assert values["sentinel_hosts"] == ""
 
 
 
@@ -104,6 +138,9 @@ def test_declared_runtime_settings_env_override(monkeypatch):
     monkeypatch.setenv("OS_SERVICE_PROJECT_ID", "env-service-proj-123")
 
     monkeypatch.setenv("ADMIN_LEGACY_PROJECT_POLICY", "true")
+    monkeypatch.setenv("SENTINEL_ENABLED", "true")
+    monkeypatch.setenv("SENTINEL_MASTER_NAME", "valkey")
+    monkeypatch.setenv("SENTINEL_HOSTS", "cache-1:26379,cache-2:26379")
 
 
 
@@ -116,6 +153,9 @@ def test_declared_runtime_settings_env_override(monkeypatch):
     assert settings.drover_reconcile_concurrency_per_project == 5
     assert settings.os_service_project_id == "env-service-proj-123"
     assert settings.admin_legacy_project_policy is True
+    assert settings.sentinel_enabled is True
+    assert settings.sentinel_master_name == "valkey"
+    assert settings.sentinel_hosts == "cache-1:26379,cache-2:26379"
 
 
 

@@ -77,6 +77,9 @@ def _load_toml() -> dict:
     database = data.get("database", {})
     cache = data.get("cache", {})
     drover = data.get("drover", {})
+    sentinel_hosts = cache.get("sentinel_hosts") or ""
+    if isinstance(sentinel_hosts, list):
+        sentinel_hosts = ",".join(str(host) for host in sentinel_hosts)
     return {
         "os_auth_url": keystone.get("auth_url", ""),
         "os_username": keystone.get("username", ""),
@@ -101,6 +104,9 @@ def _load_toml() -> dict:
         "database_pool_timeout": database.get("pool_timeout", 10),
         "redis_url": cache.get("redis_url", "redis://localhost:6379/7"),
         "redis_password_file": cache.get("password_file", cache.get("redis_password_file", "")),
+        "sentinel_enabled": cache.get("sentinel_enabled", False),
+        "sentinel_master_name": cache.get("sentinel_master_name", ""),
+        "sentinel_hosts": str(sentinel_hosts),
         "cache_ttl_fast": cache.get("ttl_fast", 15),
         "cache_ttl_normal": cache.get("ttl_normal", 30),
         "cache_ttl_slow": cache.get("ttl_slow", 60),
@@ -179,6 +185,10 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/7"
     redis_password_file: str = ""
+    sentinel_enabled: bool = False
+    sentinel_master_name: str = ""
+    sentinel_hosts: str = ""
+    cache_ttl_fast: int = 15
     cache_ttl_normal: int = 30
     cache_ttl_slow: int = 60
     cache_ttl_static: int = 300
