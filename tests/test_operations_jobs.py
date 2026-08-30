@@ -323,6 +323,158 @@ async def test_waiting_callback_to_running_transition(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_create_operation_completes_only_after_cluster_is_active(monkeypatch):
+    op = DroverOperation(
+        id="op-create",
+        project_id="proj-1",
+        cluster_id="cluster-create",
+        kind="create",
+        status="RUNNING",
+        started_at=datetime.now(UTC),
+        created_at=datetime.now(UTC),
+    )
+    initial_job = DroverJob(
+        id="job-create-initial",
+        cluster_id="cluster-create",
+        project_id="proj-1",
+        kind="create",
+        status="running",
+        attempts=1,
+        payload_json={},
+        operation_id=op.id,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    cluster = K3sCluster(
+        id="cluster-create",
+        project_id="proj-1",
+        name="test-cluster",
+        status="CREATING",
+    )
+    session = _TestSession(
+        store={
+            (DroverOperation, op.id): op,
+            (DroverJob, initial_job.id): initial_job,
+            (K3sCluster, cluster.id): cluster,
+        }
+    )
+    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+
+    assert await jobs._complete(initial_job.id, attempt=1) is True
+    assert op.status == "RUNNING"
+    assert op.finished_at is None
+
+    follow_up_job = DroverJob(
+        id="job-create-agents",
+        cluster_id=cluster.id,
+        project_id=cluster.project_id,
+        kind="provision_agents",
+        status="running",
+        attempts=1,
+        payload_json={},
+        operation_id=op.id,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    session.store[(DroverJob, follow_up_job.id)] = follow_up_job
+    cluster.status = "ACTIVE"
+
+    assert await jobs._complete(follow_up_job.id, attempt=1) is True
+    assert op.status == "SUCCEEDED"
+    assert op.finished_at is not None
+
+
+
+@pytest.mark.parametrize("terminal_status", ["FAILED", "CANCELLED"])
+@pytest.mark.asyncio
+async def test_terminal_create_operation_is_not_reopened_by_late_job(monkeypatch, terminal_status):
+    op = DroverOperation(
+        id=f"op-{terminal_status.lower()}",
+        project_id="proj-1",
+        cluster_id="cluster-terminal",
+        kind="create",
+        status=terminal_status,
+        finished_at=datetime.now(UTC),
+        created_at=datetime.now(UTC),
+    )
+    original_finished_at = op.finished_at
+    job = DroverJob(
+        id=f"job-{terminal_status.lower()}",
+        cluster_id=op.cluster_id,
+        project_id=op.project_id,
+        kind="bootstrap_ha",
+        status="running",
+        attempts=1,
+        payload_json={},
+        operation_id=op.id,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    cluster = K3sCluster(
+        id=op.cluster_id,
+        project_id=op.project_id,
+        name="terminal-cluster",
+        status="ERROR",
+    )
+    session = _TestSession(
+        store={
+            (DroverOperation, op.id): op,
+            (DroverJob, job.id): job,
+            (K3sCluster, cluster.id): cluster,
+        }
+    )
+    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+
+    assert await jobs._complete(job.id, attempt=1) is True
+    assert op.status == terminal_status
+    assert op.finished_at == original_finished_at
+    assert session.events[-1].phase == "job_completed"
+    assert "after operation terminalized" in session.events[-1].message
+
+
+@pytest.mark.asyncio
+async def test_ha_bootstrap_completion_keeps_create_operation_nonterminal(monkeypatch):
+    op = DroverOperation(
+        id="op-ha",
+        project_id="proj-1",
+        cluster_id="cluster-ha",
+        kind="create",
+        status="RUNNING",
+        created_at=datetime.now(UTC),
+    )
+    job = DroverJob(
+        id="job-ha",
+        cluster_id=op.cluster_id,
+        project_id=op.project_id,
+        kind="bootstrap_ha",
+        status="running",
+        attempts=1,
+        payload_json={},
+        operation_id=op.id,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    cluster = K3sCluster(
+        id=op.cluster_id,
+        project_id=op.project_id,
+        name="ha-cluster",
+        status="PROVISIONING",
+    )
+    session = _TestSession(
+        store={
+            (DroverOperation, op.id): op,
+            (DroverJob, job.id): job,
+            (K3sCluster, cluster.id): cluster,
+        }
+    )
+    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+
+    assert await jobs._complete(job.id, attempt=1) is True
+    assert op.status == "RUNNING"
+    assert op.finished_at is None
+    assert session.events[-1].phase == "server_boot_ready"
+
+@pytest.mark.asyncio
 async def test_lease_recovery_appends_event(monkeypatch):
     """Re-claiming a stale running job logs lease_recovered event on linked operation."""
     op = DroverOperation(
