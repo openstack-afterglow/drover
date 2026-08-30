@@ -21,6 +21,35 @@ _VALID_TOKEN_INFO = {
 }
 
 
+def test_ha_security_group_allows_embedded_etcd_between_masters():
+    from drover.services import provisioner
+
+    rules = provisioner._cluster_security_group_rules(["203.0.113.0/24"], "sg-1")
+
+    assert {
+        "direction": "ingress",
+        "protocol": "tcp",
+        "port_range_min": 2379,
+        "port_range_max": 2380,
+        "remote_group_id": "sg-1",
+    } in rules
+
+    assert len(rules) == 9
+    assert {
+        (rule["protocol"], rule["port_range_min"], rule["port_range_max"])
+        for rule in rules
+    } == {
+        ("tcp", 22, 22),
+        ("tcp", 80, 80),
+        ("tcp", 443, 443),
+        ("tcp", 2379, 2380),
+        ("tcp", 6443, 6443),
+        ("tcp", 10250, 10250),
+        ("tcp", 30000, 32767),
+        ("udp", 8472, 8472),
+        ("udp", 51820, 51820),
+    }
+
 def _auth_headers():
     return {"Authorization": "Bearer test-token"}
 
