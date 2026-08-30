@@ -110,7 +110,8 @@ def mock_durable_services(store, monkeypatch):
     monkeypatch.setattr("drover.services.store.create_cluster_record", mock_create_cluster_record)
 
     # Operations mocks
-    async def mock_get_op_by_idemp(project_id, idemp_key):
+    async def mock_get_op_by_idemp(session_or_factory, project_id, idemp_key):
+        assert session_or_factory is None
         op_id = store.idemp_index.get((project_id, idemp_key))
         if op_id:
             return store.operations.get(op_id)
