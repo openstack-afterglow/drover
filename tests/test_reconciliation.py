@@ -67,6 +67,32 @@ class ReconciliationTestStore:
         return cl
 
 
+def test_fetch_octavia_member_passes_pool_positionally():
+    connection = MagicMock()
+    member = object()
+    connection.load_balancer.find_member.return_value = member
+
+    result = reconciliation._fetch_octavia_member(
+        connection,
+        "member-1",
+        metadata={"pool_id": "pool-1"},
+    )
+
+    assert result is member
+    connection.load_balancer.find_member.assert_called_once_with(
+        "member-1",
+        "pool-1",
+        ignore_missing=True,
+    )
+
+def test_fetch_octavia_member_without_pool_metadata_skips_lookup():
+    connection = MagicMock()
+
+    assert reconciliation._fetch_octavia_member(connection, "member-1", metadata=None) is None
+    connection.load_balancer.find_member.assert_not_called()
+
+
+
 @pytest.fixture
 def test_store():
     return ReconciliationTestStore()

@@ -151,7 +151,7 @@ def _fetch_octavia_member(
         if isinstance(metadata, dict):
             pool_id = metadata.get("pool_id")
         if pool_id and hasattr(conn, "load_balancer") and hasattr(conn.load_balancer, "find_member"):
-            return conn.load_balancer.find_member(member_id, pool_id=pool_id, ignore_missing=True)
+            return conn.load_balancer.find_member(member_id, pool_id, ignore_missing=True)
         return None
     except Exception as e:
         if _is_not_found(e):
