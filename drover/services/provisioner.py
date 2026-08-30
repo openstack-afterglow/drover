@@ -118,6 +118,8 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
             await inventory.record_resource(
                 None, cluster_id=cluster_id, service="nova", resource_type="server", resource_id=vm.id, name=agent_name
             )
+            agent_vm_ids.append(vm.id)
+            new_agent_entries.append({"vm_id": vm.id, "name": agent_name})
         except Exception as e:
             _logger.error("k3s agent %s creation failed: %s", agent_name, e)
             failed_count += 1

@@ -49,7 +49,6 @@ async def provision_nodegroup_vms(
     from drover.services import (
         plugins as k3s_plugins,
     )
-    from drover.services import redis_store as k3s_cluster_svc
     from drover.services import (
         store as k3s_db,
     )
@@ -61,7 +60,7 @@ async def provision_nodegroup_vms(
         _logger.error("provision_nodegroup_vms: cluster %s 없음", cluster_id)
         return []
 
-    node_token = await k3s_cluster_svc.get_cluster_node_token(project_id, cluster_id)
+    node_token = await k3s_db.get_cluster_node_token(project_id, cluster_id)
     server_ip = cluster.get("server_ip") or ""
     cluster_name = cluster.get("name") or cluster_id
     resource_snapshot = cluster.get("resource_policy_snapshot") or {}
