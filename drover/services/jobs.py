@@ -365,14 +365,26 @@ async def _complete(job_id: str, *, attempt: int) -> bool:
         if op_id:
             op = await session.get(DroverOperation, op_id, with_for_update=True)
             if op:
-                if op.status != "WAITING_CALLBACK":
+                cluster = await session.get(K3sCluster, job.cluster_id)
+                create_is_active = (
+                    op.kind == "create"
+                    and cluster is not None
+                    and cluster.status == "ACTIVE"
+                    and op.status not in {"FAILED", "CANCELLED", "SUCCEEDED"}
+                )
+                if create_is_active or (
+                    op.kind != "create" and op.status not in {"FAILED", "CANCELLED", "SUCCEEDED"}
+                ):
                     op.status = "SUCCEEDED"
                     op.finished_at = _now()
                     phase = "job_completed"
                     msg = f"Job {job.kind} completed"
-                else:
+                elif op.kind == "create" and op.status not in {"FAILED", "CANCELLED", "SUCCEEDED"}:
                     phase = "server_boot_ready"
-                    msg = "Boot server ready, waiting for cloud-init callback"
+                    msg = "Create stage completed; waiting for the cluster to become ACTIVE"
+                else:
+                    phase = "job_completed"
+                    msg = f"Job {job.kind} completed after operation terminalized"
                 await operations._append_event_impl(
                     session,
                     op.id,
