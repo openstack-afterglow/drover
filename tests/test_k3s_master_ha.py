@@ -253,6 +253,25 @@ async def test_handle_ha_joiner_no_agents_if_not_all_joined():
         await _handle_ha_joiner("proj1", "clus1", 3, req)
         enqueue_job.assert_not_awaited()
 @pytest.mark.asyncio
+async def test_ha_join_endpoint_falls_back_to_floating_ip_when_vip_lookup_fails():
+    from drover.services import provisioner
+
+    with patch(
+        "drover.services.octavia.get_load_balancer",
+        side_effect=RuntimeError("Octavia unavailable"),
+    ):
+        join_url, tls_sans = await provisioner._resolve_ha_join_endpoint(
+            MagicMock(),
+            "lb-1",
+            "198.51.100.50",
+            "10.0.0.10",
+        )
+
+    assert join_url == "https://198.51.100.50:6443"
+    assert tls_sans == ["198.51.100.50"]
+
+
+@pytest.mark.asyncio
 async def test_three_master_topology_inventory_deletion_reconciliation(monkeypatch):
     """Test 3-master HA topology inventory recording, reconciliation, and deletion.
 
@@ -337,11 +356,22 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
     # Nova VMs for server #2 and #3
     mock_vm2 = MagicMock(id="srv-vm-master-2")
     mock_vm3 = MagicMock(id="srv-vm-master-3")
+    agent_userdata = MagicMock()
+    agent_userdata.data = b"cloud-init"
+    agent_userdata.config_drive = False
 
     with (
         patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
         patch("drover.services.keystone.get_admin_connection_for_project", return_value=mock_conn),
         patch("drover.services.octavia.add_member", return_value=mock_mem1),
+        patch(
+            "drover.services.octavia.get_load_balancer",
+            return_value={"vip_address": "192.168.240.50"},
+        ),
+        patch(
+            "drover.services.cloudinit.generate_server_userdata",
+            return_value=agent_userdata,
+        ) as generate_userdata,
         patch("drover.services.cinder.create_volume_from_image", side_effect=[mock_vol2, mock_vol3]),
         patch("drover.services.nova.create_server", side_effect=[mock_vm2, mock_vm3]),
         patch("drover.services.store.create_ha_callback_token", new=AsyncMock(return_value="ha-tok-123")),
@@ -356,6 +386,15 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
             lb_fip_address="198.51.100.50",
             operation_id=op_id,
         )
+    assert generate_userdata.call_count == 2
+    assert all(
+        call.kwargs["join_url"] == "https://192.168.240.50:6443"
+        for call in generate_userdata.call_args_list
+    )
+    assert all(
+        call.kwargs["extra_tls_sans"] == ["192.168.240.50", "198.51.100.50"]
+        for call in generate_userdata.call_args_list
+    )
 
     # Server #2 and Server #3 callback -> _handle_ha_joiner
     mock_mem2 = {"id": "member-master-2"}

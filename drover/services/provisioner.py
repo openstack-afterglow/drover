@@ -16,6 +16,29 @@ def _rand_suffix(length: int = 5) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
+async def _resolve_ha_join_endpoint(
+    conn,
+    lb_id: str,
+    lb_fip_address: str,
+    server_ip: str,
+) -> tuple[str, list[str]]:
+    from drover.services import octavia
+
+    lb_vip_address = ""
+    if lb_id:
+        try:
+            lb = await asyncio.to_thread(octavia.get_load_balancer, conn, lb_id)
+            lb_vip_address = lb.get("vip_address") or ""
+        except Exception as e:
+            _logger.warning("HA bootstrap: failed to resolve private LB VIP: %s", e)
+    join_address = lb_vip_address or lb_fip_address or server_ip
+    tls_sans = []
+    for address in (lb_vip_address, lb_fip_address):
+        if address and address not in tls_sans:
+            tls_sans.append(address)
+    return f"https://{join_address}:6443", tls_sans
+
+
 # ---------------------------------------------------------------------------
 # 에이전트 VM 프로비저닝 (단일 마스터 / HA 모두 공통)
 # ---------------------------------------------------------------------------
@@ -199,14 +222,18 @@ async def bootstrap_ha_servers(
         _logger.error("HA bootstrap: creation-time resource snapshot is incomplete")
         return
 
-    # HA 조인 URL: LB FIP 우선, 없으면 server#1 IP
-    join_url = f"https://{lb_fip_address or server_ip}:6443"
-
     try:
         conn = keystone.get_admin_connection_for_project(project_id)
     except Exception as e:
         _logger.error("HA bootstrap: cannot get OpenStack connection: %s", e)
         return
+
+    join_url, ha_extra_tls_sans = await _resolve_ha_join_endpoint(
+        conn,
+        cluster.get("api_lb_id") or "",
+        lb_fip_address,
+        server_ip,
+    )
 
     try:
         subnets = await asyncio.to_thread(lambda: list(conn.network.subnets(network_id=network_id)))
@@ -275,7 +302,7 @@ async def bootstrap_ha_servers(
                 cloud_conf=cloud_conf,
                 extra_server_args=extra_server_args,
                 extra_write_files=extra_write_files,
-                extra_tls_sans=[lb_fip_address] if lb_fip_address else [],
+                extra_tls_sans=ha_extra_tls_sans,
                 needs_external_cloud_provider=k3s_plugins.needs_external_cloud_provider(s),
                 os_type=os_type,
                 server_node_name=server_vm_name,
@@ -446,6 +473,9 @@ async def create_cluster_job(
             await inventory.record_resource(
                 None, cluster_id=cluster_id, service="octavia", resource_type="load_balancer", resource_id=ha_lb_id, operation_id=operation_id, name=ha_lb.get("name")
             )
+            ha_lb_vip_address = ha_lb.get("vip_address") or ""
+            if ha_lb_vip_address:
+                extra_tls_sans.append(ha_lb_vip_address)
             await asyncio.to_thread(octavia.wait_for_load_balancer, conn, ha_lb_id)
             listener = await asyncio.to_thread(
                 octavia.create_listener, conn, ha_lb_id, "TCP", 6443, name=f"k3s-ha-{name}-6443"
