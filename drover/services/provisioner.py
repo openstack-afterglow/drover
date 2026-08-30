@@ -39,6 +39,26 @@ async def _resolve_ha_join_endpoint(
     return f"https://{join_address}:6443", tls_sans
 
 
+async def _persist_ha_endpoint_snapshot(
+    project_id: str,
+    cluster_id: str,
+    *,
+    lb_id: str,
+    pool_id: str,
+    fip_id: str,
+    fip_address: str,
+) -> None:
+    await k3s_cluster.update_cluster_status(
+        project_id,
+        cluster_id,
+        "CREATING",
+        api_lb_id=lb_id or "",
+        api_lb_pool_id=pool_id or "",
+        api_fip_id=fip_id or "",
+        api_fip_address=fip_address or "",
+    )
+
+
 # ---------------------------------------------------------------------------
 # 에이전트 VM 프로비저닝 (단일 마스터 / HA 모두 공통)
 # ---------------------------------------------------------------------------
@@ -517,6 +537,14 @@ async def create_cluster_job(
                     None, cluster_id=cluster_id, service="neutron", resource_type="floating_ip", resource_id=ha_fip_id, operation_id=operation_id, name=ha_fip_address
                 )
                 extra_tls_sans.append(ha_fip_address)
+            await _persist_ha_endpoint_snapshot(
+                project_id,
+                cluster_id,
+                lb_id=ha_lb_id or "",
+                pool_id=ha_lb_pool_id or "",
+                fip_id=ha_fip_id or "",
+                fip_address=ha_fip_address or "",
+            )
 
             if operation_id:
                 await operations.append_operation_event(
