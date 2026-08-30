@@ -283,7 +283,7 @@ async def create_k3s_cluster_async(
 
     existing_op = None
     if idempotency_key:
-        existing_op = await operations.get_operation_by_idempotency_key(project_id, idempotency_key)
+        existing_op = await operations.get_operation_by_idempotency_key(None, project_id, idempotency_key)
         if existing_op:
             if existing_op.request_hash != req_hash:
                 raise HTTPException(
