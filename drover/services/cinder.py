@@ -70,6 +70,46 @@ def wait_volume_deleted(conn: openstack.connection.Connection, volume_id: str, t
     raise TimeoutError(f"볼륨 {volume_id} 삭제 대기 타임아웃 ({timeout}s)")
 
 
+def _wait_volume_detachable_or_deleted(
+    conn: openstack.connection.Connection,
+    volume_id: str,
+    timeout: int = 120,
+):
+    """Wait for Nova delete-on-termination detach/delete races to settle."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        vol = conn.block_storage.find_volume(volume_id, ignore_missing=True)
+        if vol is None:
+            return None
+        status = str(getattr(vol, "status", "") or "").lower()
+        if status == "deleting":
+            wait_volume_deleted(conn, volume_id, timeout=max(1, int(deadline - time.monotonic())))
+            return None
+        if not (getattr(vol, "attachments", None) or []) and status not in {
+            "attaching",
+            "detaching",
+            "in-use",
+        }:
+            return vol
+        time.sleep(3)
+    vol = conn.block_storage.find_volume(volume_id, ignore_missing=True)
+    if vol is None:
+        return None
+    status = str(getattr(vol, "status", "") or "").lower()
+    if status == "deleting":
+        wait_volume_deleted(conn, volume_id, timeout=1)
+        return None
+    if not (getattr(vol, "attachments", None) or []) and status not in {
+        "attaching",
+        "detaching",
+        "in-use",
+    }:
+        return vol
+    raise TimeoutError(f"볼륨 {volume_id} 분리 대기 타임아웃 ({timeout}s)")
+
+
 def delete_volume_safe(
     conn: openstack.connection.Connection,
     volume_id: str,
@@ -84,6 +124,9 @@ def delete_volume_safe(
         return
     if not validate_resource_ownership(vol, expected_project_id, expected_cluster_id, "volume"):
         raise ValueError(f"Volume {volume_id} ownership validation failed for project {expected_project_id}")
+    vol = _wait_volume_detachable_or_deleted(conn, volume_id)
+    if vol is None:
+        return
     delete_volume(conn, volume_id)
     wait_volume_deleted(conn, volume_id)
 
