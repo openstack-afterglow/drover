@@ -419,7 +419,7 @@ def _vol_to_info(vol) -> VolumeInfo:
         id=vol.id,
         name=vol.name or "",
         status=vol.status,
-        size=vol.size,
+        size_gb=vol.size,
         volume_type=vol.volume_type,
         attachments=list(vol.attachments or []),
         bootable=bootable,

@@ -242,20 +242,24 @@ def cleanup_disposable_clusters(conn: Any, cluster_ids: list[str], timeout: int 
             cluster = conn.drover.get_cluster(cluster_id)
             if cluster and cluster.get("status") not in ("DELETED", "DELETING"):
                 operation_id = _consume_operation_id(conn.drover.delete_cluster_async(cluster_id))
-                if not operation_id:
-                    raise RuntimeError("delete stream did not provide an operation_id")
+                if operation_id:
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline:
+                        operation = conn.drover.get_operation(operation_id)
+                        status = operation.get("status") if operation else None
+                        if status == "SUCCEEDED":
+                            break
+                        if status in {"FAILED", "CANCELLED"}:
+                            raise RuntimeError(f"delete operation reached {status}")
+                        time.sleep(2)
+                    else:
+                        raise TimeoutError("delete operation did not complete before timeout")
 
-                deadline = time.monotonic() + timeout
-                while time.monotonic() < deadline:
-                    operation = conn.drover.get_operation(operation_id)
-                    status = operation.get("status") if operation else None
-                    if status == "SUCCEEDED":
-                        break
-                    if status in {"FAILED", "CANCELLED"}:
-                        raise RuntimeError(f"delete operation reached {status}")
-                    time.sleep(2)
-                else:
-                    raise TimeoutError("delete operation did not complete before timeout")
+                deleted_cluster = conn.drover.admin_cluster(cluster_id)
+                if deleted_cluster and deleted_cluster.get("status") != "DELETED":
+                    raise RuntimeError(
+                        f"delete stream completed with cluster status {deleted_cluster.get('status')}"
+                    )
 
             active_resources = conn.drover.admin_managed_resources(
                 cluster_id=cluster_id,
