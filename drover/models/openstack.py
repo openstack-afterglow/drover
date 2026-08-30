@@ -13,6 +13,7 @@ class VolumeInfo(BaseModel):
     volume_type: str | None = None
     bootable: bool = False
     attachments: list[dict] = Field(default_factory=list)
+    volume_image_metadata: dict | None = None
     created_at: str | None = None
 
 
