@@ -357,9 +357,20 @@ def create_floating_ip(
     kwargs: dict = {"floating_network_id": floating_network_id}
     if port_id:
         kwargs["port_id"] = port_id
-    if tags:
-        kwargs["tags"] = tags
     fip = conn.network.create_ip(**kwargs)
+    if tags:
+        try:
+            conn.network.set_tags(fip, tags)
+        except Exception:
+            try:
+                conn.network.delete_ip(fip, ignore_missing=True)
+            except Exception:
+                _logging.getLogger(__name__).warning(
+                    "Failed to delete untagged floating IP %s after tag update failure",
+                    fip.id,
+                    exc_info=True,
+                )
+            raise
     return _fip_to_info(fip)
 
 def find_external_network_for_subnets(
