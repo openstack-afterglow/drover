@@ -742,10 +742,20 @@ def create_security_group(
     description: str = "",
     tags: list[str] | None = None,
 ) -> dict:
-    kwargs: dict = {"name": name, "description": description}
+    sg = conn.network.create_security_group(name=name, description=description)
     if tags:
-        kwargs["tags"] = tags
-    sg = conn.network.create_security_group(**kwargs)
+        try:
+            conn.network.set_tags(sg, tags)
+        except Exception:
+            try:
+                conn.network.delete_security_group(sg, ignore_missing=True)
+            except Exception:
+                _logging.getLogger(__name__).warning(
+                    "Failed to delete untagged security group %s after tag update failure",
+                    sg.id,
+                    exc_info=True,
+                )
+            raise
     return _sg_to_dict(sg)
 
 

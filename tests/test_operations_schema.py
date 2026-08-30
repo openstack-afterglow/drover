@@ -34,10 +34,11 @@ def db_session():
 
 def test_load_manifest_validates_checksums():
     manifest = load_manifest()
-    assert len(manifest) >= 2
+    assert len(manifest) >= 3
     logical_ids = [m.logical_id for m in manifest]
     assert "001_baseline" in logical_ids
     assert "002_operations" in logical_ids
+    assert "003_cluster_reconciliation" in logical_ids
 
     op_mig = next(m for m in manifest if m.logical_id == "002_operations")
     actual_hash = hashlib.sha256((MIGRATIONS / op_mig.relative_path).read_bytes()).hexdigest()
@@ -66,6 +67,10 @@ def test_migration_statements_parsing():
     assert "idx_drover_op_proj_idemp" in joined
     assert "idx_drover_op_event_seq" in joined
     assert "idx_managed_res_identity" in joined
+
+    reconciliation_sql = (MIGRATIONS / "003_cluster_reconciliation.sql").read_text(encoding="utf-8")
+    assert "ADD COLUMN IF NOT EXISTS `last_reconciled_at` DATETIME(6) NULL" in reconciliation_sql
+    assert "ADD COLUMN IF NOT EXISTS `drift_status` JSON NULL" in reconciliation_sql
 
 
 def test_orm_drover_operation_creation_and_relationships(db_session: Session):
