@@ -37,6 +37,7 @@ Safety & Isolation:
 - Native /v1 endpoint operation polling is used to monitor cluster lifecycle operations.
 """
 
+import json
 import os
 import sys
 import time
@@ -88,6 +89,7 @@ def get_staging_config() -> dict[str, str]:
             or os.environ.get("DROVER_INTEGRATION_FLAVOR_NAME", "").strip()
         ),
         "external_net_id": os.environ.get("DROVER_INTEGRATION_EXTERNAL_NET_ID", "").strip(),
+        "volume_availability_zone": os.environ.get("DROVER_INTEGRATION_VOLUME_AZ", "").strip(),
         "drover_url": (
             os.environ.get("SERVICE_DROVER_INTERNAL_URL", "").strip()
             or os.environ.get("DROVER_API_URL", "").strip()
@@ -107,11 +109,16 @@ def get_staging_config() -> dict[str, str]:
             missing.append("OS_PROJECT_NAME / OS_PROJECT_ID")
         if not config["network_id"]:
             missing.append("DROVER_INTEGRATION_NETWORK_ID / DROVER_INTEGRATION_NETWORK_NAME")
+        if not config["subnet_id"]:
+            missing.append("DROVER_INTEGRATION_SUBNET_ID")
         if not config["image_id"]:
             missing.append("DROVER_INTEGRATION_IMAGE_ID / DROVER_INTEGRATION_IMAGE_NAME")
         if not config["flavor_id"]:
             missing.append("DROVER_INTEGRATION_FLAVOR_ID / DROVER_INTEGRATION_FLAVOR_NAME")
-
+        if not config["volume_availability_zone"]:
+            missing.append("DROVER_INTEGRATION_VOLUME_AZ")
+        if not config["drover_url"]:
+            missing.append("SERVICE_DROVER_INTERNAL_URL / DROVER_API_URL")
         if missing:
             raise ValueError(
                 f"DROVER_INTEGRATION_CLOUD is enabled, but required staging environment variables are missing: "
@@ -174,24 +181,101 @@ def openstack_conn(staging_env: dict[str, str]) -> Any:
     return conn
 
 
+@pytest.fixture(scope="session", autouse=True)
+def staging_policy_contract(openstack_conn: Any, staging_env: dict[str, str]) -> None:
+    """Fail before provisioning when live Drover policy does not match isolated CI resources."""
+    policies = {
+        str(policy["key"]): policy
+        for policy in openstack_conn.drover.resource_policies()
+        if isinstance(policy, dict) and policy.get("key")
+    }
+    expected = {
+        "k3s.server_image": staging_env["image_id"],
+        "k3s.server_flavor": staging_env["flavor_id"],
+        "k3s.default_agent_flavor": staging_env["flavor_id"],
+        "k3s.volume_availability_zone": staging_env["volume_availability_zone"],
+        "k3s.lb_subnet": staging_env["subnet_id"],
+    }
+    if staging_env["external_net_id"]:
+        expected["k3s.api_lb_floating_network"] = staging_env["external_net_id"]
+
+    mismatches = [
+        f"{key}: expected configured resource {resource_id}"
+        for key, resource_id in expected.items()
+        if (policies.get(key) or {}).get("resource_id") != resource_id
+    ]
+    runtime_settings = {
+        str(setting["key"]): setting
+        for setting in openstack_conn.drover.runtime_settings()
+        if isinstance(setting, dict) and setting.get("key")
+    }
+    if not (runtime_settings.get("k3s.version") or {}).get("value"):
+        mismatches.append("k3s.version: expected a configured runtime value")
+
+    if mismatches:
+        pytest.fail(
+            "Live Drover policy is not pinned to the disposable staging contract:\n"
+            + "\n".join(f"  - {item}" for item in mismatches),
+            pytrace=False,
+        )
+
+
+def _consume_operation_id(stream: Any) -> str | None:
+    operation_id = None
+    for line in stream:
+        if not isinstance(line, str) or not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line.removeprefix("data:").strip())
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("operation_id"):
+            operation_id = str(payload["operation_id"])
+    return operation_id
+
+
+def cleanup_disposable_clusters(conn: Any, cluster_ids: list[str], timeout: int = 600) -> None:
+    """Delete every tracked cluster and fail teardown if Drover leaves active resources."""
+    failures: list[str] = []
+    for cluster_id in cluster_ids:
+        try:
+            cluster = conn.drover.get_cluster(cluster_id)
+            if cluster and cluster.get("status") not in ("DELETED", "DELETING"):
+                operation_id = _consume_operation_id(conn.drover.delete_cluster_async(cluster_id))
+                if not operation_id:
+                    raise RuntimeError("delete stream did not provide an operation_id")
+
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    operation = conn.drover.get_operation(operation_id)
+                    status = operation.get("status") if operation else None
+                    if status == "SUCCEEDED":
+                        break
+                    if status in {"FAILED", "CANCELLED"}:
+                        raise RuntimeError(f"delete operation reached {status}")
+                    time.sleep(2)
+                else:
+                    raise TimeoutError("delete operation did not complete before timeout")
+
+            active_resources = conn.drover.admin_managed_resources(
+                cluster_id=cluster_id,
+                include_deleted=False,
+            )
+            if active_resources:
+                raise RuntimeError(f"{len(active_resources)} active managed resources remain")
+        except Exception as exc:
+            failures.append(f"{cluster_id}: {type(exc).__name__}: {exc}")
+
+    if failures:
+        pytest.fail(
+            "Drover staging cleanup failed:\n" + "\n".join(f"  - {failure}" for failure in failures),
+            pytrace=False,
+        )
+
+
 @pytest.fixture
 def disposable_cluster_tracker(openstack_conn: Any) -> Generator[list[str], None, None]:
-    """Fixture tracking created cluster IDs and running finalizer cleanup for residual disposable resources."""
+    """Track created cluster IDs and require complete live-resource cleanup."""
     created_cluster_ids: list[str] = []
-
     yield created_cluster_ids
-
-    # Fixture finalizer: safely delete residual clusters if test failed before explicit deletion
-    for cluster_id in created_cluster_ids:
-        try:
-            cluster = openstack_conn.drover.get_cluster(cluster_id)
-            if cluster and cluster.get("status") not in ("DELETED", "DELETING"):
-                openstack_conn.drover.delete_cluster_async(cluster_id)
-                # Poll deletion completion up to 60s
-                for _ in range(30):
-                    time.sleep(2)
-                    c = openstack_conn.drover.get_cluster(cluster_id)
-                    if not c or c.get("status") == "DELETED":
-                        break
-        except Exception:
-            pass
+    cleanup_disposable_clusters(openstack_conn, created_cluster_ids)

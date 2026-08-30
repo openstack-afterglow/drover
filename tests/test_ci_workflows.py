@@ -74,41 +74,57 @@ def test_ci_workflow_structure():
 
 
 def test_staging_workflow_structure():
-    """Verify Staging workflow enforces contract assertions, Kolla deploy, Keystone catalog, and integration suite."""
+    """Verify the live gate pins its revision and enforces isolated staging contracts."""
     staging_file = WORKFLOWS_DIR / "staging.yml"
     assert staging_file.is_file()
     staging = yaml.safe_load(staging_file.read_text(encoding="utf-8"))
 
-    jobs = staging.get("jobs", {})
-    assert "staging-gate" in jobs
+    assert staging["concurrency"] == {
+        "group": "drover-staging-gate",
+        "cancel-in-progress": False,
+    }
+    gate_job = staging["jobs"]["staging-gate"]
+    assert gate_job["environment"] == "staging"
+    assert gate_job["timeout-minutes"] == 90
+    steps = gate_job["steps"]
 
-    gate_job = jobs["staging-gate"]
-    steps = gate_job.get("steps", [])
+    checkout_step = next(step for step in steps if step.get("name") == "Checkout verified revision")
+    assert checkout_step["with"]["ref"] == "${{ github.event.workflow_run.head_sha || github.sha }}"
 
-    # Step 1: Assert staging gate contract/secrets
-    assertion_step = next((s for s in steps if "Assert required staging gate secrets" in s.get("name", "")), None)
-    assert assertion_step is not None, "Missing staging secrets assertion step"
-    run_code = assertion_step.get("run", "")
-    assert "DROVER_INTEGRATION_CLOUD" in run_code
-    assert "OS_AUTH_URL" in run_code
-    assert "OS_USERNAME" in run_code
-    assert "OS_PASSWORD" in run_code
+    assertion_step = next(
+        step for step in steps if "Assert required staging gate secrets" in step.get("name", "")
+    )
+    assertion_env = assertion_step["env"]
+    assert assertion_env["DROVER_INTEGRATION_CLOUD"] == "1"
+    for required_name in (
+        "OS_AUTH_URL",
+        "OS_USERNAME",
+        "OS_PASSWORD",
+        "DROVER_INTEGRATION_NETWORK_ID",
+        "DROVER_INTEGRATION_SUBNET_ID",
+        "DROVER_INTEGRATION_IMAGE_ID",
+        "DROVER_INTEGRATION_FLAVOR_ID",
+        "DROVER_INTEGRATION_EXTERNAL_NET_ID",
+        "DROVER_INTEGRATION_VOLUME_AZ",
+        "DROVER_API_URL",
+    ):
+        assert required_name in assertion_env
+    assert "HTTPS required" in assertion_step["run"]
 
-    # Step 2: Deploy Kolla role assets
-    deploy_step = next((s for s in steps if "Deploy Kolla role" in s.get("name", "")), None)
-    assert deploy_step is not None, "Missing Deploy Kolla role step"
+    asset_step = next(step for step in steps if step.get("name") == "Validate packaged Kolla role assets")
+    assert "live deployment is verified separately" in asset_step["run"]
 
-    # Step 3: Assert Keystone catalog endpoint discovery for /v1
-    catalog_step = next((s for s in steps if "Assert Keystone catalog" in s.get("name", "")), None)
-    assert catalog_step is not None, "Missing Assert Keystone catalog step"
-    cat_code = catalog_step.get("run", "")
-    assert "container-infra" in cat_code
-    assert "endswith('/v1')" in cat_code or 'endswith("/v1")' in cat_code
+    catalog_step = next(step for step in steps if step.get("name") == "Assert live Drover catalog and liveness")
+    catalog_code = catalog_step["run"]
+    assert "services(type='drover')" in catalog_code
+    assert "/v1/health/live" in catalog_code
+    assert "container-infra" not in catalog_code
 
-    # Step 4: Run integration suite
-    integration_step = next((s for s in steps if "Execute live OpenStack integration" in s.get("name", "")), None)
-    assert integration_step is not None, "Missing integration test suite step"
-    assert "pytest tests/integration" in integration_step.get("run", "")
+    integration_step = next(
+        step for step in steps if step.get("name") == "Execute live OpenStack integration test suite"
+    )
+    assert integration_step["run"] == "uv run pytest tests/integration -v"
+    assert integration_step["env"]["DROVER_API_URL"] == "${{ vars.DROVER_API_URL }}"
 
 
 def test_pyproject_script_entrypoints():

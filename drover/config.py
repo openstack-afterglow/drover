@@ -82,6 +82,7 @@ def _load_toml() -> dict:
         "os_username": keystone.get("username", ""),
         "os_password": keystone.get("password", ""),
         "os_password_file": keystone.get("password_file", keystone.get("os_password_file", "")),
+        "os_project_name": keystone.get("project_name", ""),
         "os_project_domain_name": keystone.get("project_domain_name", "Default"),
         "os_user_domain_name": keystone.get("user_domain_name", "Default"),
         "os_region_name": keystone.get("region", keystone.get("region_name", "RegionOne")),
@@ -159,6 +160,7 @@ class Settings(BaseSettings):
     os_username: str = ""
     os_password: str = ""
     os_password_file: str = ""
+    os_project_name: str = ""
     os_project_domain_name: str = "Default"
     os_user_domain_name: str = "Default"
     os_region_name: str = "RegionOne"

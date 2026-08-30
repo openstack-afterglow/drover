@@ -62,6 +62,7 @@ def test_declared_runtime_settings_defaults(monkeypatch):
     assert settings.drover_reconcile_interval == 300
     assert settings.drover_reconcile_concurrency_per_project == 2
     assert settings.os_service_project_id == ""
+    assert settings.os_project_name == ""
     assert settings.admin_legacy_project_policy is False
 
 def test_declared_runtime_settings_toml_mapping(monkeypatch):
@@ -71,6 +72,7 @@ def test_declared_runtime_settings_toml_mapping(monkeypatch):
         lambda: {
             "openstack": {
                 "service_project_id": "service-proj-999",
+                "project_name": "drover-service",
                 "admin_legacy_project_policy": True,
             },
             "drover": {
@@ -84,6 +86,7 @@ def test_declared_runtime_settings_toml_mapping(monkeypatch):
     values = config._load_toml()
 
     assert values["os_service_project_id"] == "service-proj-999"
+    assert values["os_project_name"] == "drover-service"
     assert values["admin_legacy_project_policy"] is True
     assert values["k3s_health_interval"] == 300
     assert values["drover_reconcile_interval"] == 600
