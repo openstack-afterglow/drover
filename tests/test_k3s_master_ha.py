@@ -272,6 +272,34 @@ async def test_ha_join_endpoint_falls_back_to_floating_ip_when_vip_lookup_fails(
 
 
 @pytest.mark.asyncio
+async def test_ha_endpoint_snapshot_is_persisted_before_primary_callback():
+    from drover.services import provisioner
+
+    with patch(
+        "drover.services.provisioner.k3s_cluster.update_cluster_status",
+        new=AsyncMock(),
+    ) as update_status:
+        await provisioner._persist_ha_endpoint_snapshot(
+            "project-1",
+            "cluster-1",
+            lb_id="lb-1",
+            pool_id="pool-1",
+            fip_id="fip-1",
+            fip_address="198.51.100.50",
+        )
+
+    update_status.assert_awaited_once_with(
+        "project-1",
+        "cluster-1",
+        "CREATING",
+        api_lb_id="lb-1",
+        api_lb_pool_id="pool-1",
+        api_fip_id="fip-1",
+        api_fip_address="198.51.100.50",
+    )
+
+
+@pytest.mark.asyncio
 async def test_three_master_topology_inventory_deletion_reconciliation(monkeypatch):
     """Test 3-master HA topology inventory recording, reconciliation, and deletion.
 
