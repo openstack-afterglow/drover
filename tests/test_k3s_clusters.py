@@ -474,6 +474,45 @@ def test_octavia_create_lb_with_vip_network_id():
     assert result["id"] == "lb-2"
 
 
+def test_octavia_listener_and_pool_wait_for_load_balancer_active():
+    from drover.services import octavia
+
+    mock_conn = MagicMock()
+    listener = MagicMock()
+    listener.id = "listener-1"
+    listener.name = "api-listener"
+    listener.protocol = "TCP"
+    listener.protocol_port = 6443
+    listener.provisioning_status = "PENDING_CREATE"
+    listener.default_pool_id = None
+    listener.load_balancer_id = "lb-1"
+    mock_conn.load_balancer.create_listener.return_value = listener
+
+    pool = MagicMock()
+    pool.id = "pool-1"
+    pool.name = "api-pool"
+    pool.protocol = "TCP"
+    pool.lb_algorithm = "ROUND_ROBIN"
+    pool.provisioning_status = "PENDING_CREATE"
+    pool.health_monitor_id = None
+    pool.load_balancers = [{"id": "lb-1"}]
+    mock_conn.load_balancer.create_pool.return_value = pool
+
+    with patch.object(octavia, "wait_for_load_balancer") as wait_for_active:
+        octavia.create_listener(mock_conn, "lb-1", "TCP", 6443, name="api-listener")
+        wait_for_active.assert_called_once_with(mock_conn, "lb-1")
+
+    with patch.object(octavia, "wait_for_load_balancer") as wait_for_active:
+        octavia.create_pool(
+            mock_conn,
+            "lb-1",
+            "TCP",
+            name="api-pool",
+            listener_id="listener-1",
+        )
+        wait_for_active.assert_called_once_with(mock_conn, "lb-1")
+
+
 # ---------------------------------------------------------------------------
 # CreateK3sClusterRequest 모델 — allowed_cidrs 검증
 # ---------------------------------------------------------------------------

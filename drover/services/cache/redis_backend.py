@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import unquote, urlsplit
 
 import redis.asyncio as aioredis
 
@@ -68,17 +69,21 @@ class RedisBackend(Cache):
             else:
                 hosts.append((entry, 26379))
 
+        password = unquote(urlsplit(settings.redis_url).password or "")
+
         sentinel = Sentinel(
             hosts,
             socket_timeout=5,
             socket_connect_timeout=3,
         )
-        return sentinel.master_for(
-            settings.sentinel_master_name,
-            decode_responses=True,
-            socket_keepalive=True,
-            health_check_interval=30,
-        )
+        master_kwargs = {
+            "decode_responses": True,
+            "socket_keepalive": True,
+            "health_check_interval": 30,
+        }
+        if password:
+            master_kwargs["password"] = password
+        return sentinel.master_for(settings.sentinel_master_name, **master_kwargs)
 
     # ── 기본 ABC 구현 ────────────────────────────────────────────────────────
     async def get(self, key: str) -> bytes | None:
