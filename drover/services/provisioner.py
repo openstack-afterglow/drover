@@ -59,6 +59,86 @@ async def _persist_ha_endpoint_snapshot(
     )
 
 
+def _cluster_security_group_rules(
+    allowed_cidrs: list[str] | None,
+    security_group_id: str,
+) -> list[dict]:
+    rules = []
+    for cidr in allowed_cidrs or ["0.0.0.0/0"]:
+        rules.append(
+            dict(
+                direction="ingress",
+                protocol="tcp",
+                port_range_min=22,
+                port_range_max=22,
+                remote_ip_prefix=cidr,
+            )
+        )
+        rules.append(
+            dict(
+                direction="ingress",
+                protocol="tcp",
+                port_range_min=6443,
+                port_range_max=6443,
+                remote_ip_prefix=cidr,
+            )
+        )
+    rules.extend(
+        [
+            dict(
+                direction="ingress",
+                protocol="tcp",
+                port_range_min=2379,
+                port_range_max=2380,
+                remote_group_id=security_group_id,
+            ),
+            dict(
+                direction="ingress",
+                protocol="tcp",
+                port_range_min=10250,
+                port_range_max=10250,
+                remote_group_id=security_group_id,
+            ),
+            dict(
+                direction="ingress",
+                protocol="udp",
+                port_range_min=8472,
+                port_range_max=8472,
+                remote_group_id=security_group_id,
+            ),
+            dict(
+                direction="ingress",
+                protocol="udp",
+                port_range_min=51820,
+                port_range_max=51820,
+                remote_group_id=security_group_id,
+            ),
+            dict(
+                direction="ingress",
+                protocol="tcp",
+                port_range_min=80,
+                port_range_max=80,
+                remote_ip_prefix="0.0.0.0/0",
+            ),
+            dict(
+                direction="ingress",
+                protocol="tcp",
+                port_range_min=443,
+                port_range_max=443,
+                remote_ip_prefix="0.0.0.0/0",
+            ),
+            dict(
+                direction="ingress",
+                protocol="tcp",
+                port_range_min=30000,
+                port_range_max=32767,
+                remote_ip_prefix="0.0.0.0/0",
+            ),
+        ]
+    )
+    return rules
+
+
 # ---------------------------------------------------------------------------
 # 에이전트 VM 프로비저닝 (단일 마스터 / HA 모두 공통)
 # ---------------------------------------------------------------------------
@@ -443,19 +523,7 @@ async def create_cluster_job(
             None, cluster_id=cluster_id, service="neutron", resource_type="security_group", resource_id=sg_id, operation_id=operation_id, name=sg_name
         )
 
-        mgmt_cidrs = allowed_cidrs or ["0.0.0.0/0"]
-        rules = []
-        for cidr in mgmt_cidrs:
-            rules.append(dict(direction="ingress", protocol="tcp", port_range_min=22, port_range_max=22, remote_ip_prefix=cidr))
-            rules.append(dict(direction="ingress", protocol="tcp", port_range_min=6443, port_range_max=6443, remote_ip_prefix=cidr))
-        rules += [
-            dict(direction="ingress", protocol="tcp", port_range_min=10250, port_range_max=10250, remote_group_id=sg_id),
-            dict(direction="ingress", protocol="udp", port_range_min=8472, port_range_max=8472, remote_group_id=sg_id),
-            dict(direction="ingress", protocol="udp", port_range_min=51820, port_range_max=51820, remote_group_id=sg_id),
-            dict(direction="ingress", protocol="tcp", port_range_min=80, port_range_max=80, remote_ip_prefix="0.0.0.0/0"),
-            dict(direction="ingress", protocol="tcp", port_range_min=443, port_range_max=443, remote_ip_prefix="0.0.0.0/0"),
-            dict(direction="ingress", protocol="tcp", port_range_min=30000, port_range_max=32767, remote_ip_prefix="0.0.0.0/0"),
-        ]
+        rules = _cluster_security_group_rules(allowed_cidrs, sg_id)
         for rule_kwargs in rules:
             rule = await asyncio.to_thread(neutron.create_security_group_rule, conn, sg_id, **rule_kwargs)
             rule_id = rule.get("id") if isinstance(rule, dict) else getattr(rule, "id", None)
