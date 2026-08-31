@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from threading import Lock
 from typing import TYPE_CHECKING
 
+from openstack import exceptions as openstack_exceptions
+
 if TYPE_CHECKING:
     import openstack
 
+_logger = logging.getLogger(__name__)
 
 def _lb_to_dict(lb) -> dict:
     prov = getattr(lb, "provisioning_status", "") or ""
@@ -169,7 +173,10 @@ def wait_for_load_balancer(
 
     deadline = time.time() + wait
     while time.time() < deadline:
-        lb = conn.load_balancer.get_load_balancer(lb_id)
+        try:
+            lb = conn.load_balancer.get_load_balancer(lb_id)
+        except openstack_exceptions.ResourceNotFound as exc:
+            raise RuntimeError(f"LB {lb_id} disappeared while waiting for {status}") from exc
         prov_status = getattr(lb, "provisioning_status", "")
         if prov_status == status:
             return _lb_to_dict(lb)
@@ -240,8 +247,23 @@ def create_listener(
     return _listener_to_dict(listener)
 
 
+def _listener_load_balancer_id(conn: openstack.connection.Connection, listener_id: str) -> str:
+    try:
+        listener = conn.load_balancer.find_listener(listener_id, ignore_missing=True)
+    except openstack_exceptions.ResourceNotFound:
+        return ""
+    except Exception:
+        _logger.warning("Failed to resolve listener %s parent load balancer", listener_id, exc_info=True)
+        raise
+    if isinstance(listener, dict):
+        return str(listener.get("load_balancer_id") or "")
+    return str(getattr(listener, "load_balancer_id", "") or "") if listener is not None else ""
+
 def delete_listener(conn: openstack.connection.Connection, listener_id: str) -> None:
+    lb_id = _listener_load_balancer_id(conn, listener_id)
     conn.load_balancer.delete_listener(listener_id, ignore_missing=True)
+    if lb_id:
+        wait_for_load_balancer(conn, lb_id)
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +300,34 @@ def create_pool(
     return _pool_to_dict(pool)
 
 
+def _pool_load_balancer_id(conn: openstack.connection.Connection, pool_id: str) -> str:
+    try:
+        pool = conn.load_balancer.find_pool(pool_id, ignore_missing=True)
+    except openstack_exceptions.ResourceNotFound:
+        return ""
+    except Exception:
+        _logger.warning("Failed to resolve pool %s parent load balancer", pool_id, exc_info=True)
+        raise
+    if pool is None:
+        return ""
+    if isinstance(pool, dict):
+        direct_id = pool.get("load_balancer_id")
+        load_balancers = pool.get("load_balancers") or []
+    else:
+        direct_id = getattr(pool, "load_balancer_id", None)
+        load_balancers = getattr(pool, "load_balancers", None) or []
+    if isinstance(direct_id, str) and direct_id:
+        return direct_id
+    first = load_balancers[0] if load_balancers else None
+    if isinstance(first, dict):
+        return str(first.get("id") or "")
+    return str(getattr(first, "id", "") or "")
+
 def delete_pool(conn: openstack.connection.Connection, pool_id: str) -> None:
+    lb_id = _pool_load_balancer_id(conn, pool_id)
     conn.load_balancer.delete_pool(pool_id, ignore_missing=True)
+    if lb_id:
+        wait_for_load_balancer(conn, lb_id)
 
 
 # ---------------------------------------------------------------------------
@@ -309,11 +357,18 @@ def add_member(
         kwargs["name"] = name
     if subnet_id:
         kwargs["subnet_id"] = subnet_id
-    return _member_to_dict(conn.load_balancer.create_member(pool_id, **kwargs))
+    lb_id = _pool_load_balancer_id(conn, pool_id)
+    member = conn.load_balancer.create_member(pool_id, **kwargs)
+    if lb_id:
+        wait_for_load_balancer(conn, lb_id)
+    return _member_to_dict(member)
 
 
 def remove_member(conn: openstack.connection.Connection, pool_id: str, member_id: str) -> None:
+    lb_id = _pool_load_balancer_id(conn, pool_id)
     conn.load_balancer.delete_member(member_id, pool_id, ignore_missing=True)
+    if lb_id:
+        wait_for_load_balancer(conn, lb_id)
 
 
 # ---------------------------------------------------------------------------
@@ -346,11 +401,32 @@ def create_health_monitor(
     }
     if name:
         kwargs["name"] = name
-    return _hm_to_dict(conn.load_balancer.create_health_monitor(**kwargs))
+    lb_id = _pool_load_balancer_id(conn, pool_id)
+    monitor = conn.load_balancer.create_health_monitor(**kwargs)
+    if lb_id:
+        wait_for_load_balancer(conn, lb_id)
+    return _hm_to_dict(monitor)
+
+
+def _health_monitor_pool_id(conn: openstack.connection.Connection, hm_id: str) -> str:
+    try:
+        monitor = conn.load_balancer.find_health_monitor(hm_id, ignore_missing=True)
+    except openstack_exceptions.ResourceNotFound:
+        return ""
+    except Exception:
+        _logger.warning("Failed to resolve health monitor %s parent pool", hm_id, exc_info=True)
+        raise
+    if isinstance(monitor, dict):
+        return str(monitor.get("pool_id") or "")
+    return str(getattr(monitor, "pool_id", "") or "") if monitor is not None else ""
 
 
 def delete_health_monitor(conn: openstack.connection.Connection, hm_id: str) -> None:
+    pool_id = _health_monitor_pool_id(conn, hm_id)
+    lb_id = _pool_load_balancer_id(conn, pool_id) if pool_id else ""
     conn.load_balancer.delete_health_monitor(hm_id, ignore_missing=True)
+    if lb_id:
+        wait_for_load_balancer(conn, lb_id)
 
 
 # ---------------------------------------------------------------------------

@@ -513,6 +513,82 @@ def test_octavia_listener_and_pool_wait_for_load_balancer_active():
         wait_for_active.assert_called_once_with(mock_conn, "lb-1")
 
 
+def test_octavia_member_and_delete_mutations_wait_for_load_balancer_active():
+    from drover.services import octavia
+
+    mock_conn = MagicMock()
+    pool = MagicMock()
+    pool.load_balancer_id = None
+    pool.load_balancers = [{"id": "lb-1"}]
+    mock_conn.load_balancer.find_pool.return_value = pool
+
+    listener = MagicMock()
+    listener.load_balancer_id = "lb-1"
+    mock_conn.load_balancer.find_listener.return_value = listener
+
+    member = MagicMock()
+    member.id = "member-1"
+    member.name = "server-1"
+    member.address = "192.0.2.10"
+    member.protocol_port = 6443
+    member.weight = 1
+    member.provisioning_status = "PENDING_CREATE"
+    member.subnet_id = "subnet-1"
+    monitor = MagicMock()
+    monitor.id = "monitor-1"
+    monitor.name = "api-monitor"
+    monitor.type = "TCP"
+    monitor.delay = 5
+    monitor.timeout = 5
+    monitor.max_retries = 3
+    monitor.provisioning_status = "PENDING_CREATE"
+    mock_conn.load_balancer.create_health_monitor.return_value = monitor
+    mock_conn.load_balancer.find_health_monitor.return_value = {"pool_id": "pool-1"}
+    mock_conn.load_balancer.create_member.return_value = member
+
+    with patch.object(octavia, "wait_for_load_balancer") as wait_for_active:
+        octavia.add_member(
+            mock_conn,
+            "pool-1",
+            "192.0.2.10",
+            6443,
+            subnet_id="subnet-1",
+        )
+        octavia.remove_member(mock_conn, "pool-1", "member-1")
+        octavia.delete_pool(mock_conn, "pool-1")
+        octavia.create_health_monitor(mock_conn, "pool-1", type="TCP")
+        octavia.delete_health_monitor(mock_conn, "monitor-1")
+        octavia.delete_listener(mock_conn, "listener-1")
+    assert [call.args for call in wait_for_active.call_args_list] == [
+        (mock_conn, "lb-1"),
+        (mock_conn, "lb-1"),
+        (mock_conn, "lb-1"),
+        (mock_conn, "lb-1"),
+        (mock_conn, "lb-1"),
+        (mock_conn, "lb-1"),
+    ]
+    mock_conn.load_balancer.find_listener.return_value = {"load_balancer_id": "lb-dict"}
+    assert octavia._listener_load_balancer_id(mock_conn, "listener-dict") == "lb-dict"
+    mock_conn.load_balancer.find_pool.return_value = {"load_balancer_id": "lb-direct"}
+    assert octavia._pool_load_balancer_id(mock_conn, "pool-direct") == "lb-direct"
+    mock_conn.load_balancer.find_pool.return_value = {"load_balancers": [{"id": "lb-list"}]}
+    assert octavia._pool_load_balancer_id(mock_conn, "pool-list") == "lb-list"
+
+
+def test_wait_for_load_balancer_fails_immediately_when_lb_disappears():
+    from openstack import exceptions as openstack_exceptions
+
+    from drover.services import octavia
+
+    mock_conn = MagicMock()
+    mock_conn.load_balancer.get_load_balancer.side_effect = openstack_exceptions.ResourceNotFound(
+        "missing"
+    )
+
+    with pytest.raises(RuntimeError, match="disappeared while waiting"):
+        octavia.wait_for_load_balancer(mock_conn, "lb-missing", wait=300)
+
+
 # ---------------------------------------------------------------------------
 # CreateK3sClusterRequest 모델 — allowed_cidrs 검증
 # ---------------------------------------------------------------------------
