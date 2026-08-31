@@ -1,8 +1,8 @@
 # Staging verification boundary
 
-The repository validates unit behavior locally. The `Staging Gate` workflow verifies a separately deployed live Drover service; it does not install or reconfigure Kolla from a GitHub-hosted runner. Live checks are intentionally gated behind `DROVER_INTEGRATION_CLOUD=1` and a GitHub `staging` environment:
+The repository validates unit behavior locally. The `Manual Live OpenStack Gate` workflow is `workflow_dispatch`-only and is excluded from push, pull-request, and post-CI automation. It verifies a separately deployed live Drover service; it does not install or reconfigure Kolla from a GitHub-hosted runner. Live checks require `DROVER_INTEGRATION_CLOUD=1` and the GitHub `staging` environment:
 
-- The triggering CI revision is checked out exactly, while concurrency prevents overlapping cluster lifecycles.
+- The manually requested revision is checked out exactly, while concurrency prevents overlapping cluster lifecycles.
 - Packaged Kolla assets are validated locally; the live `drover` Keystone catalog entry and public `/v1/health/live` endpoint prove the external deployment separately.
 - A dedicated project, network, subnet, image, flavor, volume availability zone, and external network must be configured for disposable tests.
 - Drover resource policies must be pinned to those staging resources, including the HA load-balancer subnet, and `k3s.version` must be configured.

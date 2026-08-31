@@ -74,10 +74,13 @@ def test_ci_workflow_structure():
 
 
 def test_staging_workflow_structure():
-    """Verify the live gate pins its revision and enforces isolated staging contracts."""
+    """Verify the manual live gate is isolated from automatic CI and fail-closed."""
     staging_file = WORKFLOWS_DIR / "staging.yml"
     assert staging_file.is_file()
-    staging = yaml.safe_load(staging_file.read_text(encoding="utf-8"))
+    workflow_source = staging_file.read_text(encoding="utf-8")
+    assert "workflow_dispatch:" in workflow_source
+    assert "workflow_run:" not in workflow_source
+    staging = yaml.safe_load(workflow_source)
 
     assert staging["concurrency"] == {
         "group": "drover-staging-gate",
@@ -88,8 +91,8 @@ def test_staging_workflow_structure():
     assert gate_job["timeout-minutes"] == 90
     steps = gate_job["steps"]
 
-    checkout_step = next(step for step in steps if step.get("name") == "Checkout verified revision")
-    assert checkout_step["with"]["ref"] == "${{ github.event.workflow_run.head_sha || github.sha }}"
+    checkout_step = next(step for step in steps if step.get("name") == "Checkout requested revision")
+    assert checkout_step["with"]["ref"] == "${{ github.sha }}"
 
     assertion_step = next(
         step for step in steps if "Assert required staging gate secrets" in step.get("name", "")
