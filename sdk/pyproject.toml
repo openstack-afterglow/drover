@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "drover-sdk"
-version = "0.2.14"
+version = "0.2.15"
 description = "OpenStack SDK extension for the Drover API"
 requires-python = ">=3.12"
 dependencies = [
