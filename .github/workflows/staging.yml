@@ -1,11 +1,7 @@
-name: Staging Gate
+name: Manual Live OpenStack Gate
 
 on:
   workflow_dispatch:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-    branches: [main, dev]
 
 permissions:
   contents: read
@@ -20,12 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
     timeout-minutes: 90
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') }}
     steps:
-      - name: Checkout verified revision
+      - name: Checkout requested revision
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
 
       - name: Setup Python and uv
         uses: astral-sh/setup-uv@v6
