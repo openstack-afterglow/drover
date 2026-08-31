@@ -220,12 +220,15 @@ async def test_handle_ha_joiner_adds_lb_member_and_triggers_agents():
         "api_lb_pool_id": "pool-xyz",
         "network_id": "net-abc",
         "server_ip": "10.0.0.5",
-        "node_token": "K10abc::server:xyz",
     }
 
     with (
         patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
         patch("drover.services.store.incr_ha_join_count", new=AsyncMock(return_value=2)),
+        patch(
+            "drover.services.store.get_cluster_node_token",
+            new=AsyncMock(return_value="K10abc::server:xyz"),
+        ) as get_node_token,
         patch("drover.services.keystone.get_admin_connection_for_project") as mock_conn,
         patch("drover.services.octavia.add_member") as mock_add,
         patch("drover.api.callback._jobs_svc.enqueue_job", new=AsyncMock()) as enqueue_job,
@@ -251,6 +254,7 @@ async def test_handle_ha_joiner_adds_lb_member_and_triggers_agents():
             kind="provision_agents",
             payload={"server_ip": "10.0.0.5", "node_token": "K10abc::server:xyz"},
         )
+        get_node_token.assert_awaited_once_with("proj1", "clus1")
 
 
 @pytest.mark.asyncio
@@ -460,6 +464,10 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
     with (
         patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
         patch("drover.services.store.incr_ha_join_count", new=AsyncMock(side_effect=[1, 2])),
+        patch(
+            "drover.services.store.get_cluster_node_token",
+            new=AsyncMock(return_value="K10node::token123"),
+        ),
         patch("drover.services.keystone.get_admin_connection_for_project", return_value=mock_conn),
         patch("drover.services.octavia.add_member", side_effect=[mock_mem2, mock_mem3]),
         patch("drover.services.operations.get_active_operation", new=AsyncMock(return_value=MagicMock(id=op_id))),

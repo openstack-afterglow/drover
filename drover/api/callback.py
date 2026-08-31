@@ -279,7 +279,7 @@ async def _handle_ha_joiner(
 
     if join_count >= master_count - 1:
         server_ip = cluster_info.get("server_ip") or ""
-        node_token = cluster_info.get("node_token") or ""
+        node_token = await k3s_cluster.get_cluster_node_token(project_id, cluster_id) or ""
         if server_ip and node_token:
             _logger.info("HA: all servers joined for cluster %s, queuing provision_agents job", cluster_id)
             active_op = await operations.get_active_operation(None, cluster_id, kind="create")

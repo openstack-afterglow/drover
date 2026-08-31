@@ -327,7 +327,7 @@ wheels = [
 
 [[package]]
 name = "drover"
-version = "0.2.13"
+version = "0.2.14"
 source = { editable = "." }
 dependencies = [
     { name = "afterglow-crypto" },
