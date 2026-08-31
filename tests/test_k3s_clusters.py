@@ -500,7 +500,10 @@ def test_octavia_listener_and_pool_wait_for_load_balancer_active():
 
     with patch.object(octavia, "wait_for_load_balancer") as wait_for_active:
         octavia.create_listener(mock_conn, "lb-1", "TCP", 6443, name="api-listener")
-        wait_for_active.assert_called_once_with(mock_conn, "lb-1")
+        assert [call.args for call in wait_for_active.call_args_list] == [
+            (mock_conn, "lb-1"),
+            (mock_conn, "lb-1"),
+        ]
 
     with patch.object(octavia, "wait_for_load_balancer") as wait_for_active:
         octavia.create_pool(
@@ -510,7 +513,10 @@ def test_octavia_listener_and_pool_wait_for_load_balancer_active():
             name="api-pool",
             listener_id="listener-1",
         )
-        wait_for_active.assert_called_once_with(mock_conn, "lb-1")
+        assert [call.args for call in wait_for_active.call_args_list] == [
+            (mock_conn, "lb-1"),
+            (mock_conn, "lb-1"),
+        ]
 
 
 def test_octavia_member_and_delete_mutations_wait_for_load_balancer_active():
@@ -561,12 +567,7 @@ def test_octavia_member_and_delete_mutations_wait_for_load_balancer_active():
         octavia.delete_listener(mock_conn, "listener-1")
     assert [call.args for call in wait_for_active.call_args_list] == [
         (mock_conn, "lb-1"),
-        (mock_conn, "lb-1"),
-        (mock_conn, "lb-1"),
-        (mock_conn, "lb-1"),
-        (mock_conn, "lb-1"),
-        (mock_conn, "lb-1"),
-    ]
+    ] * 12
     mock_conn.load_balancer.find_listener.return_value = {"load_balancer_id": "lb-dict"}
     assert octavia._listener_load_balancer_id(mock_conn, "listener-dict") == "lb-dict"
     mock_conn.load_balancer.find_pool.return_value = {"load_balancer_id": "lb-direct"}

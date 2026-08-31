@@ -225,6 +225,11 @@ def list_listeners(conn: openstack.connection.Connection, lb_id: str | None = No
     return [_listener_to_dict(listener) for listener in conn.load_balancer.listeners(**kwargs)]
 
 
+def _wait_for_parent_load_balancer(conn: openstack.connection.Connection, lb_id: str) -> None:
+    if lb_id:
+        wait_for_load_balancer(conn, lb_id)
+
+
 def create_listener(
     conn: openstack.connection.Connection,
     lb_id: str,
@@ -242,8 +247,9 @@ def create_listener(
         kwargs["name"] = name
     if default_pool_id:
         kwargs["default_pool_id"] = default_pool_id
+    _wait_for_parent_load_balancer(conn, lb_id)
     listener = conn.load_balancer.create_listener(**kwargs)
-    wait_for_load_balancer(conn, lb_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
     return _listener_to_dict(listener)
 
 
@@ -261,9 +267,9 @@ def _listener_load_balancer_id(conn: openstack.connection.Connection, listener_i
 
 def delete_listener(conn: openstack.connection.Connection, listener_id: str) -> None:
     lb_id = _listener_load_balancer_id(conn, listener_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
     conn.load_balancer.delete_listener(listener_id, ignore_missing=True)
-    if lb_id:
-        wait_for_load_balancer(conn, lb_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +301,9 @@ def create_pool(
         kwargs["name"] = name
     if listener_id:
         kwargs["listener_id"] = listener_id
+    _wait_for_parent_load_balancer(conn, lb_id)
     pool = conn.load_balancer.create_pool(**kwargs)
-    wait_for_load_balancer(conn, lb_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
     return _pool_to_dict(pool)
 
 
@@ -325,9 +332,9 @@ def _pool_load_balancer_id(conn: openstack.connection.Connection, pool_id: str) 
 
 def delete_pool(conn: openstack.connection.Connection, pool_id: str) -> None:
     lb_id = _pool_load_balancer_id(conn, pool_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
     conn.load_balancer.delete_pool(pool_id, ignore_missing=True)
-    if lb_id:
-        wait_for_load_balancer(conn, lb_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
 
 
 # ---------------------------------------------------------------------------
@@ -358,17 +365,17 @@ def add_member(
     if subnet_id:
         kwargs["subnet_id"] = subnet_id
     lb_id = _pool_load_balancer_id(conn, pool_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
     member = conn.load_balancer.create_member(pool_id, **kwargs)
-    if lb_id:
-        wait_for_load_balancer(conn, lb_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
     return _member_to_dict(member)
 
 
 def remove_member(conn: openstack.connection.Connection, pool_id: str, member_id: str) -> None:
     lb_id = _pool_load_balancer_id(conn, pool_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
     conn.load_balancer.delete_member(member_id, pool_id, ignore_missing=True)
-    if lb_id:
-        wait_for_load_balancer(conn, lb_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
 
 
 # ---------------------------------------------------------------------------
@@ -402,9 +409,9 @@ def create_health_monitor(
     if name:
         kwargs["name"] = name
     lb_id = _pool_load_balancer_id(conn, pool_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
     monitor = conn.load_balancer.create_health_monitor(**kwargs)
-    if lb_id:
-        wait_for_load_balancer(conn, lb_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
     return _hm_to_dict(monitor)
 
 
@@ -424,9 +431,9 @@ def _health_monitor_pool_id(conn: openstack.connection.Connection, hm_id: str) -
 def delete_health_monitor(conn: openstack.connection.Connection, hm_id: str) -> None:
     pool_id = _health_monitor_pool_id(conn, hm_id)
     lb_id = _pool_load_balancer_id(conn, pool_id) if pool_id else ""
+    _wait_for_parent_load_balancer(conn, lb_id)
     conn.load_balancer.delete_health_monitor(hm_id, ignore_missing=True)
-    if lb_id:
-        wait_for_load_balancer(conn, lb_id)
+    _wait_for_parent_load_balancer(conn, lb_id)
 
 
 # ---------------------------------------------------------------------------
