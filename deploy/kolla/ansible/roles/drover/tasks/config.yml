@@ -1,0 +1,103 @@
+---
+- name: Config | Resolve Drover service project ID
+  kolla_toolbox:
+    container_engine: "{{ kolla_container_engine }}"
+    module_name: openstack.cloud.project_info
+    module_args:
+      auth: "{{ openstack_auth }}"
+      name: "{{ drover_service_project_name }}"
+  register: drover_service_project_lookup
+  changed_when: false
+  no_log: true
+  when:
+    - inventory_hostname in groups['drover']
+    - drover_service_project_id | default('') | length == 0
+
+- name: Config | Set resolved Drover service project ID
+  ansible.builtin.set_fact:
+    drover_service_project_id: "{{ drover_service_project_lookup.projects[0].id }}"
+  when:
+    - inventory_hostname in groups['drover']
+    - drover_service_project_id | default('') | length == 0
+    - drover_service_project_lookup.projects | default([]) | length == 1
+
+- name: Config | Require exactly one Drover service project
+  ansible.builtin.assert:
+    that:
+      - drover_service_project_id | default('') | length > 0
+    fail_msg: "Drover service project '{{ drover_service_project_name }}' must exist before configuration rendering"
+  when: inventory_hostname in groups['drover']
+
+- name: Config | Ensure Drover config directory exists
+  become: true
+  ansible.builtin.file:
+    path: "{{ drover_config_dir }}"
+    state: directory
+    mode: "0750"
+    owner: root
+    group: root
+  when: inventory_hostname in groups['drover']
+
+- name: Config | Ensure Drover secrets directory exists
+  become: true
+  ansible.builtin.file:
+    path: "{{ drover_secrets_dir }}"
+    state: directory
+    mode: "0750"
+    owner: root
+    group: root
+  when: inventory_hostname in groups['drover']
+
+- name: Config | Render Drover OS password secret file
+  become: true
+  ansible.builtin.copy:
+    content: "{{ drover_keystone_password }}"
+    dest: "{{ drover_secrets_dir }}/os_password"
+    mode: "0640"
+    owner: root
+    group: root
+  no_log: true
+  when: inventory_hostname in groups['drover']
+
+- name: Config | Render Drover database password secret file
+  become: true
+  ansible.builtin.copy:
+    content: "{{ drover_database_password }}"
+    dest: "{{ drover_secrets_dir }}/database_password"
+    mode: "0640"
+    owner: root
+    group: root
+  no_log: true
+  when: inventory_hostname in groups['drover']
+
+- name: Config | Render Drover redis password secret file
+  become: true
+  ansible.builtin.copy:
+    content: "{{ drover_valkey_password }}"
+    dest: "{{ drover_secrets_dir }}/redis_password"
+    mode: "0640"
+    owner: root
+    group: root
+  no_log: true
+  when: inventory_hostname in groups['drover']
+
+- name: Config | Render Drover kubeconfig encryption key secret file
+  become: true
+  ansible.builtin.copy:
+    content: "{{ drover_kubeconfig_encryption_key }}"
+    dest: "{{ drover_secrets_dir }}/kubeconfig_encryption_key"
+    mode: "0640"
+    owner: root
+    group: root
+  no_log: true
+  when: inventory_hostname in groups['drover']
+
+- name: Config | Render drover.conf
+  become: true
+  ansible.builtin.template:
+    src: drover.conf.j2
+    dest: "{{ drover_config_dir }}/drover.conf"
+    mode: "0640"
+    owner: root
+    group: root
+  when: inventory_hostname in groups['drover']

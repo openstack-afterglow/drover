@@ -1,0 +1,31 @@
+---
+- name: DB | Create Drover database
+  kolla_toolbox:
+    container_engine: "{{ kolla_container_engine }}"
+    module_name: mysql_db
+    module_args:
+      login_host: "{{ drover_database_address }}"
+      login_port: "{{ drover_database_port }}"
+      login_user: "{{ drover_database_admin_user }}"
+      login_password: "{{ drover_database_admin_password }}"
+      name: "{{ drover_database_name }}"
+  run_once: true
+  delegate_to: "{{ groups['drover'][0] }}"
+
+- name: DB | Create Drover database user
+  kolla_toolbox:
+    container_engine: "{{ kolla_container_engine }}"
+    module_name: mysql_user
+    module_args:
+      login_host: "{{ drover_database_address }}"
+      login_port: "{{ drover_database_port }}"
+      login_user: "{{ drover_database_admin_user }}"
+      login_password: "{{ drover_database_admin_password }}"
+      name: "{{ drover_database_user }}"
+      password: "{{ drover_database_password }}"
+      host: "%"
+      priv: "{{ drover_database_name }}.*:ALL"
+      state: present
+  run_once: true
+  delegate_to: "{{ groups['drover'][0] }}"
+  no_log: true

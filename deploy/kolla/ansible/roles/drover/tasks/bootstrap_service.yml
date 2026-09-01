@@ -1,0 +1,31 @@
+---
+- name: Bootstrap | Pull Drover API image for migration
+  become: true
+  community.docker.docker_image:
+    name: "{{ drover_api_image_ref }}"
+    source: pull
+    force_source: "{{ drover_image_tag == 'latest' }}"
+  run_once: true
+  delegate_to: "{{ groups['drover'] | first }}"
+  when: not (drover_source_mode | default(false) | bool)
+
+- name: Bootstrap | Apply Drover database migrations
+  become: true
+  community.docker.docker_container:
+    name: drover_bootstrap
+    image: "{{ drover_api_image_ref }}"
+    command: ["python", "-m", "drover.scripts.migrate", "--apply"]
+    state: started
+    detach: false
+    cleanup: true
+    network_mode: host
+    volumes:
+      - "{{ drover_config_dir }}/drover.conf:/app/drover.conf:ro"
+      - "{{ drover_secrets_dir }}:{{ drover_container_secrets_dir }}:ro"
+    env:
+      DATABASE_URL: "{{ drover_database_url }}"
+      REDIS_URL: "{{ drover_redis_url }}"
+  no_log: true
+  register: drover_bootstrap_result
+  run_once: true
+  delegate_to: "{{ groups['drover'] | first }}"
