@@ -71,26 +71,25 @@ def test_validate_config_with_file_backed_credentials(tmp_path):
 
 
 def test_kolla_drover_conf_renders_only_secret_paths():
-    kolla_template_path = Path(__file__).parents[1] / "deploy" / "kolla" / "templates" / "drover.conf.j2"
+    kolla_template_path = Path(__file__).parents[1] / "deploy" / "kolla" / "ansible" / "roles" / "drover" / "templates" / "drover.conf.j2"
     template_text = kolla_template_path.read_text()
 
     env = jinja2.Environment(undefined=jinja2.StrictUndefined)
+    env.filters["bool"] = bool
     template = env.from_string(template_text)
 
     rendered = template.render(
-        ansible_hostname="test-host",
         drover_keystone_auth_url="http://127.0.0.1:5000/v3",
-        drover_keystone_username="drover",
+        drover_keystone_user="drover",
         drover_keystone_password_file="/etc/drover/secrets/os_password",
-        drover_keystone_project_name="service",
+        drover_service_project_name="drover-service",
+        drover_service_project_id="test-proj-id-123",
         drover_keystone_project_domain_name="Default",
         drover_keystone_user_domain_name="Default",
-        drover_keystone_region="RegionOne",
+        drover_keystone_region_name="RegionOne",
         drover_keystone_interface="internal",
-        drover_keystone_insecure=False,
-        drover_openstack_cacert="",
-        drover_service_project_id="",
-        drover_admin_legacy_project_policy=False,
+        openstack_insecure=False,
+        openstack_cacert="",
         drover_database_url="mysql+aiomysql://drover@127.0.0.1:3306/drover",
         drover_database_password_file="/etc/drover/secrets/database_password",
         drover_database_pool_size=5,
@@ -103,23 +102,50 @@ def test_kolla_drover_conf_renders_only_secret_paths():
         drover_kubeconfig_encryption_key_file="/etc/drover/secrets/kubeconfig_encryption_key",
         drover_boot_volume_size_gb=30,
         drover_occm_enabled=True,
+        drover_occm_image="registry.k8s.io/provider-os/openstack-cloud-controller-manager:v1.34.1",
         drover_cinder_csi_enabled=True,
+        drover_cinder_csi_image="registry.k8s.io/provider-os/cinder-csi-plugin:v1.34.1",
         drover_manila_csi_enabled=False,
-        drover_k3s_health_interval=180,
-        drover_callback_allowed_cidrs=[],
+        drover_manila_csi_image="registry.k8s.io/provider-os/manila-csi-plugin:v1.34.1",
+        drover_manila_csi_nfs_image="registry.k8s.io/sig-storage/nfsplugin:v4.9.0",
+        drover_manila_csi_share_protocol="NFS",
+        drover_keystone_auth_enabled=False,
+        drover_keystone_auth_image="registry.k8s.io/provider-os/k8s-keystone-auth:v1.34.1",
+        drover_keystone_auth_policy="",
+        drover_octavia_ingress_enabled=False,
+        drover_octavia_ingress_image="registry.k8s.io/provider-os/octavia-ingress-controller:v1.34.1",
+        drover_barbican_kms_enabled=False,
+        drover_barbican_kms_image="registry.k8s.io/provider-os/barbican-kms-plugin:v1.34.1",
+        drover_barbican_kms_kek_id="",
+        drover_cert_rotation_node_timeout_sec=300,
+        drover_cert_rotation_job_image="registry.k8s.io/util-linux/util-linux:latest",
+        drover_stampede_enabled=False,
+        drover_stampede_interval=60,
+        drover_stampede_scale_down_threshold=0.5,
+        drover_stampede_scale_down_window=600,
+        drover_stampede_scale_up_cooldown=120,
+        drover_stampede_scale_down_cooldown=300,
+        drover_stampede_resource_headroom_factor=0.3,
     )
 
     assert 'password_file = "/etc/drover/secrets/os_password"' in rendered
+    assert 'password_file = "/etc/drover/secrets/database_password"' in rendered
+    assert 'password_file = "/etc/drover/secrets/redis_password"' in rendered
     assert 'kubeconfig_encryption_key_file = "/etc/drover/secrets/kubeconfig_encryption_key"' in rendered
     assert "password =" not in rendered
     assert "kubeconfig_encryption_key =" not in rendered
 
 
-def test_kolla_tasks_use_mode_0600_for_secrets():
-    tasks_path = Path(__file__).parents[1] / "deploy" / "kolla" / "tasks" / "config.yml"
-    tasks_text = tasks_path.read_text()
+def test_kolla_secret_files_are_root_group_readable_for_non_root_container():
+    role_root = Path(__file__).parents[1] / "deploy" / "kolla" / "ansible" / "roles" / "drover"
+    tasks_text = (role_root / "tasks" / "config.yml").read_text()
+    dockerfile_text = (Path(__file__).parents[1] / "Dockerfile").read_text()
 
-    assert "mode: \"0600\"" in tasks_text or "mode: '0600'" in tasks_text
+    assert 'mode: "0750"' in tasks_text
+    assert tasks_text.count('mode: "0640"') >= 4
+    assert "owner: root" in tasks_text and "group: root" in tasks_text
+    assert "no_log: true" in tasks_text
+    assert "adduser appuser root" in dockerfile_text
 
 
 def test_cloudinit_cloud_conf_file_mode_0600():

@@ -142,3 +142,60 @@ def test_pyproject_script_entrypoints():
     assert scripts.get("drover-api") == "drover.main:run"
     assert scripts.get("drover-worker") == "drover.worker:main"
     assert scripts.get("drover-migrate") == "drover.scripts.migrate:main"
+
+
+def test_release_workflow_structure():
+    """Verify GitHub Release workflow structure, tag trigger, permissions, and wheel verification."""
+    release_file = WORKFLOWS_DIR / "release.yml"
+    assert release_file.is_file(), "release.yml must exist in .github/workflows/"
+
+    workflow_source = release_file.read_text(encoding="utf-8")
+    release_data = yaml.safe_load(workflow_source)
+
+    # Must trigger on v* tags only
+    triggers = release_data.get("on", release_data.get(True, {}))
+    assert "push" in triggers, "release workflow must trigger on push"
+    push_tags = triggers["push"].get("tags", [])
+    assert any("v*" in tag or "v" in tag for tag in push_tags), "release workflow must trigger on v* tags"
+    assert "pull_request" not in triggers, "release workflow must not trigger on pull_request"
+
+    # Must enforce least privilege permissions
+    top_permissions = release_data.get("permissions", {})
+    assert top_permissions.get("contents") == "read", "Top-level permissions must be read-only"
+
+    jobs = release_data.get("jobs", {})
+    assert "release" in jobs or "build-and-release" in jobs, "Missing release job"
+    release_job = jobs.get("release") or jobs.get("build-and-release")
+
+    job_permissions = release_job.get("permissions", {})
+    assert job_permissions.get("contents") == "write", "Release job must have write permissions for GitHub Release"
+
+    steps = release_job.get("steps", [])
+
+    # Check lockstep step
+    lockstep_step = next((s for s in steps if "lockstep" in s.get("name", "").lower() or "lockstep" in s.get("run", "").lower()), None)
+    assert lockstep_step is not None, "Missing tag and version lockstep check step"
+
+    # Check wheel build step
+    build_step = next((s for s in steps if "deploy/kolla" in s.get("run", "")), None)
+    assert build_step is not None, "Missing deploy/kolla wheel build step"
+
+    # Check clean venv test & uninstall step
+    venv_step = next((s for s in steps if "kolla-ansible" in s.get("run", "") and "venv" in s.get("run", "")), None)
+    assert venv_step is not None, "Missing clean venv installation & verification step"
+    venv_run = venv_step["run"]
+    assert "share/kolla-ansible/ansible/roles/drover" in venv_run
+    assert "pip uninstall" in venv_run
+
+    # Check upload artifact step
+    upload_step = next((s for s in steps if "upload-artifact" in s.get("uses", "")), None)
+    assert upload_step is not None, "Missing upload-artifact step"
+    assert "deploy/kolla/dist" in upload_step["with"]["path"] or "*.whl" in upload_step["with"]["path"]
+
+    # Check softprops/action-gh-release step
+    gh_release_step = next((s for s in steps if "action-gh-release" in s.get("uses", "")), None)
+    assert gh_release_step is not None, "Missing action-gh-release step"
+    assert gh_release_step["with"]["files"] == "deploy/kolla/dist/*.whl"
+
+    # Must not publish to PyPI
+    assert "pypa/gh-action-pypi-publish" not in workflow_source

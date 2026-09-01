@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "drover-kolla"
+dynamic = ["version"]
+description = "Kolla Ansible role package for Drover"
+requires-python = ">=3.12"
+dependencies = [
+    "kolla-ansible>=21,<22",
+]
+
+[tool.hatch.version]
+path = "../../drover/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/drover_kolla"]
+
+[tool.hatch.build.targets.wheel.shared-data]
+"ansible/roles/drover" = "share/kolla-ansible/ansible/roles/drover"

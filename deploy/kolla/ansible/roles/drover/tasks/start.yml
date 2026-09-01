@@ -1,0 +1,31 @@
+---
+- name: Start | Stat Drover config file
+  become: true
+  ansible.builtin.stat:
+    path: "{{ drover_config_dir }}/drover.conf"
+  register: drover_config_stat
+  when: inventory_hostname in groups['drover']
+
+- name: Start | Start Drover containers
+  become: true
+  community.docker.docker_container:
+    name: "{{ item.value.container_name }}"
+    image: "{{ item.value.image }}"
+    pull: "{{ 'never' if (drover_source_mode | default(false) | bool) else 'always' }}"
+    state: started
+    restart_policy: "{{ item.value.restart_policy | default('unless-stopped') }}"
+    volumes: "{{ item.value.volumes | default([]) }}"
+    env: "{{ drover_service_environments.get(item.key, {}) }}"
+    command: "{{ item.value.command | default(omit) }}"
+    healthcheck: "{{ item.value.healthcheck | default(omit) }}"
+    ports: "{{ item.value.ports | default([]) }}"
+    network_mode: "{{ item.value.network_mode | default(omit) }}"
+    labels:
+      kolla_version: "2025.2"
+      service: drover
+      config_hash: "{{ drover_config_stat.stat.checksum | default('') }}"
+  no_log: true
+  loop: "{{ drover_services | dict2items }}"
+  when:
+    - inventory_hostname in groups['drover']
+    - item.value.enabled | bool

@@ -1,0 +1,64 @@
+---
+- name: Precheck | Verify enable_drover is set
+  ansible.builtin.assert:
+    that:
+      - enable_drover is defined
+    fail_msg: "enable_drover must be set in globals.yml"
+  run_once: true
+  tags: precheck
+
+- name: Precheck | Verify stock Kolla Valkey dependency
+  ansible.builtin.assert:
+    that:
+      - enable_valkey | default(false) | bool
+      - groups.get('valkey', []) | length > 0
+      - valkey_master_password is defined and valkey_master_password | length > 0
+    fail_msg: "Deploy stock Kolla Valkey before enabling drover; no plugin Redis fallback exists"
+  run_once: true
+  tags: precheck
+  when: enable_drover | default(false) | bool
+
+- name: Precheck | Check required Drover secrets
+  ansible.builtin.assert:
+    that:
+      - drover_database_password is defined and drover_database_password | length > 0
+      - drover_keystone_password is defined and drover_keystone_password | length > 0
+      - drover_kubeconfig_encryption_key is defined and drover_kubeconfig_encryption_key | length == 64
+      - drover_kubeconfig_encryption_key == afterglow_kubeconfig_encryption_key
+    fail_msg: "Drover DB/Keystone secrets must be set, and its encryption key must equal afterglow_kubeconfig_encryption_key during cutover"
+  tags: precheck
+  when: enable_drover | bool
+
+- name: Precheck | Validate Drover public route hostname
+  ansible.builtin.assert:
+    that:
+      - drover_public_haproxy_fqdn is match('^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$')
+      - (drover_public_endpoint_url | regex_replace('/$', '')) == ('https://' ~ drover_public_haproxy_fqdn)
+    fail_msg: "drover_public_endpoint_url must be the HTTPS origin for drover_public_haproxy_fqdn"
+  run_once: true
+  tags: precheck
+  when:
+    - enable_drover | bool
+    - drover_public_haproxy_enabled | bool
+
+- name: Precheck | Verify Drover API image accessibility
+  become: true
+  ansible.builtin.command:
+    cmd: "docker manifest inspect {{ drover_api_image }}:{{ drover_image_tag }}"
+  register: drover_image_check
+  failed_when: false
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ groups['drover'] | first }}"
+  tags: precheck
+  when: enable_drover | bool
+
+- name: Precheck | Warn if Drover API image is inaccessible
+  ansible.builtin.debug:
+    msg: "WARNING: Cannot access {{ drover_api_image }}:{{ drover_image_tag }}. Ensure registry credentials are configured."
+  when:
+    - enable_drover | bool
+    - drover_image_check is defined
+    - drover_image_check.rc != 0
+  run_once: true
+  tags: precheck

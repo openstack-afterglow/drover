@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build & Release Drover Kolla Wheel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up uv & Python 3.12
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+
+      - name: Verify tag and version lockstep
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE_VERSION=$(python -c "import drover; print(drover.__version__)")
+          echo "Tag version: ${TAG_VERSION}"
+          echo "Package version: ${PACKAGE_VERSION}"
+          if [ "${TAG_VERSION}" != "${PACKAGE_VERSION}" ]; then
+            echo "Error: Tag version (${TAG_VERSION}) does not match package version (${PACKAGE_VERSION})"
+            exit 1
+          fi
+
+      - name: Build deploy/kolla wheel
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          cd deploy/kolla
+          uv build --wheel
+          EXPECTED_WHEEL="dist/drover_kolla-${TAG_VERSION}-py3-none-any.whl"
+          if [ ! -f "${EXPECTED_WHEEL}" ]; then
+            echo "Expected wheel ${EXPECTED_WHEEL} not found!"
+            ls -la dist/
+            exit 1
+          fi
+
+      - name: Install wheel into clean Python 3.12 venv and verify role path
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          WHEEL_PATH="$(pwd)/deploy/kolla/dist/drover_kolla-${TAG_VERSION}-py3-none-any.whl"
+
+          python3.12 -m venv /tmp/kolla-venv
+          /tmp/kolla-venv/bin/pip install --upgrade pip
+          /tmp/kolla-venv/bin/pip install "kolla-ansible>=21,<22" "${WHEEL_PATH}"
+
+          ROLE_DIR="/tmp/kolla-venv/share/kolla-ansible/ansible/roles/drover"
+          if [ ! -d "${ROLE_DIR}" ]; then
+            echo "Error: Installed role directory ${ROLE_DIR} not found!"
+            exit 1
+          fi
+          if [ ! -f "${ROLE_DIR}/tasks/main.yml" ]; then
+            echo "Error: Installed role tasks/main.yml not found!"
+            exit 1
+          fi
+
+          echo "Role installed successfully at ${ROLE_DIR}"
+
+          /tmp/kolla-venv/bin/pip uninstall -y drover-kolla
+          if /tmp/kolla-venv/bin/pip show drover-kolla > /dev/null 2>&1; then
+            echo "Error: Package drover-kolla still installed!"
+            exit 1
+          fi
+          if [ -f "${ROLE_DIR}/tasks/main.yml" ]; then
+            echo "Error: drover-kolla role files remain after uninstall!"
+            exit 1
+          fi
+          echo "Cleanly uninstalled drover-kolla"
+
+      - name: Upload drover-kolla wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: drover-kolla-wheel
+          path: deploy/kolla/dist/*.whl
+          if-no-files-found: error
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: deploy/kolla/dist/*.whl
+          generate_release_notes: true

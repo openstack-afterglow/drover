@@ -1,0 +1,23 @@
+---
+- name: HAProxy | Remove disabled Drover public route destination
+  become: true
+  ansible.builtin.file:
+    path: "{{ node_config_directory }}/haproxy/services.d/drover-public.cfg"
+    state: absent
+  when: not (drover_public_haproxy_enabled | bool)
+
+- name: HAProxy | Remove disabled Drover external frontend map
+  become: true
+  ansible.builtin.blockinfile:
+    path: "{{ node_config_directory }}/haproxy/external-frontend-map"
+    marker: "# {mark} drover-public"
+    state: absent
+  when: not (drover_public_haproxy_enabled | bool)
+
+- name: Configure loadbalancer for Drover
+  ansible.builtin.import_role:
+    name: loadbalancer-config
+  vars:
+    project_name: drover
+    project_services: "{{ drover_haproxy_services }}"
+  tags: always
