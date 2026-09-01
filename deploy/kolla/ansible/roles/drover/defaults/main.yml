@@ -2,13 +2,13 @@
 # Drover kolla role defaults
 
 drover_image_namespace: "ghcr.io/openstack-afterglow"
-drover_image_tag: "v0.2.17"
+drover_image_tag: "v0.2.18"
 drover_api_image: "{{ drover_image_namespace }}/drover-api"
 drover_worker_image: "{{ drover_image_namespace }}/drover-worker"
 
 drover_source_mode: "{{ enable_drover_source_build | default(enable_source_build | default(drover_dev_mode | default(false))) | bool }}"
 drover_source_repo: "https://github.com/openstack-afterglow/drover.git"
-drover_source_version: "8f32bdcb6778e40974d65146dfb31a6c998497d3"
+drover_source_version: "eadb4c1d45e33e02718a005bc8fd174212cf713d"
 drover_source_dir: "{{ drover_source_checkout_path | default('/opt/afterglow/src/drover') }}"
 drover_api_image_ref: "{{ 'afterglow-local/drover-api:' ~ (drover_source_version | truncate(12, True, '')) if (drover_source_mode | bool) else (drover_api_image ~ ':' ~ drover_image_tag) }}"
 drover_worker_image_ref: "{{ 'afterglow-local/drover-worker:' ~ (drover_source_version | truncate(12, True, '')) if (drover_source_mode | bool) else (drover_worker_image ~ ':' ~ drover_image_tag) }}"

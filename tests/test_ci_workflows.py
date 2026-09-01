@@ -171,6 +171,8 @@ def test_release_workflow_structure():
     assert job_permissions.get("contents") == "write", "Release job must have write permissions for GitHub Release"
 
     steps = release_job.get("steps", [])
+    setup_uv_step = next(step for step in steps if step.get("uses") == "astral-sh/setup-uv@v6")
+    assert setup_uv_step["with"]["python-version"] == "3.11"
 
     # Check lockstep step
     lockstep_step = next((s for s in steps if "lockstep" in s.get("name", "").lower() or "lockstep" in s.get("run", "").lower()), None)
@@ -186,6 +188,7 @@ def test_release_workflow_structure():
     venv_run = venv_step["run"]
     assert "share/kolla-ansible/ansible/roles/drover" in venv_run
     assert "pip uninstall" in venv_run
+    assert "python3.11 -m venv" in venv_run
 
     # Check upload artifact step
     upload_step = next((s for s in steps if "upload-artifact" in s.get("uses", "")), None)

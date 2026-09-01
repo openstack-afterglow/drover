@@ -4,7 +4,7 @@ import os
 
 from drover_sdk.service import DroverService
 
-__version__ = "0.2.17"
+__version__ = "0.2.18"
 
 
 def register(conn):
