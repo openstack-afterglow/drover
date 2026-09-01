@@ -96,7 +96,7 @@ def test_defaults_variable_interface():
     # Image namespace and tags
     assert defaults["drover_image_namespace"] == "ghcr.io/openstack-afterglow"
     assert defaults["drover_image_tag"] == f"v{drover.__version__}"
-    assert defaults["drover_source_version"] == "eadb4c1d45e33e02718a005bc8fd174212cf713d"
+    assert defaults["drover_source_version"] == "66d33447d0a6f8b1b2ba34f88b360a6bf9c28399"
 
     # Required service definitions
     assert "drover_services" in defaults

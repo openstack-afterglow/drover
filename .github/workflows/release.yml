@@ -52,9 +52,8 @@ jobs:
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           WHEEL_PATH="$(pwd)/deploy/kolla/dist/drover_kolla-${TAG_VERSION}-py3-none-any.whl"
 
-          python3.11 -m venv /tmp/kolla-venv
-          /tmp/kolla-venv/bin/pip install --upgrade pip
-          /tmp/kolla-venv/bin/pip install "kolla-ansible>=21,<22" "${WHEEL_PATH}"
+          uv venv --python 3.11 /tmp/kolla-venv
+          uv pip install --python /tmp/kolla-venv/bin/python "kolla-ansible>=21,<22" "${WHEEL_PATH}"
 
           ROLE_DIR="/tmp/kolla-venv/share/kolla-ansible/ansible/roles/drover"
           if [ ! -d "${ROLE_DIR}" ]; then
@@ -68,8 +67,8 @@ jobs:
 
           echo "Role installed successfully at ${ROLE_DIR}"
 
-          /tmp/kolla-venv/bin/pip uninstall -y drover-kolla
-          if /tmp/kolla-venv/bin/pip show drover-kolla > /dev/null 2>&1; then
+          uv pip uninstall --python /tmp/kolla-venv/bin/python drover-kolla
+          if uv pip show --python /tmp/kolla-venv/bin/python drover-kolla > /dev/null 2>&1; then
             echo "Error: Package drover-kolla still installed!"
             exit 1
           fi
