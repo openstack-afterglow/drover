@@ -2,7 +2,7 @@
 # Drover kolla role defaults
 
 drover_image_namespace: "ghcr.io/openstack-afterglow"
-drover_image_tag: "v0.2.17"
+drover_image_tag: "v0.2.18"
 drover_api_image: "{{ drover_image_namespace }}/drover-api"
 drover_worker_image: "{{ drover_image_namespace }}/drover-worker"
 

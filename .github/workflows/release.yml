@@ -18,10 +18,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Set up uv & Python 3.12
+      - name: Set up uv & Python 3.11
         uses: astral-sh/setup-uv@v6
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           enable-cache: true
 
       - name: Verify tag and version lockstep
@@ -47,12 +47,12 @@ jobs:
             exit 1
           fi
 
-      - name: Install wheel into clean Python 3.12 venv and verify role path
+      - name: Install wheel into clean Python 3.11 venv and verify role path
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           WHEEL_PATH="$(pwd)/deploy/kolla/dist/drover_kolla-${TAG_VERSION}-py3-none-any.whl"
 
-          python3.12 -m venv /tmp/kolla-venv
+          python3.11 -m venv /tmp/kolla-venv
           /tmp/kolla-venv/bin/pip install --upgrade pip
           /tmp/kolla-venv/bin/pip install "kolla-ansible>=21,<22" "${WHEEL_PATH}"
 

@@ -166,9 +166,10 @@ def test_version_lockstep():
     # Wheel pyproject metadata check
     pyproject_file = KOLLA_DIR / "pyproject.toml"
     assert pyproject_file.is_file()
-    pyproject_content = pyproject_file.read_text(encoding="utf-8")
-    assert 'name = "drover-kolla"' in pyproject_content
-    assert 'path = "../../drover/__init__.py"' in pyproject_content
+    kolla_project = tomllib.loads(pyproject_file.read_text(encoding="utf-8"))
+    assert kolla_project["project"]["name"] == "drover-kolla"
+    assert kolla_project["project"]["requires-python"] == ">=3.11"
+    assert kolla_project["tool"]["hatch"]["version"]["path"] == "../../drover/__init__.py"
 
 
 def test_action_dispatch_and_ordering():
@@ -382,6 +383,11 @@ def test_drover_kolla_wheel_packaging_lifecycle(tmp_path):
         assert any(member.endswith("tasks/main.yml") for member in role_files_in_zip)
         assert any(member.endswith("tasks/preconditions_keystone.yml") for member in role_files_in_zip)
         assert any(member.endswith("templates/drover.conf.j2") for member in role_files_in_zip)
+
+        metadata_members = [name for name in namelist if name.endswith(".dist-info/METADATA")]
+        assert len(metadata_members) == 1
+        metadata_content = zf.read(metadata_members[0]).decode("utf-8")
+        assert "Requires-Python: >=3.11" in metadata_content
 
         # Inspect RECORD file
         record_members = [name for name in namelist if name.endswith("RECORD")]

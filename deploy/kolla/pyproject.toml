@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "drover-kolla"
 dynamic = ["version"]
 description = "Kolla Ansible role package for Drover"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "kolla-ansible>=21,<22",
 ]
