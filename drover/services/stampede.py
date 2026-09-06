@@ -8,7 +8,9 @@ ACTIVE + stampede_enabled 클러스터의 각 노드그룹을 순회하며:
 
 import asyncio
 import logging
+import re
 import time
+import uuid
 
 from drover.config import get_settings
 
@@ -222,6 +224,11 @@ def _select_flavor(
     return min(candidates, key=lambda f: (f.get("vcpus_m", 0), f.get("ram_bytes", 0)))
 
 
+_NON_GPU_PCI_ALIAS_TOKENS = frozenset(
+    {"audio", "crypto", "fpga", "infiniband", "network", "nic", "nvme", "qat", "rdma", "sriov"}
+)
+
+
 def _flavor_gpu_count(extra_specs: dict) -> int:
     raw = extra_specs.get("gpu_count")
     if raw is not None:
@@ -232,15 +239,24 @@ def _flavor_gpu_count(extra_specs: dict) -> int:
     alias = extra_specs.get("pci_passthrough:alias", "")
     total = 0
     for entry in str(alias).split(","):
-        if ":" not in entry:
+        entry = entry.strip()
+        if not entry:
             continue
-        gpu_alias, _, count = entry.strip().rpartition(":")
-        if "audio" in gpu_alias.lower():
+        if ":" in entry:
+            gpu_alias, _, count_text = entry.rpartition(":")
+            try:
+                count = int(count_text.strip())
+                if count <= 0:
+                    count = 1
+            except ValueError:
+                count = 1
+        else:
+            gpu_alias = entry
+            count = 1
+        alias_tokens = {token for token in re.split(r"[^a-z0-9]+", gpu_alias.lower()) if token}
+        if alias_tokens & _NON_GPU_PCI_ALIAS_TOKENS:
             continue
-        try:
-            total += int(count)
-        except ValueError:
-            total += 1
+        total += count
     return total
 
 
@@ -403,35 +419,6 @@ async def _get_available_flavors(project_id: str) -> list[dict]:
         return []
 
 
-async def _check_gpu_quota_for_nodes(project_id: str, flavor: dict, add_count: int) -> tuple[bool, str]:
-    if flavor.get("gpu", 0) <= 0:
-        return True, ""
-    from drover.services import gpu_quota, keystone
-
-    try:
-        conn = keystone.get_admin_connection_for_project(project_id)
-        base_specs = dict(flavor.get("extra_specs") or {})
-        alias_counts = gpu_quota._parse_alias_counts(base_specs)
-        if not alias_counts:
-            return False, "gpu flavor is missing pci_passthrough:alias for quota accounting"
-        requested: dict[str, int] = {}
-        for alias, count in alias_counts.items():
-            canonical = gpu_quota.normalize_gpu_alias(alias)
-            requested[canonical] = requested.get(canonical, 0) + count * add_count
-        effective = await gpu_quota.get_effective_gpu_quotas(project_id)
-        usage = await gpu_quota.get_project_gpu_usage(conn, project_id)
-        for alias, count in requested.items():
-            limit = effective.get(alias, 0)
-            if limit == -1:
-                continue
-            current = usage.get(alias, 0)
-            if current + count > limit:
-                return False, f"{alias}: current={current}, requested={count}, quota={limit}"
-        return True, ""
-    except Exception as e:
-        return False, f"gpu quota check failed: {e}"
-
-
 async def _update_stampede_state(nodegroup_id: str, cluster_id: str, updates: dict) -> None:
     """nodegroup.stampede_state 를 원자적으로 갱신 (merge patch)."""
     from drover.services import nodegroup as k3s_nodegroup
@@ -475,9 +462,7 @@ async def _scale_up_nodegroup(
     cooldown = s.drover_stampede_scale_up_cooldown
     if time.time() - last_up < cooldown:
         rem = cooldown - (time.time() - last_up)
-        _logger.debug(
-            "stampede: nodegroup %s scale-up 쿨다운 중 (%.0fs 남음)", ng_id, rem
-        )
+        _logger.debug("stampede: nodegroup %s scale-up 쿨다운 중 (%.0fs 남음)", ng_id, rem)
         await _record_stampede_event(
             project_id=project_id,
             cluster_id=cluster_id,
@@ -572,24 +557,28 @@ async def _scale_up_nodegroup(
             },
         )
 
-    if flavor.get("gpu", 0) > 0:
-        quota_ok, quota_reason = await _check_gpu_quota_for_nodes(project_id, flavor, add_count)
-        if not quota_ok:
-            await _record_stampede_event(
-                project_id=project_id,
-                cluster_id=cluster_id,
-                nodegroup_id=ng_id,
-                action="blocked",
-                status="skipped",
-                extra={
-                    "reason": "gpu_quota",
-                    "message": quota_reason,
-                    "add_count": add_count,
-                    "flavor_id": flavor["id"],
-                },
-            )
-            await _update_stampede_state(ng_id, cluster_id, {"last_blocked_reason": "gpu_quota"})
-            return
+    from drover.services import afterglow as afterglow_service
+
+    gpu_required, blocked_reason = await afterglow_service.check_gpu_admission(
+        project_id=project_id,
+        flavor_id=flavor["id"],
+        settings=s,
+    )
+    if blocked_reason:
+        await _record_stampede_event(
+            project_id=project_id,
+            cluster_id=cluster_id,
+            nodegroup_id=ng_id,
+            action="blocked",
+            status="skipped",
+            extra={
+                "reason": blocked_reason,
+                "flavor_id": flavor["id"],
+                "add_count": add_count,
+            },
+        )
+        await _update_stampede_state(ng_id, cluster_id, {"last_blocked_reason": blocked_reason})
+        return
 
     _logger.info(
         "stampede: nodegroup %s scale-up %d개 (flavor=%s, unresolvable_pods=%d, in_flight=%d)",
@@ -632,11 +621,11 @@ async def _scale_up_nodegroup(
             "flavor_name": flavor.get("name", ""),
             "triggering_metric": "pending_pods",
             "pending_pod_count": len(unresolvable_pods),
+            "gpu_required": gpu_required,
         },
     )
 
-    # Persist before returning: the worker, not this API/reconcile process,
-    # owns VM provisioning and can reclaim a crashed lease.
+    provisioning_key_prefix = f"stampede-{cluster_id}-{ng_id}-{uuid.uuid4().hex}"
     from drover.services.jobs import enqueue_job
 
     await enqueue_job(
@@ -650,7 +639,8 @@ async def _scale_up_nodegroup(
             "image_id": nodegroup.get("image_id"),
             "labels": nodegroup.get("labels"),
             "taints": nodegroup.get("taints"),
-            "gpu_required": flavor.get("gpu", 0) > 0,
+            "gpu_required": gpu_required,
+            "provisioning_key_prefix": provisioning_key_prefix,
         },
         user_id="stampede-system",
         username="Stampede",
@@ -667,6 +657,7 @@ async def _provision_and_track(
     labels: dict | None,
     taints: list | None,
     gpu_required: bool = False,
+    provisioning_key_prefix: str | None = None,
     operation_id: str | None = None,
     triggering_metric: str | dict | None = None,
 ) -> None:
@@ -686,7 +677,11 @@ async def _provision_and_track(
             image_id=image_id,
             labels=labels,
             taints=taints,
+            provisioning_key_prefix=provisioning_key_prefix,
         )
+    except k3s_autoscale.ProvisioningInProgress:
+        _logger.info("stampede: nodegroup %s provisioning intent remains in progress", nodegroup_id)
+        raise
     except Exception:
         _logger.exception("stampede: nodegroup %s provisioning failed", nodegroup_id)
         new_vms = []

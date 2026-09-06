@@ -101,7 +101,6 @@ async def test_scale_dispatch_uses_persisted_desired_count(monkeypatch):
     scale.assert_awaited_once_with("project-1", "cluster-1", 7)
 
 
-
 async def test_stampede_provision_dispatches_tracked_worker_operation(monkeypatch):
     tracked = AsyncMock()
     monkeypatch.setattr("drover.services.stampede._provision_and_track", tracked)
@@ -131,7 +130,9 @@ async def test_stampede_provision_dispatches_tracked_worker_operation(monkeypatc
         labels={"gpu": "true"},
         taints=[],
         gpu_required=True,
+        provisioning_key_prefix=None,
     )
+
 
 async def test_old_worker_cannot_complete_reclaimed_attempt(monkeypatch):
     job = SimpleNamespace(status="running", attempts=2, claimed_at=object(), last_error=None, updated_at=None)
@@ -140,7 +141,6 @@ async def test_old_worker_cannot_complete_reclaimed_attempt(monkeypatch):
 
     assert await jobs._complete("job-1", attempt=1) is False
     assert job.status == "running"
-
 
 
 async def test_lease_renewal_is_fenced_to_the_claimed_attempt(monkeypatch):
@@ -153,6 +153,7 @@ async def test_lease_renewal_is_fenced_to_the_claimed_attempt(monkeypatch):
     assert await jobs._renew_lease("job-1", attempt=2) is True
     assert job.claimed_at is not None
 
+
 async def test_second_failure_requeues_job(monkeypatch):
     job = SimpleNamespace(status="running", attempts=2, claimed_at=object(), last_error=None, updated_at=None)
     session = _Session(objects={(DroverJob, "job-1"): job})
@@ -162,6 +163,25 @@ async def test_second_failure_requeues_job(monkeypatch):
     assert job.status == "queued"
     assert job.last_error == "Nova unavailable"
     assert job.claimed_at is None
+
+
+async def test_in_progress_intent_keeps_lease_without_consuming_retry(monkeypatch):
+    job = SimpleNamespace(
+        status="running",
+        attempts=2,
+        claimed_at=object(),
+        last_error=None,
+        updated_at=None,
+        operation_id=None,
+    )
+    session = _Session(objects={(DroverJob, "job-1"): job})
+    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+
+    assert await jobs._defer_in_progress("job-1", attempt=2) is True
+    assert job.status == "running"
+    assert job.attempts == 1
+    assert job.claimed_at is not None
+    assert job.last_error == "Afterglow provisioning remains in progress"
 
 
 async def test_third_failure_terminalizes_job_and_cluster(monkeypatch):
@@ -175,7 +195,9 @@ async def test_third_failure_terminalizes_job_and_cluster(monkeypatch):
         last_error=None,
         updated_at=None,
     )
-    cluster = SimpleNamespace(project_id="project-1", deleted_at=None, status="SCALING", status_reason=None, updated_at=None)
+    cluster = SimpleNamespace(
+        project_id="project-1", deleted_at=None, status="SCALING", status_reason=None, updated_at=None
+    )
     session = _Session(objects={(DroverJob, "job-1"): job, (K3sCluster, "cluster-1"): cluster})
     monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
 
@@ -228,3 +250,26 @@ async def test_process_failure_is_requeued_with_claimed_attempt(monkeypatch):
 
     assert await jobs.process_one_job() is True
     retry.assert_awaited_once_with("job-1", attempt=2, error="capacity unavailable")
+
+
+async def test_process_defers_existing_afterglow_intent_without_failure_retry(monkeypatch):
+    from drover.services.autoscale import ProvisioningInProgress
+
+    defer = AsyncMock(return_value=True)
+    retry = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        jobs,
+        "_claim_one",
+        AsyncMock(return_value=("job-1", 2, "stampede_provision", "cluster-1", "project-1", {})),
+    )
+    monkeypatch.setattr(
+        jobs,
+        "_execute_job_direct",
+        AsyncMock(side_effect=ProvisioningInProgress("intent-1")),
+    )
+    monkeypatch.setattr(jobs, "_defer_in_progress", defer)
+    monkeypatch.setattr(jobs, "_retry_or_fail", retry)
+
+    assert await jobs.process_one_job() is True
+    defer.assert_awaited_once_with("job-1", attempt=2)
+    retry.assert_not_awaited()

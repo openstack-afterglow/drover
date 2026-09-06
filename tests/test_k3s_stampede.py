@@ -334,7 +334,6 @@ async def test_scale_up_gpu_pending_pod_ignores_cpu_only_free_capacity():
     s = MagicMock()
     s.drover_stampede_scale_up_cooldown = 0
 
-
     with (
         patch("drover.services.stampede._get_stampede_state", new=AsyncMock(return_value={})),
         patch(
@@ -343,7 +342,7 @@ async def test_scale_up_gpu_pending_pod_ignores_cpu_only_free_capacity():
                 return_value=[{"id": "gpu", "name": "gpu.large", "vcpus_m": 4000, "ram_bytes": 8 * 1024**3, "gpu": 1}]
             ),
         ),
-        patch("drover.services.stampede._check_gpu_quota_for_nodes", new=AsyncMock(return_value=(True, ""))),
+        patch("drover.services.afterglow.check_gpu_admission", new=AsyncMock(return_value=(True, None))),
         patch("drover.services.nodegroup.update_nodegroup", new=AsyncMock()) as update_nodegroup,
         patch("drover.services.stampede._update_stampede_state", new=AsyncMock()) as update_state,
         patch("drover.services.stampede._record_stampede_event", new=AsyncMock()) as record_event,
@@ -363,22 +362,24 @@ async def test_scale_up_gpu_pending_pod_ignores_cpu_only_free_capacity():
     assert any(call.args[2]["in_flight_count"] == 1 for call in update_state.await_args_list)
     assert record_event.await_args.kwargs["action"] == "scale_up"
     assert record_event.await_args.kwargs["status"] == "started"
-    enqueue_job.assert_awaited_once_with(
-        cluster_id="cl-1",
-        project_id="proj-1",
-        kind="stampede_provision",
-        payload={
-            "nodegroup_id": "gpu-ng",
-            "add_count": 1,
-            "flavor_id": "gpu",
-            "image_id": None,
-            "labels": {"env": "test"},
-            "taints": [],
-            "gpu_required": True,
-        },
-        user_id="stampede-system",
-        username="Stampede",
-    )
+    enqueue_job.assert_awaited_once()
+    enqueue_args = enqueue_job.await_args.kwargs
+    assert enqueue_args["cluster_id"] == "cl-1"
+    assert enqueue_args["project_id"] == "proj-1"
+    assert enqueue_args["kind"] == "stampede_provision"
+    assert enqueue_args["user_id"] == "stampede-system"
+    assert enqueue_args["username"] == "Stampede"
+    assert enqueue_args["payload"] == {
+        "nodegroup_id": "gpu-ng",
+        "add_count": 1,
+        "flavor_id": "gpu",
+        "image_id": None,
+        "labels": {"env": "test"},
+        "taints": [],
+        "gpu_required": True,
+        "provisioning_key_prefix": enqueue_args["payload"]["provisioning_key_prefix"],
+    }
+    assert enqueue_args["payload"]["provisioning_key_prefix"].startswith("stampede-cl-1-gpu-ng-")
 
 
 @pytest.mark.asyncio
@@ -411,7 +412,6 @@ async def test_scale_up_caps_binpacked_nodes_by_in_flight_capacity():
     s = MagicMock()
     s.drover_stampede_scale_up_cooldown = 0
 
-
     with (
         patch(
             "drover.services.stampede._get_stampede_state",
@@ -423,6 +423,7 @@ async def test_scale_up_caps_binpacked_nodes_by_in_flight_capacity():
                 return_value=[{"id": "small", "name": "cpu.small", "vcpus_m": 2000, "ram_bytes": 2 * 1024**3, "gpu": 0}]
             ),
         ),
+        patch("drover.services.afterglow.check_gpu_admission", new=AsyncMock(return_value=(False, None))),
         patch("drover.services.nodegroup.update_nodegroup", new=AsyncMock()) as update_nodegroup,
         patch("drover.services.stampede._update_stampede_state", new=AsyncMock()) as update_state,
         patch("drover.services.stampede._record_stampede_event", new=AsyncMock()) as record_event,
@@ -447,80 +448,27 @@ async def test_scale_up_caps_binpacked_nodes_by_in_flight_capacity():
     assert started_event["action"] == "scale_up"
     assert started_event["status"] == "started"
     assert any(call.args[2]["in_flight_count"] == 2 for call in update_state.await_args_list)
-    enqueue_job.assert_awaited_once_with(
-        cluster_id="cl-1",
-        project_id="proj-1",
-        kind="stampede_provision",
-        payload={
-            "nodegroup_id": "cpu-ng",
-            "add_count": 1,
-            "flavor_id": "small",
-            "image_id": None,
-            "labels": {"env": "test"},
-            "taints": [],
-            "gpu_required": False,
-        },
-        user_id="stampede-system",
-        username="Stampede",
-    )
+    enqueue_job.assert_awaited_once()
+    enqueue_args = enqueue_job.await_args.kwargs
+    assert enqueue_args["cluster_id"] == "cl-1"
+    assert enqueue_args["project_id"] == "proj-1"
+    assert enqueue_args["kind"] == "stampede_provision"
+    assert enqueue_args["user_id"] == "stampede-system"
+    assert enqueue_args["username"] == "Stampede"
+    assert enqueue_args["payload"] == {
+        "nodegroup_id": "cpu-ng",
+        "add_count": 1,
+        "flavor_id": "small",
+        "image_id": None,
+        "labels": {"env": "test"},
+        "taints": [],
+        "gpu_required": False,
+        "provisioning_key_prefix": enqueue_args["payload"]["provisioning_key_prefix"],
+    }
+    assert enqueue_args["payload"]["provisioning_key_prefix"].startswith("stampede-cl-1-cpu-ng-")
 
 
 @pytest.mark.asyncio
-async def test_scale_up_blocks_gpu_nodes_when_quota_check_fails():
-    from drover.services.stampede import _scale_up_nodegroup
-
-    ng = {**_make_nodegroup(node_count=0, max_size=3), "id": "gpu-ng", "flavor_id": "gpu"}
-    pending = [
-        {
-            "name": "trainer",
-            "namespace": "ml",
-            "node_selector": {},
-            "tolerations": [],
-            "affinity": {},
-            "resource_requests": {"cpu_m": 500, "memory_bytes": 512 * 1024**2, "gpu": 1},
-            "message": "Insufficient nvidia.com/gpu",
-        }
-    ]
-    s = MagicMock()
-    s.drover_stampede_scale_up_cooldown = 0
-
-    with (
-        patch("drover.services.stampede._get_stampede_state", new=AsyncMock(return_value={})),
-        patch(
-            "drover.services.stampede._get_available_flavors",
-            new=AsyncMock(
-                return_value=[{"id": "gpu", "name": "gpu.large", "vcpus_m": 4000, "ram_bytes": 8 * 1024**3, "gpu": 1}]
-            ),
-        ),
-        patch(
-            "drover.services.stampede._check_gpu_quota_for_nodes",
-            new=AsyncMock(return_value=(False, "quota exceeded")),
-        ),
-        patch("drover.services.nodegroup.update_nodegroup", new=AsyncMock()) as update_nodegroup,
-        patch("drover.services.stampede._update_stampede_state", new=AsyncMock()) as update_state,
-        patch("drover.services.stampede._record_stampede_event", new=AsyncMock()) as record_event,
-        patch("drover.services.stampede.asyncio.create_task") as create_task,
-    ):
-        await _scale_up_nodegroup(
-            cluster_id="cl-1",
-            project_id="proj-1",
-            nodegroup=ng,
-            pending_pods=pending,
-            node_pods=[],
-            node_capacities=[],
-            s=s,
-        )
-
-    update_nodegroup.assert_not_awaited()
-    create_task.assert_not_called()
-    event = record_event.await_args.kwargs
-    assert event["action"] == "blocked"
-    assert event["status"] == "skipped"
-    assert event["extra"]["reason"] == "gpu_quota"
-    assert event["extra"]["message"] == "quota exceeded"
-    assert any(call.args[2]["last_blocked_reason"] == "gpu_quota" for call in update_state.await_args_list)
-
-
 @pytest.mark.asyncio
 async def test_scale_down_blocks_when_evicted_pods_do_not_fit_elsewhere():
     from drover.services.stampede import _scale_down_nodegroup
@@ -996,3 +944,135 @@ async def test_reconcile_cluster_no_stampede_nodegroups():
 
         await reconcile_cluster(_make_cluster())
         mock_pods.assert_not_called()
+
+
+def test_flavor_gpu_count_excludes_non_gpu_pci_aliases():
+    from drover.services.stampede import _flavor_gpu_count
+
+    # gpu_count extra-spec priority
+    assert _flavor_gpu_count({"gpu_count": "2", "pci_passthrough:alias": "nvme:1"}) == 2
+
+    # Non-GPU aliases excluded
+    all_non_gpu = "audio:1,crypto:1,fpga:1,infiniband:1,network:1,nic:1,nvme:1,qat:1,rdma:1,sriov:1"
+    assert _flavor_gpu_count({"pci_passthrough:alias": all_non_gpu}) == 0
+
+    # Mixed aliases: only real GPU counts
+    mixed = "nvme:2,nic:1,gpu_alias:1,audio:1"
+    assert _flavor_gpu_count({"pci_passthrough:alias": mixed}) == 1
+
+    # Token matching must not reject a genuine alias that merely contains a non-GPU substring.
+    assert _flavor_gpu_count({"pci_passthrough:alias": "nicgpu:1"}) == 1
+
+    # Nova permits an omitted alias count, which means one GPU.
+    assert _flavor_gpu_count({"pci_passthrough:alias": "RTX3090"}) == 1
+    assert _flavor_gpu_count({"pci_passthrough:alias": "sriov"}) == 0
+
+
+@pytest.mark.asyncio
+async def test_scale_up_blocked_when_afterglow_admission_denies_quota():
+    from drover.services.stampede import _scale_up_nodegroup
+
+    ng = {**_make_nodegroup(node_count=1, max_size=3), "id": "gpu-ng", "flavor_id": "gpu"}
+    pending = [
+        {
+            "name": "trainer",
+            "namespace": "ml",
+            "node_selector": {},
+            "tolerations": [],
+            "affinity": {},
+            "resource_requests": {"cpu_m": 500, "memory_bytes": 512 * 1024**2, "gpu": 1},
+            "message": "Insufficient nvidia.com/gpu",
+        }
+    ]
+    s = MagicMock()
+    s.drover_stampede_scale_up_cooldown = 0
+
+    with (
+        patch("drover.services.stampede._get_stampede_state", new=AsyncMock(return_value={})),
+        patch(
+            "drover.services.stampede._get_available_flavors",
+            new=AsyncMock(
+                return_value=[{"id": "gpu", "name": "gpu.large", "vcpus_m": 4000, "ram_bytes": 8 * 1024**3, "gpu": 1}]
+            ),
+        ),
+        patch(
+            "drover.services.afterglow.check_gpu_admission", new=AsyncMock(return_value=(False, "gpu_quota_exceeded"))
+        ),
+        patch("drover.services.nodegroup.update_nodegroup", new=AsyncMock()) as update_nodegroup,
+        patch("drover.services.stampede._update_stampede_state", new=AsyncMock()) as update_state,
+        patch("drover.services.stampede._record_stampede_event", new=AsyncMock()) as record_event,
+        patch("drover.services.jobs.enqueue_job", new=AsyncMock()) as enqueue_job,
+    ):
+        await _scale_up_nodegroup(
+            cluster_id="cl-1",
+            project_id="proj-1",
+            nodegroup=ng,
+            pending_pods=pending,
+            node_pods=[],
+            node_capacities=[],
+            s=s,
+        )
+
+    # State mutations and job enqueues MUST NOT happen
+    update_nodegroup.assert_not_called()
+    enqueue_job.assert_not_called()
+
+    # Blocked event and last_blocked_reason state recorded
+    record_event.assert_awaited_once()
+    assert record_event.await_args.kwargs["action"] == "blocked"
+    assert record_event.await_args.kwargs["extra"]["reason"] == "gpu_quota_exceeded"
+    update_state.assert_awaited_once_with("gpu-ng", "cl-1", {"last_blocked_reason": "gpu_quota_exceeded"})
+
+
+@pytest.mark.asyncio
+async def test_scale_up_blocked_when_afterglow_admission_unavailable():
+    from drover.services.stampede import _scale_up_nodegroup
+
+    ng = {**_make_nodegroup(node_count=1, max_size=3), "id": "cpu-ng", "flavor_id": "small"}
+    pending = [
+        {
+            "name": "web",
+            "namespace": "default",
+            "node_selector": {},
+            "tolerations": [],
+            "affinity": {},
+            "resource_requests": {"cpu_m": 1500, "memory_bytes": 256 * 1024**2, "gpu": 0},
+            "message": "Insufficient cpu",
+        }
+    ]
+    s = MagicMock()
+    s.drover_stampede_scale_up_cooldown = 0
+
+    with (
+        patch("drover.services.stampede._get_stampede_state", new=AsyncMock(return_value={})),
+        patch(
+            "drover.services.stampede._get_available_flavors",
+            new=AsyncMock(
+                return_value=[{"id": "small", "name": "cpu.small", "vcpus_m": 2000, "ram_bytes": 2 * 1024**3, "gpu": 0}]
+            ),
+        ),
+        patch(
+            "drover.services.afterglow.check_gpu_admission",
+            new=AsyncMock(return_value=(False, "gpu_admission_unavailable")),
+        ),
+        patch("drover.services.nodegroup.update_nodegroup", new=AsyncMock()) as update_nodegroup,
+        patch("drover.services.stampede._update_stampede_state", new=AsyncMock()) as update_state,
+        patch("drover.services.stampede._record_stampede_event", new=AsyncMock()) as record_event,
+        patch("drover.services.jobs.enqueue_job", new=AsyncMock()) as enqueue_job,
+    ):
+        await _scale_up_nodegroup(
+            cluster_id="cl-1",
+            project_id="proj-1",
+            nodegroup=ng,
+            pending_pods=pending,
+            node_pods=[],
+            node_capacities=[],
+            s=s,
+        )
+
+    update_nodegroup.assert_not_called()
+    enqueue_job.assert_not_called()
+    record_event.assert_awaited_once()
+    assert record_event.await_args.kwargs["action"] == "blocked"
+    assert record_event.await_args.kwargs["extra"]["reason"] == "gpu_admission_unavailable"
+    update_state.assert_awaited_once_with("cpu-ng", "cl-1", {"last_blocked_reason": "gpu_admission_unavailable"})

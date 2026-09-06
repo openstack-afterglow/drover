@@ -110,11 +110,24 @@ def test_defaults_variable_interface():
     assert defaults["drover_keystone_password_file"] == "{{ drover_container_secrets_dir }}/os_password"
     assert defaults["drover_database_password_file"] == "{{ drover_container_secrets_dir }}/database_password"
     assert defaults["drover_redis_password_file"] == "{{ drover_container_secrets_dir }}/redis_password"
-    assert defaults["drover_kubeconfig_encryption_key_file"] == "{{ drover_container_secrets_dir }}/kubeconfig_encryption_key"
+    assert (
+        defaults["drover_kubeconfig_encryption_key_file"]
+        == "{{ drover_container_secrets_dir }}/kubeconfig_encryption_key"
+    )
+    assert (
+        defaults["drover_afterglow_admission_token_file"]
+        == "{{ drover_container_secrets_dir }}/afterglow_admission_token"
+    )
+    assert defaults["drover_afterglow_admission_url"] == "{{ afterglow_public_api_base | default('') }}"
+    assert defaults["drover_afterglow_admission_token"] == "{{ afterglow_k3s_gpu_admission_token | default('') }}"
 
     # Passwordless database and redis URLs
     assert ":" not in defaults["drover_database_url"].split("@")[0].split("//")[1]
-    assert ":" not in defaults["drover_redis_url"].split("@")[0].split("//")[1] if "@" in defaults["drover_redis_url"] else True
+    assert (
+        ":" not in defaults["drover_redis_url"].split("@")[0].split("//")[1]
+        if "@" in defaults["drover_redis_url"]
+        else True
+    )
 
     # Secret mounts in services
     secret_mount = "{{ drover_secrets_dir }}:{{ drover_container_secrets_dir }}:ro"
@@ -147,6 +160,7 @@ def test_defaults_variable_interface():
     raw_defaults = defaults_file.read_text(encoding="utf-8")
     assert "secret_password" not in raw_defaults
     assert "my_secret_key" not in raw_defaults
+
 
 def test_version_lockstep():
     """Verify version lockstep between root Drover package, marker, default image tag, and wheel metadata."""
@@ -182,7 +196,7 @@ def test_action_dispatch_and_ordering():
     assert_task = main_tasks[0]
     assert "ansible.builtin.assert" in assert_task
     allowed_actions = assert_task["ansible.builtin.assert"]["that"][0]
-    for action in ['precheck', 'pull', 'deploy', 'reconfigure', 'upgrade', 'destroy', 'config']:
+    for action in ["precheck", "pull", "deploy", "reconfigure", "upgrade", "destroy", "config"]:
         assert action in allowed_actions
 
     # Check deploy.yml ordering: precheck -> config -> preconditions -> bootstrap_service -> start
@@ -199,7 +213,9 @@ def test_action_dispatch_and_ordering():
     # Check upgrade.yml ordering
     upgrade_file = ROLE_DIR / "tasks" / "upgrade.yml"
     upgrade_tasks = yaml.safe_load(upgrade_file.read_text(encoding="utf-8"))
-    upgrade_included = [t["ansible.builtin.include_tasks"] for t in upgrade_tasks if "ansible.builtin.include_tasks" in t]
+    upgrade_included = [
+        t["ansible.builtin.include_tasks"] for t in upgrade_tasks if "ansible.builtin.include_tasks" in t
+    ]
     assert upgrade_included == ["pull.yml", "bootstrap_service.yml", "start.yml"]
 
     # Check destroy.yml task
@@ -214,7 +230,9 @@ def test_keystone_registration_contract():
     assert ks_file.is_file()
     ks_tasks = yaml.safe_load(ks_file.read_text(encoding="utf-8"))
 
-    reg_task = next(t for t in ks_tasks if t.get("ansible.builtin.import_role", {}).get("name") == "service-ks-register")
+    reg_task = next(
+        t for t in ks_tasks if t.get("ansible.builtin.import_role", {}).get("name") == "service-ks-register"
+    )
     vars_map = reg_task["vars"]
 
     assert vars_map["project_name"] == "drover"
@@ -261,6 +279,7 @@ def test_migration_and_bootstrap_contract():
     assert "DROVER_KUBECONFIG_ENCRYPTION_KEY" not in env
     assert "OS_PASSWORD" not in env
 
+
 def test_config_resolution_and_rendering():
     """Verify config.yml project lookup, assertion, and drover.conf rendering."""
     config_file = ROLE_DIR / "tasks" / "config.yml"
@@ -289,6 +308,8 @@ def test_drover_conf_template_render():
         drover_database_password_file="/etc/drover/secrets/database_password",
         drover_redis_password_file="/etc/drover/secrets/redis_password",
         drover_kubeconfig_encryption_key_file="/etc/drover/secrets/kubeconfig_encryption_key",
+        drover_afterglow_admission_url="http://afterglow.internal:8000",
+        drover_afterglow_admission_token_file="/etc/drover/secrets/afterglow_admission_token",
         drover_service_project_name="drover-service",
         drover_service_project_id="test-proj-id-123",
         drover_keystone_project_domain_name="Default",
@@ -319,8 +340,11 @@ def test_drover_conf_template_render():
     assert 'password_file = "/etc/drover/secrets/database_password"' in rendered
     assert 'password_file = "/etc/drover/secrets/redis_password"' in rendered
     assert 'kubeconfig_encryption_key_file = "/etc/drover/secrets/kubeconfig_encryption_key"' in rendered
+    assert 'afterglow_admission_url = "http://afterglow.internal:8000"' in rendered
+    assert 'afterglow_admission_token_file = "/etc/drover/secrets/afterglow_admission_token"' in rendered
     assert "password =" not in rendered
     assert "kubeconfig_encryption_key =" not in rendered
+
 
 def test_container_start_and_pull_policy():
     """Verify pull policy logic in pull.yml and start.yml."""
@@ -422,6 +446,8 @@ def test_drover_kolla_wheel_packaging_lifecycle(tmp_path):
     # 4. Uninstall the wheel and confirm its owned role files are removed.
     uninstall_cmd = ["uv", "pip", "uninstall", "--python", str(venv_python), "drover-kolla"]
     res_uninst = subprocess.run(uninstall_cmd, capture_output=True, text=True)
-    assert res_uninst.returncode == 0, f"uv pip uninstall failed:\nstdout: {res_uninst.stdout}\nstderr: {res_uninst.stderr}"
+    assert res_uninst.returncode == 0, (
+        f"uv pip uninstall failed:\nstdout: {res_uninst.stdout}\nstderr: {res_uninst.stderr}"
+    )
     remaining_files = list(installed_role_dir.glob("**/*")) if installed_role_dir.exists() else []
     assert not [path for path in remaining_files if path.is_file()]

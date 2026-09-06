@@ -28,6 +28,14 @@ def test_encryption_key_file_loading(tmp_path):
     assert settings.drover_kubeconfig_encryption_key == key_hex
 
 
+def test_afterglow_admission_token_file_loading(tmp_path):
+    secret_file = tmp_path / "afterglow_admission_token"
+    secret_file.write_text("admission-secret-123\n")
+
+    settings = config.Settings(drover_afterglow_admission_token_file=str(secret_file))
+    assert settings.drover_afterglow_admission_token == "admission-secret-123"
+
+
 def test_database_password_file_injection(tmp_path):
     secret_file = tmp_path / "db_password"
     secret_file.write_text("secret_db_pass\n")
@@ -71,7 +79,9 @@ def test_validate_config_with_file_backed_credentials(tmp_path):
 
 
 def test_kolla_drover_conf_renders_only_secret_paths():
-    kolla_template_path = Path(__file__).parents[1] / "deploy" / "kolla" / "ansible" / "roles" / "drover" / "templates" / "drover.conf.j2"
+    kolla_template_path = (
+        Path(__file__).parents[1] / "deploy" / "kolla" / "ansible" / "roles" / "drover" / "templates" / "drover.conf.j2"
+    )
     template_text = kolla_template_path.read_text()
 
     env = jinja2.Environment(undefined=jinja2.StrictUndefined)
@@ -100,6 +110,8 @@ def test_kolla_drover_conf_renders_only_secret_paths():
         drover_redis_password_file="/etc/drover/secrets/redis_password",
         drover_callback_base_url="http://127.0.0.1:8011",
         drover_kubeconfig_encryption_key_file="/etc/drover/secrets/kubeconfig_encryption_key",
+        drover_afterglow_admission_url="http://afterglow.internal:8000",
+        drover_afterglow_admission_token_file="/etc/drover/secrets/afterglow_admission_token",
         drover_boot_volume_size_gb=30,
         drover_occm_enabled=True,
         drover_occm_image="registry.k8s.io/provider-os/openstack-cloud-controller-manager:v1.34.1",
@@ -132,8 +144,11 @@ def test_kolla_drover_conf_renders_only_secret_paths():
     assert 'password_file = "/etc/drover/secrets/database_password"' in rendered
     assert 'password_file = "/etc/drover/secrets/redis_password"' in rendered
     assert 'kubeconfig_encryption_key_file = "/etc/drover/secrets/kubeconfig_encryption_key"' in rendered
+    assert 'afterglow_admission_url = "http://afterglow.internal:8000"' in rendered
+    assert 'afterglow_admission_token_file = "/etc/drover/secrets/afterglow_admission_token"' in rendered
     assert "password =" not in rendered
     assert "kubeconfig_encryption_key =" not in rendered
+    assert "afterglow_admission_token =" not in rendered
 
 
 def test_kolla_secret_files_are_root_group_readable_for_non_root_container():
@@ -142,7 +157,7 @@ def test_kolla_secret_files_are_root_group_readable_for_non_root_container():
     dockerfile_text = (Path(__file__).parents[1] / "Dockerfile").read_text()
 
     assert 'mode: "0750"' in tasks_text
-    assert tasks_text.count('mode: "0640"') >= 4
+    assert tasks_text.count('mode: "0640"') >= 5
     assert "owner: root" in tasks_text and "group: root" in tasks_text
     assert "no_log: true" in tasks_text
     assert "adduser appuser root" in dockerfile_text
@@ -162,9 +177,10 @@ def test_cloudinit_cloud_conf_file_mode_0600():
     # Ubuntu user_data is base64(gzip(cloud-config))
     import base64
     import gzip
+
     decompressed = gzip.decompress(base64.b64decode(res.data)).decode()
     assert "- path: /etc/kubernetes/cloud.conf" in decompressed
-    assert "permissions: \"0600\"" in decompressed
+    assert 'permissions: "0600"' in decompressed
 
 
 def test_fcos_ignition_cloud_conf_mode_0600():
@@ -181,6 +197,7 @@ def test_fcos_ignition_cloud_conf_mode_0600():
 
     import base64
     import json
+
     ign_dict = json.loads(base64.b64decode(res.data).decode())
     files = ign_dict.get("storage", {}).get("files", [])
     cloud_conf_entry = next((f for f in files if f["path"] == "/etc/kubernetes/cloud.conf"), None)

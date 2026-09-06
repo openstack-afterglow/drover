@@ -293,24 +293,12 @@ Policy `drover:admin` (시스템 관리자 전용) 인증이 요구되는 관리
 
 ---
 
-## 9. 통계 및 GPU 쿼터 API (Stats & GPU Quotas)
+## 9. 통계 API (Stats API)
 
 ### 9.1 테넌트 통계 API
 * **`GET /v1/stats/clusters`**: 현재 프로젝트 소유의 클러스터 개수 및 상태별 통계 반환.
 
-### 9.2 테넌트 GPU 쿼터 API (`/v1/gpu-quotas`)
-* **`GET /v1/gpu-quotas/effective`**: 적용된 실효 GPU 쿼터 한도 조회
-* **`GET /v1/gpu-quotas/status`**: GPU 타입별 한도(`limit`), 사용량(`in_use`), 잔여량(`available`) 조회
-* **`POST /v1/gpu-quotas/check`**: 요청 Flavor의 `extra_specs` 기반 GPU 쿼터 충족 여부 사전 검증 (`GpuQuotaCheckRequest`)
-
-### 9.3 관리자 GPU 쿼터 API (`/v1/admin/gpu-quotas`)
-* **`GET /v1/admin/gpu-quotas/defaults`**: 기본 GPU 쿼터 조회
-* **`PUT /v1/admin/gpu-quotas/defaults`**: 기본 GPU 쿼터 설정 (`GpuQuotaRequest`)
-* **`DELETE /v1/admin/gpu-quotas/defaults/{gpu_type}`**: 기본 GPU 쿼터 삭제
-* **`GET /v1/admin/gpu-quotas/{project_id}`**: 특정 프로젝트 GPU 쿼터 및 사용량 조회
-* **`PUT /v1/admin/gpu-quotas/{project_id}`**: 특정 프로젝트 GPU 쿼터 지정
-* **`DELETE /v1/admin/gpu-quotas/{project_id}/{gpu_type}`**: 특정 프로젝트 GPU 쿼터 삭제
-
+> **참고 (GPU 쿼터 이관)**: `/v1/gpu-quotas` 및 `/v1/admin/gpu-quotas` API는 Afterglow 서비스(`app.services.gpu_quota`)로 완전히 이관 및 이관 완료되어 Drover API에서 제거되었습니다. GPU 쿼터 관련 모든 조회 및 설정은 Afterglow API (`/api/v1/admin/gpu-quotas`)를 사용합니다.
 ---
 
 ## 10. 인프라 전용 Guest Callback API (System Callback)

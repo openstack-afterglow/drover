@@ -117,7 +117,7 @@ Drover 서비스의 아키텍처 단순화와 성능 최적화를 위해 아래 
 
 2. **OpenStack Placement API 직접 할당 연동 미지원**
    - Placement 서비스의 Resource Class 직접 커스텀 allocation 할당을 사용하지 않습니다.
-   - 노드 배치는 Nova Flavor 스케줄링을 따르며, GPU 자원의 제어는 Drover 내부의 전용 **App-level GPU Quota Engine** (`/v1/gpu-quotas`)을 사용하여 제어합니다.
+   - 노드 배치는 Nova Flavor 스케줄링을 따르며, GPU 쿼터 정책 검증 권한(Authority)은 Afterglow (`app.services.gpu_quota`)가 단독 소유합니다. Drover는 K3s GPU 용량 계산, Allocatable/Readiness 헬스 체크, GPU flavor 사이징 및 스케줄링 로직만 담당합니다.
 
 ---
 

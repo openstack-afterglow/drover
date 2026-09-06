@@ -232,21 +232,6 @@ class RuntimeSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
 
-class GpuQuota(Base):
-    """프로젝트별 GPU 타입 quota. limit=-1 은 무제한."""
-
-    __tablename__ = "gpu_quotas"
-
-    id: Mapped[int] = mapped_column(INT, primary_key=True, autoincrement=True)
-    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False, index=True)
-    gpu_type: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
-    limit: Mapped[int] = mapped_column(INT, nullable=False, default=-1)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
-
-    __table_args__ = (Index("idx_gpu_quota_project_type", "project_id", "gpu_type", unique=True),)
-
-
 class DroverOperation(Base):
     __tablename__ = "drover_operations"
 
@@ -305,9 +290,7 @@ class DroverOperationEvent(Base):
 
     operation: Mapped[DroverOperation] = relationship("DroverOperation", back_populates="events")
 
-    __table_args__ = (
-        Index("idx_drover_op_event_seq", "operation_id", "sequence", unique=True),
-    )
+    __table_args__ = (Index("idx_drover_op_event_seq", "operation_id", "sequence", unique=True),)
 
 
 class ManagedOpenStackResource(Base):
@@ -333,6 +316,4 @@ class ManagedOpenStackResource(Base):
     cluster: Mapped[K3sCluster] = relationship("K3sCluster", back_populates="managed_resources")
     operation: Mapped[DroverOperation | None] = relationship("DroverOperation", back_populates="resources")
 
-    __table_args__ = (
-        Index("idx_managed_res_identity", "service", "resource_type", "resource_id", unique=True),
-    )
+    __table_args__ = (Index("idx_managed_res_identity", "service", "resource_type", "resource_id", unique=True),)

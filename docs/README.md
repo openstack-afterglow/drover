@@ -26,6 +26,9 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - 보안 아키텍처 (비밀번호 미노출, 최소권한 Application Credentials, Callback CIDR 제한)
    - 동기화(Reconciliation), Stampede 오토스케일링 및 의도적 설계 제약사항 (Magnum Wire 호환성, Placement allocation 미지원)
 
+4. **[Drover `gpu_quotas` 테이블 은퇴 및 데이터 마이그레이션 운영 지침 (Runbook)](gpu-quota-table-retirement-runbook.md)**
+   - Active GPU quota 소유권의 Afterglow 단독 이관에 따른 Drover legacy `gpu_quotas` 테이블의 소스 은퇴(Source Table Retirement) 절차
+   - 마이그레이션 데이터 감사(Audit), Afterglow 권한 롤아웃 검증 및 물리적 `DROP TABLE` 전제 조건 체크리스트
 ---
 
 ## Drover 핵심 아키텍처 요약

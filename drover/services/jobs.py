@@ -74,9 +74,7 @@ async def enqueue_job(
         target_op_id = operation_id
         if not target_op_id:
             mapped_op_kind = op_kind or JOB_TO_OP_KIND.get(kind, "create")
-            active_op = await operations._get_active_op_impl(
-                session, cluster_id, kind=mapped_op_kind
-            )
+            active_op = await operations._get_active_op_impl(session, cluster_id, kind=mapped_op_kind)
             if active_op is not None:
                 target_op_id = active_op.id
             else:
@@ -206,12 +204,11 @@ async def _execute_job_direct(
             labels=payload.get("labels"),
             taints=payload.get("taints"),
             gpu_required=bool(payload.get("gpu_required")),
+            provisioning_key_prefix=payload.get("provisioning_key_prefix"),
             **kwargs,
         )
     elif kind == "delete":
-        await deletion.execute_delete_cluster(
-            project_id, cluster_id, payload, operation_id=operation_id
-        )
+        await deletion.execute_delete_cluster(project_id, cluster_id, payload, operation_id=operation_id)
     elif kind == "rotate_certificates":
         from drover.services import cert_rotation
 
@@ -234,6 +231,7 @@ async def _mark_cluster_failed(session, job: DroverJob, error: str) -> None:
         cluster.status = "ERROR"
         cluster.status_reason = error
         cluster.updated_at = _now()
+
 
 async def _claim_one() -> tuple[str, int, str, str, str, dict] | None:
     factory = get_session_factory()
@@ -372,9 +370,7 @@ async def _complete(job_id: str, *, attempt: int) -> bool:
                     and cluster.status == "ACTIVE"
                     and op.status not in {"FAILED", "CANCELLED", "SUCCEEDED"}
                 )
-                if create_is_active or (
-                    op.kind != "create" and op.status not in {"FAILED", "CANCELLED", "SUCCEEDED"}
-                ):
+                if create_is_active or (op.kind != "create" and op.status not in {"FAILED", "CANCELLED", "SUCCEEDED"}):
                     op.status = "SUCCEEDED"
                     op.finished_at = _now()
                     phase = "job_completed"
@@ -441,6 +437,33 @@ async def _retry_or_fail(job_id: str, *, attempt: int, error: str) -> bool:
         return True
 
 
+async def _defer_in_progress(job_id: str, *, attempt: int) -> bool:
+    """Keep a remote in-progress intent leased without consuming a retry."""
+    factory = get_session_factory()
+    if factory is None:
+        return False
+    async with factory() as session, session.begin():
+        job = await session.get(DroverJob, job_id, with_for_update=True)
+        if job is None or job.status != "running" or job.attempts != attempt:
+            return False
+        job.attempts = max(0, job.attempts - 1)
+        job.last_error = "Afterglow provisioning remains in progress"
+        job.claimed_at = _now()
+        job.updated_at = job.claimed_at
+        op_id = getattr(job, "operation_id", None)
+        if op_id:
+            op = await session.get(DroverOperation, op_id, with_for_update=True)
+            if op:
+                await operations._append_event_impl(
+                    session,
+                    op.id,
+                    phase="job_deferred",
+                    message=f"Job {job.kind} is waiting for existing Afterglow provisioning",
+                    payload_json={"job_id": job.id, "attempt": attempt},
+                )
+        return True
+
+
 async def _renew_lease(job_id: str, *, attempt: int) -> bool:
     """Extend only the active lease attempt currently owned by this worker."""
     factory = get_session_factory()
@@ -479,8 +502,14 @@ async def process_one_job() -> bool:
         await _execute_job_direct(kind, payload, cluster_id, project_id)
         await _complete(job_id, attempt=attempt)
     except Exception as exc:
-        _logger.exception("Drover job failed job_id=%s kind=%s attempt=%d", job_id, kind, attempt)
-        await _retry_or_fail(job_id, attempt=attempt, error=str(exc))
+        from drover.services.autoscale import ProvisioningInProgress
+
+        if isinstance(exc, ProvisioningInProgress):
+            _logger.info("Drover job deferred job_id=%s kind=%s attempt=%d", job_id, kind, attempt)
+            await _defer_in_progress(job_id, attempt=attempt)
+        else:
+            _logger.exception("Drover job failed job_id=%s kind=%s attempt=%d", job_id, kind, attempt)
+            await _retry_or_fail(job_id, attempt=attempt, error=str(exc))
     finally:
         stop.set()
         heartbeat.cancel()
