@@ -181,87 +181,100 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
             project_id, cluster_id, "ERROR", "생성 시점 리소스 스냅샷이 불완전합니다"
         )
         return
-
     try:
         conn = await keystone.get_project_manager_connection(project_id)
     except Exception as e:
         _logger.error("k3s agent provision: cannot get OpenStack connection: %s", e)
         await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"OpenStack 연결 실패: {e}")
         return
+    try:
+        agent_vm_ids: list[str] = []
+        failed_count = 0
+        new_agent_entries: list[dict] = []
 
-    agent_vm_ids: list[str] = []
-    failed_count = 0
-    new_agent_entries: list[dict] = []
+        for _i in range(agent_count):
+            agent_name = f"{cluster_name}-{_rand_suffix()}"
+            try:
+                vol_metadata = inventory.build_drover_metadata(cluster_id, None, "volume")
+                vol = await asyncio.to_thread(
+                    cinder.create_volume_from_image,
+                    conn,
+                    f"{agent_name}-boot",
+                    image_id,
+                    boot_volume_size,
+                    volume_availability_zone,
+                    metadata=vol_metadata,
+                )
+                await inventory.record_resource(
+                    None,
+                    cluster_id=cluster_id,
+                    service="cinder",
+                    resource_type="volume",
+                    resource_id=vol.id,
+                    name=f"{agent_name}-boot",
+                )
+                _agent_args = k3s_plugins.aggregate_agent_args(plugin_settings)
 
-    for _i in range(agent_count):
-        agent_name = f"{cluster_name}-{_rand_suffix()}"
-        try:
-            vol_metadata = inventory.build_drover_metadata(cluster_id, None, "volume")
-            vol = await asyncio.to_thread(
-                cinder.create_volume_from_image,
-                conn,
-                f"{agent_name}-boot",
-                image_id,
-                boot_volume_size,
-                volume_availability_zone,
-                metadata=vol_metadata,
-            )
-            await inventory.record_resource(
-                None, cluster_id=cluster_id, service="cinder", resource_type="volume", resource_id=vol.id, name=f"{agent_name}-boot"
-            )
-            _agent_args = k3s_plugins.aggregate_agent_args(plugin_settings)
+                if not _agent_args and cluster.get("occm_enabled"):
+                    _agent_args = ["--kubelet-arg=cloud-provider=external"]
+                agent_userdata = k3s_cloudinit.generate_agent_userdata(
+                    cluster_name=cluster_name,
+                    k3s_version=k3s_version,
+                    server_ip=server_ip,
+                    node_token=node_token,
+                    ssh_public_key=ssh_public_key,
+                    primary_network_id=network_id,
+                    extra_agent_args=_agent_args,
+                    os_type=os_type,
+                )
+                agent_vm_metadata = inventory.build_drover_metadata(cluster_id, None, "server")
+                agent_vm_metadata.update(
+                    {"k3s_horse_generator_role": "k3s_agent", "k3s_horse_generator_cluster_id": cluster_id}
+                )
+                vm = await asyncio.to_thread(
+                    nova.create_server,
+                    conn,
+                    agent_name,
+                    agent_flavor_id,
+                    network_id,
+                    vol.id,
+                    userdata=agent_userdata.data,
+                    metadata=agent_vm_metadata,
+                    delete_boot_volume_on_termination=True,
+                    security_groups=[sg_id] if sg_id else None,
+                    config_drive=agent_userdata.config_drive,
+                )
+                await inventory.record_resource(
+                    None,
+                    cluster_id=cluster_id,
+                    service="nova",
+                    resource_type="server",
+                    resource_id=vm.id,
+                    name=agent_name,
+                )
+                agent_vm_ids.append(vm.id)
+                new_agent_entries.append({"vm_id": vm.id, "name": agent_name})
+            except Exception as e:
+                _logger.error("k3s agent %s creation failed: %s", agent_name, e)
+                failed_count += 1
 
-            if not _agent_args and cluster.get("occm_enabled"):
-                _agent_args = ["--kubelet-arg=cloud-provider=external"]
-            agent_userdata = k3s_cloudinit.generate_agent_userdata(
-                cluster_name=cluster_name,
-                k3s_version=k3s_version,
-                server_ip=server_ip,
-                node_token=node_token,
-                ssh_public_key=ssh_public_key,
-                primary_network_id=network_id,
-                extra_agent_args=_agent_args,
-                os_type=os_type,
-            )
-            agent_vm_metadata = inventory.build_drover_metadata(cluster_id, None, "server")
-            agent_vm_metadata.update({"k3s_horse_generator_role": "k3s_agent", "k3s_horse_generator_cluster_id": cluster_id})
-            vm = await asyncio.to_thread(
-                nova.create_server,
-                conn,
-                agent_name,
-                agent_flavor_id,
-                network_id,
-                vol.id,
-                userdata=agent_userdata.data,
-                metadata=agent_vm_metadata,
-                delete_boot_volume_on_termination=True,
-                security_groups=[sg_id] if sg_id else None,
-                config_drive=agent_userdata.config_drive,
-            )
-            await inventory.record_resource(
-                None, cluster_id=cluster_id, service="nova", resource_type="server", resource_id=vm.id, name=agent_name
-            )
-            agent_vm_ids.append(vm.id)
-            new_agent_entries.append({"vm_id": vm.id, "name": agent_name})
-        except Exception as e:
-            _logger.error("k3s agent %s creation failed: %s", agent_name, e)
-            failed_count += 1
+        if new_agent_entries:
+            await k3s_cluster.add_agent_vms(cluster_id, new_agent_entries)
+            from drover.services import nodegroup as k3s_nodegroup
 
-    if new_agent_entries:
-        await k3s_cluster.add_agent_vms(cluster_id, new_agent_entries)
-        from drover.services import nodegroup as k3s_nodegroup
-
-        default_agent_id = await k3s_nodegroup.get_default_agent_nodegroup_id(cluster_id)
-        if default_agent_id:
-            await k3s_nodegroup.add_nodegroup_vms(default_agent_id, cluster_id, new_agent_entries)
-    reason = f"에이전트 {failed_count}개 생성 실패" if failed_count else ""
-    await k3s_cluster.update_cluster_status(project_id, cluster_id, "ACTIVE", reason, agent_vm_ids=agent_vm_ids)
-    _logger.info(
-        "k3s cluster %s ACTIVE: %d agents created, %d failed",
-        cluster_id,
-        len(agent_vm_ids),
-        failed_count,
-    )
+            default_agent_id = await k3s_nodegroup.get_default_agent_nodegroup_id(cluster_id)
+            if default_agent_id:
+                await k3s_nodegroup.add_nodegroup_vms(default_agent_id, cluster_id, new_agent_entries)
+        reason = f"에이전트 {failed_count}개 생성 실패" if failed_count else ""
+        await k3s_cluster.update_cluster_status(project_id, cluster_id, "ACTIVE", reason, agent_vm_ids=agent_vm_ids)
+        _logger.info(
+            "k3s cluster %s ACTIVE: %d agents created, %d failed",
+            cluster_id,
+            len(agent_vm_ids),
+            failed_count,
+        )
+    finally:
+        await asyncio.to_thread(conn.close)
 
 
 # ---------------------------------------------------------------------------
@@ -327,128 +340,132 @@ async def bootstrap_ha_servers(
     except Exception as e:
         _logger.error("HA bootstrap: cannot get OpenStack connection: %s", e)
         return
-
-    join_url, ha_extra_tls_sans = await _resolve_ha_join_endpoint(
-        conn,
-        cluster.get("api_lb_id") or "",
-        lb_fip_address,
-        server_ip,
-    )
-
     try:
-        subnets = await asyncio.to_thread(lambda: list(conn.network.subnets(network_id=network_id)))
-        subnet_id = subnets[0].id if subnets else None
-        member = await asyncio.to_thread(
-            octavia.add_member,
+        join_url, ha_extra_tls_sans = await _resolve_ha_join_endpoint(
             conn,
-            lb_pool_id,
+            cluster.get("api_lb_id") or "",
+            lb_fip_address,
             server_ip,
-            6443,
-            subnet_id=subnet_id,
-            name=f"{cluster_name}-server-1",
         )
-        await inventory.record_resource(
-            None,
-            cluster_id=cluster_id,
-            service="octavia",
-            resource_type="member",
-            resource_id=member["id"],
-            operation_id=operation_id,
-            name=f"{cluster_name}-server-1",
-            metadata={"pool_id": lb_pool_id, "role": "ha_server_member", "server_index": 1},
-        )
-        _logger.info("HA: server#1 %s added to LB pool %s", server_ip, lb_pool_id)
-    except Exception as e:
-        _logger.warning("HA: failed to add server#1 to LB pool: %s", e)
-
-    # server#2, server#3 생성
-    cloud_conf = k3s_plugins.aggregate_cloud_conf(project_id, plugin_settings)
-    extra_server_args = k3s_plugins.aggregate_server_args(plugin_settings)
-    extra_write_files = k3s_plugins.aggregate_extra_write_files(project_id, cluster_name, plugin_settings)
-
-    for idx in range(2, master_count + 1):
-        server_suffix = _rand_suffix()
-        server_vm_name = f"{cluster_name}-server{idx}-{server_suffix}"
 
         try:
-            # HA 콜백 토큰 (server_index 포함 — callback.py가 분기 처리)
-            ha_token = await k3s_cluster.create_ha_callback_token(project_id, cluster_id, idx)
-
-            boot_vol = await asyncio.to_thread(
-                cinder.create_volume_from_image,
+            subnets = await asyncio.to_thread(lambda: list(conn.network.subnets(network_id=network_id)))
+            subnet_id = subnets[0].id if subnets else None
+            member = await asyncio.to_thread(
+                octavia.add_member,
                 conn,
-                f"{server_vm_name}-boot",
-                image_id,
-                boot_volume_size,
-                volume_availability_zone,
+                lb_pool_id,
+                server_ip,
+                6443,
+                subnet_id=subnet_id,
+                name=f"{cluster_name}-server-1",
             )
             await inventory.record_resource(
                 None,
                 cluster_id=cluster_id,
-                service="cinder",
-                resource_type="volume",
-                resource_id=boot_vol.id,
+                service="octavia",
+                resource_type="member",
+                resource_id=member["id"],
                 operation_id=operation_id,
-                name=f"{server_vm_name}-boot",
-                metadata={"role": "ha_server_boot_volume", "server_index": idx},
+                name=f"{cluster_name}-server-1",
+                metadata={"pool_id": lb_pool_id, "role": "ha_server_member", "server_index": 1},
             )
-
-            userdata_result = k3s_cloudinit.generate_server_userdata(
-                cluster_name=cluster_name,
-                k3s_version=k3s_version,
-                callback_url=callback_url,
-                callback_token=ha_token,
-                primary_network_id=network_id,
-                cloud_conf=cloud_conf,
-                extra_server_args=extra_server_args,
-                extra_write_files=extra_write_files,
-                extra_tls_sans=ha_extra_tls_sans,
-                needs_external_cloud_provider=k3s_plugins.needs_external_cloud_provider(s),
-                os_type=os_type,
-                server_node_name=server_vm_name,
-                cluster_init=False,
-                join_url=join_url,
-                ha_node_token=node_token,
-            )
-
-            vm = await asyncio.to_thread(
-                nova.create_server,
-                conn,
-                server_vm_name,
-                server_flavor_id,
-                network_id,
-                boot_vol.id,
-                userdata=userdata_result.data,
-                key_name=key_name,
-                metadata={
-                    "k3s_horse_generator_role": "k3s_server",
-                    "k3s_horse_generator_cluster_id": cluster_id,
-                    "k3s_horse_generator_cluster_name": cluster_name,
-                },
-                delete_boot_volume_on_termination=True,
-                security_groups=[sg_id] if sg_id else None,
-                config_drive=userdata_result.config_drive,
-            )
-            _logger.info("HA: server#%d VM %s created: %s", idx, server_vm_name, vm.id)
-            await inventory.record_resource(
-                None,
-                cluster_id=cluster_id,
-                service="nova",
-                resource_type="server",
-                resource_id=vm.id,
-                operation_id=operation_id,
-                name=server_vm_name,
-                metadata={"role": "ha_server", "server_index": idx},
-            )
-
+            _logger.info("HA: server#1 %s added to LB pool %s", server_ip, lb_pool_id)
         except Exception as e:
-            _logger.error("HA: server#%d creation failed: %s", idx, e)
-            # 부분 실패 시 계속 진행 (embedded etcd는 quorum 없이도 단독 동작 가능)
+            _logger.warning("HA: failed to add server#1 to LB pool: %s", e)
 
-    _logger.info(
-        "HA bootstrap done for cluster %s — waiting for servers to join via callback",
-        cluster_id,
-    )
+        # server#2, server#3 생성
+        cloud_conf = k3s_plugins.aggregate_cloud_conf(project_id, plugin_settings)
+        extra_server_args = k3s_plugins.aggregate_server_args(plugin_settings)
+        extra_write_files = k3s_plugins.aggregate_extra_write_files(project_id, cluster_name, plugin_settings)
+
+        for idx in range(2, master_count + 1):
+            server_suffix = _rand_suffix()
+            server_vm_name = f"{cluster_name}-server{idx}-{server_suffix}"
+
+            try:
+                # HA 콜백 토큰 (server_index 포함 — callback.py가 분기 처리)
+                ha_token = await k3s_cluster.create_ha_callback_token(project_id, cluster_id, idx)
+
+                boot_vol = await asyncio.to_thread(
+                    cinder.create_volume_from_image,
+                    conn,
+                    f"{server_vm_name}-boot",
+                    image_id,
+                    boot_volume_size,
+                    volume_availability_zone,
+                )
+                await inventory.record_resource(
+                    None,
+                    cluster_id=cluster_id,
+                    service="cinder",
+                    resource_type="volume",
+                    resource_id=boot_vol.id,
+                    operation_id=operation_id,
+                    name=f"{server_vm_name}-boot",
+                    metadata={"role": "ha_server_boot_volume", "server_index": idx},
+                )
+
+                userdata_result = k3s_cloudinit.generate_server_userdata(
+                    cluster_name=cluster_name,
+                    k3s_version=k3s_version,
+                    callback_url=callback_url,
+                    callback_token=ha_token,
+                    primary_network_id=network_id,
+                    cloud_conf=cloud_conf,
+                    extra_server_args=extra_server_args,
+                    extra_write_files=extra_write_files,
+                    extra_tls_sans=ha_extra_tls_sans,
+                    needs_external_cloud_provider=k3s_plugins.needs_external_cloud_provider(s),
+                    os_type=os_type,
+                    server_node_name=server_vm_name,
+                    cluster_init=False,
+                    join_url=join_url,
+                    ha_node_token=node_token,
+                )
+
+                vm = await asyncio.to_thread(
+                    nova.create_server,
+                    conn,
+                    server_vm_name,
+                    server_flavor_id,
+                    network_id,
+                    boot_vol.id,
+                    userdata=userdata_result.data,
+                    key_name=key_name,
+                    metadata={
+                        "k3s_horse_generator_role": "k3s_server",
+                        "k3s_horse_generator_cluster_id": cluster_id,
+                        "k3s_horse_generator_cluster_name": cluster_name,
+                    },
+                    delete_boot_volume_on_termination=True,
+                    security_groups=[sg_id] if sg_id else None,
+                    config_drive=userdata_result.config_drive,
+                )
+                _logger.info("HA: server#%d VM %s created: %s", idx, server_vm_name, vm.id)
+                await inventory.record_resource(
+                    None,
+                    cluster_id=cluster_id,
+                    service="nova",
+                    resource_type="server",
+                    resource_id=vm.id,
+                    operation_id=operation_id,
+                    name=server_vm_name,
+                    metadata={"role": "ha_server", "server_index": idx},
+                )
+
+            except Exception as e:
+                _logger.error("HA: server#%d creation failed: %s", idx, e)
+                # 부분 실패 시 계속 진행 (embedded etcd는 quorum 없이도 단독 동작 가능)
+
+        _logger.info(
+            "HA bootstrap done for cluster %s — waiting for servers to join via callback",
+            cluster_id,
+        )
+    finally:
+        await asyncio.to_thread(conn.close)
+
+
 async def create_cluster_job(
     project_id: str,
     cluster_id: str,
@@ -520,7 +537,13 @@ async def create_cluster_job(
         )
         sg_id = sg["id"]
         await inventory.record_resource(
-            None, cluster_id=cluster_id, service="neutron", resource_type="security_group", resource_id=sg_id, operation_id=operation_id, name=sg_name
+            None,
+            cluster_id=cluster_id,
+            service="neutron",
+            resource_type="security_group",
+            resource_id=sg_id,
+            operation_id=operation_id,
+            name=sg_name,
         )
 
         rules = _cluster_security_group_rules(allowed_cidrs, sg_id)
@@ -529,7 +552,12 @@ async def create_cluster_job(
             rule_id = rule.get("id") if isinstance(rule, dict) else getattr(rule, "id", None)
             if rule_id:
                 await inventory.record_resource(
-                    None, cluster_id=cluster_id, service="neutron", resource_type="security_group_rule", resource_id=rule_id, operation_id=operation_id
+                    None,
+                    cluster_id=cluster_id,
+                    service="neutron",
+                    resource_type="security_group_rule",
+                    resource_id=rule_id,
+                    operation_id=operation_id,
                 )
 
         if operation_id:
@@ -559,7 +587,13 @@ async def create_cluster_job(
             )
             ha_lb_id = ha_lb["id"]
             await inventory.record_resource(
-                None, cluster_id=cluster_id, service="octavia", resource_type="load_balancer", resource_id=ha_lb_id, operation_id=operation_id, name=ha_lb.get("name")
+                None,
+                cluster_id=cluster_id,
+                service="octavia",
+                resource_type="load_balancer",
+                resource_id=ha_lb_id,
+                operation_id=operation_id,
+                name=ha_lb.get("name"),
             )
             ha_lb_vip_address = ha_lb.get("vip_address") or ""
             if ha_lb_vip_address:
@@ -569,7 +603,13 @@ async def create_cluster_job(
                 octavia.create_listener, conn, ha_lb_id, "TCP", 6443, name=f"k3s-ha-{name}-6443"
             )
             await inventory.record_resource(
-                None, cluster_id=cluster_id, service="octavia", resource_type="listener", resource_id=listener["id"], operation_id=operation_id, name=listener.get("name")
+                None,
+                cluster_id=cluster_id,
+                service="octavia",
+                resource_type="listener",
+                resource_id=listener["id"],
+                operation_id=operation_id,
+                name=listener.get("name"),
             )
             ha_lb_pool_id_raw = await asyncio.to_thread(
                 octavia.create_pool,
@@ -581,7 +621,13 @@ async def create_cluster_job(
             )
             ha_lb_pool_id = ha_lb_pool_id_raw["id"]
             await inventory.record_resource(
-                None, cluster_id=cluster_id, service="octavia", resource_type="pool", resource_id=ha_lb_pool_id, operation_id=operation_id, name=ha_lb_pool_id_raw.get("name")
+                None,
+                cluster_id=cluster_id,
+                service="octavia",
+                resource_type="pool",
+                resource_id=ha_lb_pool_id,
+                operation_id=operation_id,
+                name=ha_lb_pool_id_raw.get("name"),
             )
 
             _fip_net = (policy_snapshot.get("k3s.api_lb_floating_network") or {}).get("id", "")
@@ -597,12 +643,16 @@ async def create_cluster_job(
                 )
                 ha_fip_id = _fip.id if hasattr(_fip, "id") else _fip["id"]
                 ha_fip_address = (
-                    _fip.floating_ip_address
-                    if hasattr(_fip, "floating_ip_address")
-                    else _fip["floating_ip_address"]
+                    _fip.floating_ip_address if hasattr(_fip, "floating_ip_address") else _fip["floating_ip_address"]
                 )
                 await inventory.record_resource(
-                    None, cluster_id=cluster_id, service="neutron", resource_type="floating_ip", resource_id=ha_fip_id, operation_id=operation_id, name=ha_fip_address
+                    None,
+                    cluster_id=cluster_id,
+                    service="neutron",
+                    resource_type="floating_ip",
+                    resource_id=ha_fip_id,
+                    operation_id=operation_id,
+                    name=ha_fip_address,
                 )
                 extra_tls_sans.append(ha_fip_address)
             await _persist_ha_endpoint_snapshot(
@@ -647,7 +697,13 @@ async def create_cluster_job(
         )
         boot_volume_id = boot_vol.id
         await inventory.record_resource(
-            None, cluster_id=cluster_id, service="cinder", resource_type="volume", resource_id=boot_volume_id, operation_id=operation_id, name=f"{server_vm_name}-boot"
+            None,
+            cluster_id=cluster_id,
+            service="cinder",
+            resource_type="volume",
+            resource_id=boot_volume_id,
+            operation_id=operation_id,
+            name=f"{server_vm_name}-boot",
         )
         if operation_id:
             await operations.append_operation_event(
@@ -691,6 +747,7 @@ async def create_cluster_job(
         active_plugins.get("occm", False)
 
         from drover.services import keystone as _keystone
+
         app_cred: dict | None = None
         needs_app_cred = (
             active_plugins.get("occm", False)
@@ -710,7 +767,13 @@ async def create_cluster_job(
             app_cred = await _keystone.create_app_credential_for_cluster(project_id, name)
             app_credential_id = app_cred["id"]
             await inventory.record_resource(
-                None, cluster_id=cluster_id, service="keystone", resource_type="app_credential", resource_id=app_credential_id, operation_id=operation_id, name=name
+                None,
+                cluster_id=cluster_id,
+                service="keystone",
+                resource_type="app_credential",
+                resource_id=app_credential_id,
+                operation_id=operation_id,
+                name=name,
             )
 
         cloud_conf = k3s_plugins.aggregate_cloud_conf(
@@ -728,6 +791,7 @@ async def create_cluster_job(
                     payload_json={"step": K3sProgressStep.SERVER_CREATING.value, "progress": 39},
                 )
             from drover.services import barbican as _barbican
+
             kek_id = await _barbican.ensure_project_kek(project_id)
 
         manifest_kwargs: dict = {"app_credential": app_cred}
@@ -783,11 +847,13 @@ async def create_cluster_job(
             )
 
         server_vm_metadata = inventory.build_drover_metadata(cluster_id, operation_id, "server")
-        server_vm_metadata.update({
-            "k3s_horse_generator_role": "k3s_server",
-            "k3s_horse_generator_cluster_id": cluster_id,
-            "k3s_horse_generator_cluster_name": name,
-        })
+        server_vm_metadata.update(
+            {
+                "k3s_horse_generator_role": "k3s_server",
+                "k3s_horse_generator_cluster_id": cluster_id,
+                "k3s_horse_generator_cluster_name": name,
+            }
+        )
         server_vm = await asyncio.to_thread(
             nova.create_server,
             conn,
@@ -804,7 +870,13 @@ async def create_cluster_job(
         )
         server_vm_id = server_vm.id
         await inventory.record_resource(
-            None, cluster_id=cluster_id, service="nova", resource_type="server", resource_id=server_vm_id, operation_id=operation_id, name=server_vm_name
+            None,
+            cluster_id=cluster_id,
+            service="nova",
+            resource_type="server",
+            resource_id=server_vm_id,
+            operation_id=operation_id,
+            name=server_vm_name,
         )
 
         if operation_id:
@@ -851,3 +923,5 @@ async def create_cluster_job(
             await operations.update_operation_status(None, operation_id, "FAILED", error=str(e))
         await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"클러스터 생성 실패: {e}")
         raise
+    finally:
+        await asyncio.to_thread(conn.close)

@@ -267,3 +267,28 @@ async def test_store_and_get_health_result():
     assert result is not None
     assert result.cluster_id == "k3s-test"
     assert result.status == "DEGRADED"
+
+
+@pytest.mark.asyncio
+async def test_get_probe_ip_uses_managed_connection():
+    """The periodic health loop must release its OpenStack session."""
+    from drover.services.health import _get_probe_ip
+
+    conn = MagicMock()
+    server = MagicMock()
+    floating_ip = MagicMock()
+    floating_ip.type = "floating"
+    floating_ip.addr = "203.0.113.10"
+    server.ip_addresses = [floating_ip]
+
+    with (
+        patch("drover.services.keystone.project_manager_connection") as managed,
+        patch("drover.services.nova.get_server", return_value=server),
+    ):
+        managed.return_value.__aenter__ = AsyncMock(return_value=conn)
+        managed.return_value.__aexit__ = AsyncMock(return_value=False)
+        result = await _get_probe_ip("proj-1", "vm-1", "10.0.0.1")
+
+    assert result == "203.0.113.10"
+    managed.assert_called_once_with("proj-1")
+    managed.return_value.__aexit__.assert_awaited_once()

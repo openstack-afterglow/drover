@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 from typing import TYPE_CHECKING
@@ -461,11 +462,22 @@ def _connect_as_manager(project_id: str, password: str, settings):
         verify=settings.ssl_verify,
     )
 
+
 async def get_project_manager_connection(project_id: str) -> openstack.connection.Connection:
     """Return the durable per-project manager connection used by background jobs."""
     _, password = await ensure_cluster_manager_user(project_id)
     settings = get_settings()
     return await asyncio.to_thread(_connect_as_manager, project_id, password, settings)
+
+
+@contextlib.asynccontextmanager
+async def project_manager_connection(project_id: str):
+    """Yield a durable per-project manager connection and ensure it is closed."""
+    conn = await get_project_manager_connection(project_id)
+    try:
+        yield conn
+    finally:
+        await asyncio.to_thread(conn.close)
 
 
 def _create_app_cred_sync(project_id: str, cluster_name: str, user_id: str, password: str) -> dict:

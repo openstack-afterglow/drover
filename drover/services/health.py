@@ -4,6 +4,7 @@
 메인 API는 Redis에서 읽기만 함.
 """
 
+import asyncio
 import base64
 import logging
 import ssl
@@ -112,15 +113,13 @@ async def _get_probe_ip(
     if not server_vm_id or not project_id:
         return server_ip
     try:
-        import asyncio
-
         from drover.services import keystone, nova
 
-        conn = await keystone.get_project_manager_connection(project_id)
-        server = await asyncio.to_thread(nova.get_server, conn, server_vm_id)
-        for ip_info in server.ip_addresses:
-            if ip_info.type == "floating":
-                return ip_info.addr
+        async with keystone.project_manager_connection(project_id) as conn:
+            server = await asyncio.to_thread(nova.get_server, conn, server_vm_id)
+            for ip_info in server.ip_addresses:
+                if ip_info.type == "floating":
+                    return ip_info.addr
     except Exception:
         _logger.debug("k3s health: floating IP 조회 실패 (vm=%s), private IP 사용", server_vm_id)
     return server_ip

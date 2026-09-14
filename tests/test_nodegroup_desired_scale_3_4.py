@@ -197,6 +197,7 @@ async def test_reconcile_nodegroup_vms_nova_tags_convergence():
     assert len(verified) == 1
     assert verified[0]["vm_id"] == "vm-active"
     set_count.assert_awaited_once_with(_CLUSTER_ID, _NODEGROUP_ID, 1)
+    mock_conn.close.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------

@@ -115,10 +115,25 @@ async def test_manager_bootstrap_uses_admin_project_scope():
     assert result == ("manager-user", "manager-password")
     admin_factory.assert_called_once_with()
     bootstrap.assert_called_once_with("tenant-project", admin_conn, settings)
-    save_credentials.assert_awaited_once_with(
-        "tenant-project", "manager-user", "manager-name", "encrypted-password"
-    )
+    save_credentials.assert_awaited_once_with("tenant-project", "manager-user", "manager-name", "encrypted-password")
     admin_conn.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_project_manager_connection_always_closes():
+    conn = MagicMock()
+
+    with patch("drover.services.keystone.get_project_manager_connection", AsyncMock(return_value=conn)):
+        async with keystone.project_manager_connection("proj-1") as yielded:
+            assert yielded is conn
+    conn.close.assert_called_once_with()
+
+    conn.reset_mock()
+    with patch("drover.services.keystone.get_project_manager_connection", AsyncMock(return_value=conn)):
+        with pytest.raises(RuntimeError, match="boom"):
+            async with keystone.project_manager_connection("proj-1"):
+                raise RuntimeError("boom")
+    conn.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -148,7 +163,10 @@ async def test_3_create_failure_before_provision_call():
     with (
         patch("drover.config.get_settings", return_value=mock_s),
         patch("drover.services.keystone.get_project_manager_connection", AsyncMock(return_value=conn_mock)),
-        patch("drover.services.keystone.create_app_credential_for_cluster", side_effect=RuntimeError("Keystone auth failed")),
+        patch(
+            "drover.services.keystone.create_app_credential_for_cluster",
+            side_effect=RuntimeError("Keystone auth failed"),
+        ),
         patch("drover.services.inventory.record_resource", AsyncMock()),
         patch("drover.services.operations.append_operation_event", AsyncMock()),
         patch("drover.services.operations.update_operation_status", AsyncMock()),
@@ -163,8 +181,9 @@ async def test_3_create_failure_before_provision_call():
                 operation_id="op-123",
             )
 
-        # Confirm Nova create_server was NEVER called
+        # Failure must not leak the project-scoped OpenStack session.
         conn_mock.compute.create_server.assert_not_called()
+        conn_mock.close.assert_called_once_with()
 
 
 def test_4_kubernetes_secret_rendered_from_app_credential():
@@ -174,12 +193,18 @@ def test_4_kubernetes_secret_rendered_from_app_credential():
     # Manila CSI K8s Secret
     manila_yaml = ManilaCsiPlugin().generate_manifests("cluster-1", "proj-1", s, app_credential=_FAKE_APP_CRED)
     parsed = list(yaml.safe_load_all(manila_yaml))
-    secret_doc = next(d for d in parsed if d and d.get("kind") == "Secret" and d.get("metadata", {}).get("name") == "manila-cloud-secret")
+    secret_doc = next(
+        d
+        for d in parsed
+        if d and d.get("kind") == "Secret" and d.get("metadata", {}).get("name") == "manila-cloud-secret"
+    )
     assert secret_doc["stringData"]["os-applicationCredentialID"] == "appcred-id-999"
     assert secret_doc["stringData"]["os-applicationCredentialSecret"] == "appcred-secret-888"
 
     # Octavia Ingress ConfigMap
-    octavia_yaml = OctaviaIngressPlugin().generate_manifests("cluster-1", "proj-1", s, subnet_id="sub-1", app_credential=_FAKE_APP_CRED)
+    octavia_yaml = OctaviaIngressPlugin().generate_manifests(
+        "cluster-1", "proj-1", s, subnet_id="sub-1", app_credential=_FAKE_APP_CRED
+    )
     parsed_octavia = list(yaml.safe_load_all(octavia_yaml))
     cm_doc = next(d for d in parsed_octavia if d and d.get("kind") == "ConfigMap")
     cm_config = cm_doc["data"]["config.yaml"]
@@ -208,5 +233,10 @@ async def test_5_delete_revokes_app_credential():
         patch("drover.services.store.delete_cluster_record", AsyncMock()),
         patch("drover.services.activity.rec", MagicMock()),
     ):
-        [s async for s in deletion.delete_cluster_progress(MagicMock(), "proj-1", cluster_dict, token_info=None, operation_id="op-1")]
+        [
+            s
+            async for s in deletion.delete_cluster_progress(
+                MagicMock(), "proj-1", cluster_dict, token_info=None, operation_id="op-1"
+            )
+        ]
         mock_ks_delete.assert_called_once_with("proj-1", "appcred-id-999")

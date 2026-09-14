@@ -397,23 +397,23 @@ async def _get_available_flavors(project_id: str) -> list[dict]:
     from drover.services import keystone, nova
 
     try:
-        conn = await keystone.get_project_manager_connection(project_id)
-        flavors_raw = await asyncio.to_thread(nova.list_flavors, conn)
-        result = []
-        for f in flavors_raw:
-            extra_specs = getattr(f, "extra_specs", {}) or {}
-            gpu = _flavor_gpu_count(extra_specs)
-            result.append(
-                {
-                    "id": f.id,
-                    "name": f.name,
-                    "vcpus_m": int(f.vcpus or 0) * 1000,
-                    "ram_bytes": int(f.ram or 0) * 1024 * 1024,
-                    "gpu": gpu,
-                    "extra_specs": extra_specs,
-                }
-            )
-        return result
+        async with keystone.project_manager_connection(project_id) as conn:
+            flavors_raw = await asyncio.to_thread(nova.list_flavors, conn)
+            result = []
+            for f in flavors_raw:
+                extra_specs = getattr(f, "extra_specs", {}) or {}
+                gpu = _flavor_gpu_count(extra_specs)
+                result.append(
+                    {
+                        "id": f.id,
+                        "name": f.name,
+                        "vcpus_m": int(f.vcpus or 0) * 1000,
+                        "ram_bytes": int(f.ram or 0) * 1024 * 1024,
+                        "gpu": gpu,
+                        "extra_specs": extra_specs,
+                    }
+                )
+            return result
     except Exception as e:
         _logger.warning("_get_available_flavors 오류 (project=%s): %s", project_id, e)
         return []

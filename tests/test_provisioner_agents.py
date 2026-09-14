@@ -61,17 +61,18 @@ async def test_provision_agents_persists_created_vm_ids() -> None:
     add_agent_vms.assert_awaited_once_with("cluster-1", expected_entries)
     add_nodegroup_vms.assert_awaited_once_with("nodegroup-1", "cluster-1", expected_entries)
     assert update_status.await_args.kwargs["agent_vm_ids"] == ["server-1"]
+    connection.close.assert_called_once_with()
 
 
 async def test_nodegroup_provisioning_reads_token_from_database_store() -> None:
     cluster = _cluster()
     get_token = AsyncMock(return_value="node-token")
-
+    connection = MagicMock()
     with (
         patch("drover.services.store.get_cluster_admin", new=AsyncMock(return_value=cluster)),
         patch("drover.services.store.get_cluster_node_token", new=get_token),
         patch("drover.config.get_settings", return_value=SimpleNamespace(drover_boot_volume_size_gb=30)),
-        patch("drover.services.keystone.get_project_manager_connection", return_value=MagicMock()),
+        patch("drover.services.keystone.get_project_manager_connection", return_value=connection),
         patch(
             "drover.services.plugins.with_resource_policy_snapshot", side_effect=lambda settings, _snapshot: settings
         ),
@@ -87,6 +88,7 @@ async def test_nodegroup_provisioning_reads_token_from_database_store() -> None:
 
     assert created == []
     get_token.assert_awaited_once_with("project-1", "cluster-1")
+    connection.close.assert_called_once_with()
 
 
 async def test_stampede_replays_submitting_intent_without_direct_openstack_create() -> None:
