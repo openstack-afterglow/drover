@@ -285,7 +285,7 @@ async def provision_nodegroup_vms(
         return new_entries
     finally:
         if conn is not None:
-            await asyncio.to_thread(conn.close)
+            await keystone.close_connection(conn)
 
 
 async def delete_nodegroup_vms(
@@ -352,7 +352,7 @@ async def delete_nodegroup_vms(
             except Exception:
                 pass
     finally:
-        await asyncio.to_thread(conn.close)
+        await keystone.close_connection(conn)
 
 
 async def reconcile_nodegroup_vms(
@@ -418,7 +418,7 @@ async def reconcile_nodegroup_vms(
         return verified_vms
     finally:
         if conn is not None:
-            await asyncio.to_thread(conn.close)
+            await keystone.close_connection(conn)
 
 
 async def provision_nodegroup_and_reconcile(

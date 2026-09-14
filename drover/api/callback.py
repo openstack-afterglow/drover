@@ -257,7 +257,7 @@ async def _handle_ha_joiner(
             _logger.warning("HA: failed to add server#%d to LB pool: %s", server_index, e)
         finally:
             if conn is not None:
-                await asyncio.to_thread(conn.close)
+                await keystone.close_connection(conn)
     join_count = await k3s_cluster.incr_ha_join_count(cluster_id)
     _logger.info("HA: cluster %s join count: %d / %d", cluster_id, join_count, master_count - 1)
 

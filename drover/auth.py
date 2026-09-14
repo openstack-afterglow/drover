@@ -229,4 +229,6 @@ async def get_os_conn(
     try:
         yield conn
     finally:
-        await asyncio.to_thread(conn.close)
+        from drover.services.keystone import close_connection
+
+        await close_connection(conn)

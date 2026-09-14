@@ -297,4 +297,4 @@ async def execute_delete_cluster(
         ):
             pass
     finally:
-        await asyncio.to_thread(conn.close)
+        await keystone.close_connection(conn)

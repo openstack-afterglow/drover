@@ -274,7 +274,7 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
             failed_count,
         )
     finally:
-        await asyncio.to_thread(conn.close)
+        await keystone.close_connection(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +463,7 @@ async def bootstrap_ha_servers(
             cluster_id,
         )
     finally:
-        await asyncio.to_thread(conn.close)
+        await keystone.close_connection(conn)
 
 
 async def create_cluster_job(
@@ -924,4 +924,4 @@ async def create_cluster_job(
         await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"클러스터 생성 실패: {e}")
         raise
     finally:
-        await asyncio.to_thread(conn.close)
+        await keystone.close_connection(conn)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -612,7 +611,7 @@ async def reconcile_cluster(
         return drift_summary
     finally:
         if created_conn and hasattr(conn, "close"):
-            await asyncio.to_thread(conn.close)
+            await keystone.close_connection(conn)
 
 
 async def schedule_worker_reconciliations(max_per_project: int = 2) -> list[str]:

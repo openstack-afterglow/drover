@@ -122,18 +122,22 @@ async def test_manager_bootstrap_uses_admin_project_scope():
 @pytest.mark.asyncio
 async def test_project_manager_connection_always_closes():
     conn = MagicMock()
-
+    http_session = MagicMock()
+    conn._session.session = http_session
     with patch("drover.services.keystone.get_project_manager_connection", AsyncMock(return_value=conn)):
         async with keystone.project_manager_connection("proj-1") as yielded:
             assert yielded is conn
     conn.close.assert_called_once_with()
+    http_session.close.assert_called_once_with()
 
     conn.reset_mock()
+    http_session.reset_mock()
     with patch("drover.services.keystone.get_project_manager_connection", AsyncMock(return_value=conn)):
         with pytest.raises(RuntimeError, match="boom"):
             async with keystone.project_manager_connection("proj-1"):
                 raise RuntimeError("boom")
     conn.close.assert_called_once_with()
+    http_session.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
