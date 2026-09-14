@@ -155,9 +155,13 @@ def _service_settings(auth_url="https://keystone.public.example/v3"):
     )
 
 
-async def test_validate_token_uses_internal_identity_endpoint():
+@pytest.mark.parametrize(
+    "catalog_endpoint",
+    ["https://keystone.internal.example", "https://keystone.internal.example/v3/"],
+)
+async def test_validate_token_uses_internal_identity_endpoint(catalog_endpoint):
     session = MagicMock()
-    session.get_endpoint.return_value = "https://keystone.internal.example/v3"
+    session.get_endpoint.return_value = catalog_endpoint
     session.get.return_value = _keystone_response("project-1")
 
     with (
@@ -217,9 +221,13 @@ async def test_validate_token_does_not_fall_back_without_internal_identity_endpo
     session.get.assert_not_called()
 
 
-async def test_admin_keystone_client_uses_internal_identity_endpoint():
+@pytest.mark.parametrize(
+    "catalog_endpoint",
+    ["https://keystone.internal.example", "https://keystone.internal.example/v3/"],
+)
+async def test_admin_keystone_client_uses_internal_identity_endpoint(catalog_endpoint):
     session = MagicMock()
-    session.get_endpoint.return_value = "https://keystone.internal.example/v3"
+    session.get_endpoint.return_value = catalog_endpoint
     client = MagicMock()
 
     with (

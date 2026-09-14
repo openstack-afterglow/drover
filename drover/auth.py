@@ -67,8 +67,13 @@ def _resolve_internal_keystone_endpoint(session: ks_session.Session | None = Non
     if not endpoint:
         raise RuntimeError("Keystone internal endpoint is unavailable")
 
-    _internal_keystone_endpoint_cache = endpoint.rstrip("/")
-    return _internal_keystone_endpoint_cache
+    # Kolla registers the identity catalog entry without a version path, so the
+    # bare endpoint answers 404 for /auth/tokens and /roles.
+    endpoint = endpoint.rstrip("/")
+    if not endpoint.endswith("/v3"):
+        endpoint += "/v3"
+    _internal_keystone_endpoint_cache = endpoint
+    return endpoint
 
 
 def _get_admin_ks_client():
