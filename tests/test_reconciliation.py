@@ -314,7 +314,7 @@ async def test_reconcile_transient_error_retry_propagation(test_store):
         )
 
     # Reconcile job execution also bubbles exception
-    with patch("drover.services.keystone.get_admin_connection_for_project", return_value=mock_conn):
+    with patch("drover.services.keystone.get_project_manager_connection", return_value=mock_conn):
         with pytest.raises(RuntimeError, match="500 Internal Server Error"):
             await jobs._execute_job_direct(
                 kind="reconcile",

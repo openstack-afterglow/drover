@@ -285,7 +285,7 @@ async def execute_delete_cluster(
     if not cluster or cluster.get("deleted_at"):
         return
 
-    conn = await asyncio.to_thread(keystone.get_admin_connection_for_project, project_id)
+    conn = await keystone.get_project_manager_connection(project_id)
     token_info = {
         "project_id": project_id,
         "user_id": payload.get("user_id", ""),

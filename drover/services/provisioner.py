@@ -183,7 +183,7 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
         return
 
     try:
-        conn = keystone.get_admin_connection_for_project(project_id)
+        conn = await keystone.get_project_manager_connection(project_id)
     except Exception as e:
         _logger.error("k3s agent provision: cannot get OpenStack connection: %s", e)
         await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"OpenStack 연결 실패: {e}")
@@ -323,7 +323,7 @@ async def bootstrap_ha_servers(
         return
 
     try:
-        conn = keystone.get_admin_connection_for_project(project_id)
+        conn = await keystone.get_project_manager_connection(project_id)
     except Exception as e:
         _logger.error("HA bootstrap: cannot get OpenStack connection: %s", e)
         return
@@ -464,7 +464,7 @@ async def create_cluster_job(
 
     s = get_settings()
     try:
-        conn = keystone.get_admin_connection_for_project(project_id)
+        conn = await keystone.get_project_manager_connection(project_id)
     except Exception as e:
         _logger.error("k3s cluster create job: cannot get OpenStack connection for project %s: %s", project_id, e)
         if operation_id:

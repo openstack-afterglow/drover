@@ -90,7 +90,7 @@ async def provision_nodegroup_vms(
         from drover.services import cinder, keystone, nova
 
         try:
-            conn = keystone.get_admin_connection_for_project(project_id)
+            conn = await keystone.get_project_manager_connection(project_id)
         except Exception as exc:
             _logger.error("provision_nodegroup_vms: OpenStack connection failed: %s", exc)
             return []
@@ -314,7 +314,7 @@ async def delete_nodegroup_vms(
 
     # Nova VM 삭제
     try:
-        conn = keystone.get_admin_connection_for_project(project_id)
+        conn = await keystone.get_project_manager_connection(project_id)
     except Exception as e:
         _logger.error("delete_nodegroup_vms: OpenStack 연결 실패: %s", e)
         return
@@ -372,7 +372,7 @@ async def reconcile_nodegroup_vms(
     verified_vms: list[dict] = []
     conn = None
     try:
-        conn = keystone.get_admin_connection_for_project(project_id)
+        conn = await keystone.get_project_manager_connection(project_id)
     except Exception as exc:
         _logger.debug("reconcile_nodegroup_vms: OpenStack connection unavailable: %s", exc)
 

@@ -282,11 +282,8 @@ def get_openstack_connection(token: str, project_id: str) -> openstack.connectio
     )
 
 
-def get_admin_connection_for_project(project_id: str) -> openstack.connection.Connection:
-    """관리자 크리덴셜로 특정 프로젝트에 스코프된 OpenStack 연결 반환.
-
-    콜백 등 사용자 토큰이 없는 상황에서 프로젝트 리소스를 조작할 때 사용.
-    """
+def _connect_as_service(project_id: str) -> openstack.connection.Connection:
+    """Return the service account scoped only to its assigned service project."""
     import openstack
 
     settings = get_settings()
@@ -345,7 +342,7 @@ def get_service_project_connection() -> openstack.connection.Connection:
             "os_service_project_id 설정이 없습니다. "
             "afterglow.conf [openstack] service_project_id 또는 OS_SERVICE_PROJECT_ID 환경변수를 설정하세요."
         )
-    return get_admin_connection_for_project(settings.os_service_project_id)
+    return _connect_as_service(settings.os_service_project_id)
 
 
 def revoke_token(token: str) -> None:
@@ -433,7 +430,7 @@ async def ensure_cluster_manager_user(project_id: str) -> tuple[str, str]:
         return cached["user_id"], decrypt_manager_password(cached["encrypted_password"])
 
     settings = get_settings()
-    admin_conn = await asyncio.to_thread(get_admin_connection_for_project, project_id)
+    admin_conn = await asyncio.to_thread(get_admin_project_connection)
     try:
         user_id, username, password = await asyncio.to_thread(
             _ensure_cluster_manager_user_sync_with_admin_conn, project_id, admin_conn, settings
@@ -463,6 +460,12 @@ def _connect_as_manager(project_id: str, password: str, settings):
         api_timeout=30,
         verify=settings.ssl_verify,
     )
+
+async def get_project_manager_connection(project_id: str) -> openstack.connection.Connection:
+    """Return the durable per-project manager connection used by background jobs."""
+    _, password = await ensure_cluster_manager_user(project_id)
+    settings = get_settings()
+    return await asyncio.to_thread(_connect_as_manager, project_id, password, settings)
 
 
 def _create_app_cred_sync(project_id: str, cluster_name: str, user_id: str, password: str) -> dict:

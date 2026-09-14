@@ -116,7 +116,7 @@ async def _get_probe_ip(
 
         from drover.services import keystone, nova
 
-        conn = await asyncio.to_thread(keystone.get_admin_connection_for_project, project_id)
+        conn = await keystone.get_project_manager_connection(project_id)
         server = await asyncio.to_thread(nova.get_server, conn, server_vm_id)
         for ip_info in server.ip_addresses:
             if ip_info.type == "floating":

@@ -397,7 +397,7 @@ async def _get_available_flavors(project_id: str) -> list[dict]:
     from drover.services import keystone, nova
 
     try:
-        conn = keystone.get_admin_connection_for_project(project_id)
+        conn = await keystone.get_project_manager_connection(project_id)
         flavors_raw = await asyncio.to_thread(nova.list_flavors, conn)
         result = []
         for f in flavors_raw:

@@ -41,7 +41,7 @@ async def test_provision_agents_persists_created_vm_ids() -> None:
     with (
         patch("drover.services.provisioner.k3s_cluster.get_cluster", new=AsyncMock(return_value=cluster)),
         patch("drover.config.get_settings", return_value=SimpleNamespace(drover_boot_volume_size_gb=30)),
-        patch("drover.services.keystone.get_admin_connection_for_project", return_value=connection),
+        patch("drover.services.keystone.get_project_manager_connection", return_value=connection),
         patch(
             "drover.services.plugins.with_resource_policy_snapshot", side_effect=lambda settings, _snapshot: settings
         ),
@@ -71,7 +71,7 @@ async def test_nodegroup_provisioning_reads_token_from_database_store() -> None:
         patch("drover.services.store.get_cluster_admin", new=AsyncMock(return_value=cluster)),
         patch("drover.services.store.get_cluster_node_token", new=get_token),
         patch("drover.config.get_settings", return_value=SimpleNamespace(drover_boot_volume_size_gb=30)),
-        patch("drover.services.keystone.get_admin_connection_for_project", return_value=MagicMock()),
+        patch("drover.services.keystone.get_project_manager_connection", return_value=MagicMock()),
         patch(
             "drover.services.plugins.with_resource_policy_snapshot", side_effect=lambda settings, _snapshot: settings
         ),

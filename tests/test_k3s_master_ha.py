@@ -229,7 +229,7 @@ async def test_handle_ha_joiner_adds_lb_member_and_triggers_agents():
             "drover.services.store.get_cluster_node_token",
             new=AsyncMock(return_value="K10abc::server:xyz"),
         ) as get_node_token,
-        patch("drover.services.keystone.get_admin_connection_for_project") as mock_conn,
+        patch("drover.services.keystone.get_project_manager_connection") as mock_conn,
         patch("drover.services.octavia.add_member") as mock_add,
         patch("drover.api.callback._jobs_svc.enqueue_job", new=AsyncMock()) as enqueue_job,
     ):
@@ -272,7 +272,7 @@ async def test_handle_ha_joiner_no_agents_if_not_all_joined():
     with (
         patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
         patch("drover.services.store.incr_ha_join_count", new=AsyncMock(return_value=1)),
-        patch("drover.services.keystone.get_admin_connection_for_project") as mock_conn,
+        patch("drover.services.keystone.get_project_manager_connection") as mock_conn,
         patch("drover.services.octavia.add_member"),
         patch("drover.api.callback._jobs_svc.enqueue_job", new=AsyncMock()) as enqueue_job,
     ):
@@ -423,7 +423,7 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
 
     with (
         patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
-        patch("drover.services.keystone.get_admin_connection_for_project", return_value=mock_conn),
+        patch("drover.services.keystone.get_project_manager_connection", return_value=mock_conn),
         patch("drover.services.octavia.add_member", return_value=mock_mem1),
         patch(
             "drover.services.octavia.get_load_balancer",
@@ -468,7 +468,7 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
             "drover.services.store.get_cluster_node_token",
             new=AsyncMock(return_value="K10node::token123"),
         ),
-        patch("drover.services.keystone.get_admin_connection_for_project", return_value=mock_conn),
+        patch("drover.services.keystone.get_project_manager_connection", return_value=mock_conn),
         patch("drover.services.octavia.add_member", side_effect=[mock_mem2, mock_mem3]),
         patch("drover.services.operations.get_active_operation", new=AsyncMock(return_value=MagicMock(id=op_id))),
         patch("drover.api.callback._jobs_svc.enqueue_job", new=AsyncMock()),

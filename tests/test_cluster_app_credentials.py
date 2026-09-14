@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
-from drover.services import deletion, provisioner
+from drover.services import deletion, keystone, provisioner
 from drover.services.plugins.barbican_kms import BarbicanKmsPlugin
 from drover.services.plugins.manila_csi import ManilaCsiPlugin
 from drover.services.plugins.occm import OccmPlugin
@@ -95,6 +95,33 @@ def test_2_sql_stores_id_only():
 
 
 @pytest.mark.asyncio
+async def test_manager_bootstrap_uses_admin_project_scope():
+    """The service user must not be password-scoped directly to a tenant project."""
+    settings = _mock_settings()
+    admin_conn = MagicMock()
+    admin_factory = MagicMock(return_value=admin_conn)
+    bootstrap = MagicMock(return_value=("manager-user", "manager-name", "manager-password"))
+
+    with (
+        patch("drover.services.store.get_manager_credentials", new=AsyncMock(return_value=None)),
+        patch("drover.services.store.save_manager_credentials", new=AsyncMock()) as save_credentials,
+        patch("drover.services.keystone.get_settings", return_value=settings),
+        patch("drover.services.keystone.get_admin_project_connection", admin_factory),
+        patch("drover.services.keystone._ensure_cluster_manager_user_sync_with_admin_conn", bootstrap),
+        patch("drover.crypto.encrypt_manager_password", return_value="encrypted-password"),
+    ):
+        result = await keystone.ensure_cluster_manager_user("tenant-project")
+
+    assert result == ("manager-user", "manager-password")
+    admin_factory.assert_called_once_with()
+    bootstrap.assert_called_once_with("tenant-project", admin_conn, settings)
+    save_credentials.assert_awaited_once_with(
+        "tenant-project", "manager-user", "manager-name", "encrypted-password"
+    )
+    admin_conn.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
 async def test_3_create_failure_before_provision_call():
     """Verify cluster create fails before Nova VM boot call if app credential acquisition fails."""
     conn_mock = MagicMock()
@@ -120,7 +147,7 @@ async def test_3_create_failure_before_provision_call():
 
     with (
         patch("drover.config.get_settings", return_value=mock_s),
-        patch("drover.services.keystone.get_admin_connection_for_project", MagicMock(return_value=conn_mock)),
+        patch("drover.services.keystone.get_project_manager_connection", AsyncMock(return_value=conn_mock)),
         patch("drover.services.keystone.create_app_credential_for_cluster", side_effect=RuntimeError("Keystone auth failed")),
         patch("drover.services.inventory.record_resource", AsyncMock()),
         patch("drover.services.operations.append_operation_event", AsyncMock()),
