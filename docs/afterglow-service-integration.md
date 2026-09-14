@@ -6,14 +6,14 @@
 
 ## 1. 개요 및 아키텍처 전환 배경
 
-Drover 서비스는 Magnum REST wire 호환 형식이 아닌 **Drover 네이티브 `/v1` API**를 제공합니다. Keystone catalog에는 service name과 service type이 모두 `drover`로 등록되며, `drover-sdk`는 이를 SDK service로 노출하고 `container-infra`를 alias로 지원합니다. 이 문서는 현재 구현과 혼동하지 않도록 아래 전환 절차를 **통합 rollout 계획/운영 체크리스트**로 다룹니다.
+Drover 서비스는 Magnum REST wire 호환 형식이 아닌 **Drover 네이티브 `/v1` API**를 제공합니다. Keystone 서비스 카탈로그에 표준 서비스 타입으로 등록되어 클라이언트가 중앙 카탈로그에서 엔드포인트를 동적으로 검색하여 호출합니다.
 
 ### 핵심 구성 사양
 * **Keystone Service Name**: `drover`
-* **Keystone Service Type**: `drover` (`container-infra`는 Keystone type이 아니라 `drover-sdk`의 SDK alias)
+* **Keystone Service Type**: `container-infra` (새로운 SDK 패키지 `drover-sdk`가 `container-infra` 서비스 타입에 `drover` 앨리어스를 등록함)
 * **Keystone Endpoints**: `public`, `internal`, `admin` 모든 인터페이스 엔드포인트 URL이 `/v1`으로 종료됨 (예: `http://openstack.example.com:8011/v1`)
 * **인증 모델**: 호출자의 프로젝트 범위 Keystone 토큰 (`X-Auth-Token` 필수, 선택적 `X-Project-Id` 헤더). Drover는 서비스 자격으로 catalog의 `identity` internal endpoint를 해석해 토큰 검증·관리자 역할 조회에 사용하며, internal endpoint 실패 시 external/public fallback을 하지 않는다.
-* **설정 관리**: production catalog discovery는 Keystone 인증정보와 endpoint를 사용한다. `SERVICE_DROVER_INTERNAL_URL` 같은 직접 URL override는 rollout 계획의 비상/격리 테스트 경계로만 취급한다.
+* **설정 관리 단순화**: Afterglow 서비스의 기존 직접 API URL 설정(`DROVER_SERVICE_URL` 등)을 완전히 제거하고 Keystone 인증 정보(`auth_url`, `token` 또는 credentials)만으로 카탈로그 디스커버리를 수행합니다.
 
 ---
 
@@ -23,11 +23,11 @@ Kolla-Ansible 또는 컨트롤러 노드 배포 후, Afterglow 통합을 진행�
 
 ### 2.1 CLI 검증 명령 및 기대 출력
 
-[OpenStackClient CLI 공식 문서](https://docs.openstack.org/python-openstackclient/latest/) 규격에 따라 다음 명령어로 `drover` 서비스 및 엔드포인트를 확인합니다.
+[OpenStackClient CLI 공식 문서](https://docs.openstack.org/python-openstackclient/latest/) 규격에 따라 다음 명령어로 `container-infra` 서비스 및 엔드포인트를 확인합니다.
 
 ```bash
 # 1. Keystone 카탈로그 서비스 확인
-openstack catalog show drover
+openstack catalog show container-infra
 ```
 **기대 출력 예시**:
 ```text
@@ -40,34 +40,36 @@ openstack catalog show drover
 |           |   admin: http://10.0.0.10:8011/v1    |
 | id        | a1b2c3d4e5f67890123456789abcdef0  |
 | name      | drover                           |
-| type      | drover                           |
+| type      | container-infra                  |
 +-----------+----------------------------------+
 ```
 
 ```bash
 # 2. 등록된 엔드포인트 상세 목록 조회
-openstack endpoint list --service drover
+openstack endpoint list --service container-infra
 ```
 **기대 출력 예시**:
 ```text
 +----------------------------------+-----------+--------------+--------------+---------+-----------+--------------------------+
 | ID                               | Region    | Service Name | Service Type | Enabled | Interface | URL                      |
 +----------------------------------+-----------+--------------+--------------+---------+-----------+--------------------------+
-| 11111111111111111111111111111111 | RegionOne | drover       | drover      | True    | public    | http://10.0.0.10:8011/v1 |
-| 22222222222222222222222222222222 | RegionOne | drover       | drover      | True    | internal  | http://10.0.0.10:8011/v1 |
-| 33333333333333333333333333333333 | RegionOne | drover       | drover      | True    | admin     | http://10.0.0.10:8011/v1 |
+| 11111111111111111111111111111111 | RegionOne | drover       | container-in | True    | public    | http://10.0.0.10:8011/v1 |
+| 22222222222222222222222222222222 | RegionOne | drover       | container-in | True    | internal  | http://10.0.0.10:8011/v1 |
+| 33333333333333333333333333333333 | RegionOne | drover       | container-in | True    | admin     | http://10.0.0.10:8011/v1 |
 +----------------------------------+-----------+--------------+--------------+---------+-----------+--------------------------+
 ```
 
 ### 2.2 Kolla-Ansible 배포 환경 설정
-Kolla catalog registration의 source authority는 `deploy/kolla/ansible/roles/drover/tasks/preconditions_keystone.yml`이다.
-- `service_ks_register_services`에 `name: drover`, `type: drover`와 public/internal/admin root endpoints가 정의되어 있다. SDK는 root 또는 `/v1` catalog URL을 받아 versioned API로 연결한다. 위 `/v1` URL은 지원되는 예시이지 Kolla 기본 등록값은 아니다.
+`deploy/kolla/defaults/main.yml` 배포 설정이 아래와 같이 적용되어 있는지 확인합니다:
+- `drover_keystone_service_name: "drover"`
+- `drover_keystone_service_type: "container-infra"`
+- `drover_replace_magnum_catalog: false` (기존 Magnum 서비스와의 충돌 방지 가드; Ansible 모듈을 통한 자동 인플레이스 교체는 지원되지 않으며, Magnum 교체 시 사전 수동 카탈로그 제거(`openstack service delete magnum`) 후 배포 진행)
 
 ---
 
-## 3. 안전한 전환 절차 (Safe Rollout 3-Stage Strategy — 계획)
+## 3. 안전한 전환 절차 (Safe Rollout 3-Stage Strategy)
 
-아래 3단계는 catalog discovery로 전환할 때 사용할 **계획과 확인 항목**이다. 이 문서의 존재나 예제 코드는 실제 rollout 완료, production traffic cutover, direct override 제거를 증명하지 않는다. 현재 서비스 경계와 구현은 루트 [`ARCHITECTURE.md`](../ARCHITECTURE.md)와 source를 기준으로 판단한다.
+Afterglow 서비스의 가동 중단 없이 카탈로그 디스커버리로 전환하기 위해 다음 3단계 롤아웃 전략을 준수합니다.
 
 ```mermaid
 graph LR
@@ -75,17 +77,17 @@ graph LR
     Stage2 --> Stage3[Stage 3: Direct Override Removal]
 ```
 
-### Stage 1: Shadow Discovery (디스커버리 검증 및 섀도링 계획)
-- Afterglow 서비스 시작 시 `openstacksdk` 커넥션을 생성하고 `drover_sdk.register(conn)`을 실행하여 Keystone catalog 조회가 정상 작동하는지 별도 health check로 확인한다.
-- 실제 트래픽과 catalog 결과의 차이를 관찰하되, 이 문서는 해당 트래픽 전환이 이미 완료됐다고 주장하지 않는다.
+### Stage 1: Shadow Discovery (디스커버리 검증 및 섀도링)
+- Afterglow 서비스 시작 시 `openstacksdk` 커넥션을 생성하고 `drover_sdk.register(conn)`을 실행하여 Keystone 카탈로그 조회가 정상 작동하는지 백그라운드 헬스 체크 로그를 수집합니다.
+- 실제 트래픽 요청은 기존 환경변수 URL로 처리하되 카탈로그 불일치 유무를 모니터링합니다.
 
-### Stage 2: Service Proxy Cutover (서비스 프록시 전환 계획)
-- Afterglow 비즈니스 로직의 API 호출부를 `conn.drover` proxy 메서드로 전환한다.
-- `SERVICE_DROVER_INTERNAL_URL` 환경변수는 필요한 격리 테스트/비상 복구 경계에서만 유지하며, rollout 전제와 현재 production 설정을 별도로 확인한다.
+### Stage 2: Service Proxy Cutover (서비스 프록시 무중단 전환)
+- Afterglow 비즈니스 로직의 API 호출부를 `conn.drover` 프록시 메서드(`clusters()`, `create_cluster()`, `get_cluster()` 등)로 전환합니다.
+- `SERVICE_DROVER_INTERNAL_URL` 환경변수를 비상용(Emergency Fallback)으로 유지합니다.
 
-### Stage 3: Direct Override Removal (직접 URL 설정 제거 계획)
-- catalog endpoint와 proxy 동작을 검증한 뒤에만 배포 템플릿/ConfigMap의 직접 URL override 제거 여부를 결정한다.
-- override를 제거하거나 유지했다는 완료 판단은 이 계획 문서가 아니라 실제 배포 설정과 source 검토로 기록한다.
+### Stage 3: Direct Override Removal (직접 URL 설정 영구 제거)
+- 카탈로그 탐색의 안정성이 입증되면 Afterglow 배포 템플릿/Kubernetes ConfigMap/환경변수에서 `SERVICE_DROVER_INTERNAL_URL` 및 직접 URL 설정을 완전히 제거합니다.
+- `SERVICE_DROVER_INTERNAL_URL`은 오직 카탈로그 장애 조치 또는 로컬 격리 테스트 환경에서만 임시 비상 오버라이드로 사용해야 합니다.
 
 ---
 
@@ -204,7 +206,7 @@ if __name__ == "__main__":
 
 | 장애 상황 (Failure Scenario) | 원인 및 진단 방식 | 시스템 자동 동작 (System Behavior) | Afterglow 권장 대응 절차 (Action Required) |
 | :--- | :--- | :--- | :--- |
-| **Keystone 카탈로그 미조회** | Keystone 서비스 등록 누락 또는 네트워크 차단 | `drover_sdk` 예외 발생 (`EndpointNotFound`) | `openstack catalog show drover` 검증 후 Kolla `preconditions_keystone.yml` 재실행. 비상 시에만 `SERVICE_DROVER_INTERNAL_URL` 임시 설정 |
+| **Keystone 카탈로그 미조회** | Keystone 서비스 등록 누락 또는 네트워크 차단 | `drover_sdk` 예외 발생 (`EndpointNotFound`) | `openstack catalog show container-infra` 검증 후 Kolla `register.yml` 재실행. 비상 시에만 `SERVICE_DROVER_INTERNAL_URL` 임시 설정 |
 | **Keystone 토큰 만료 또는 internal identity 경로 실패 (401 Unauthorized)** | 호출자의 토큰 만료/폐기, internal identity endpoint 누락 또는 내부 VIP 연결 실패 | HTTP 401 및 `Invalid or expired Keystone token` 응답. 토큰 검증과 관리자 역할 조회는 internal endpoint만 사용하고 external/public URL로 우회하지 않음 | 호출자 토큰 상태와 `identity` internal catalog endpoint/VIP/TLS 연결을 각각 확인한 뒤 재시도 |
 | **권한 부족 (403 Forbidden)** | 템플릿 관리 등 관리자 전용 API에 일반 프로젝트 토큰 사용 | HTTP 403 및 Policy rejection 응답 | Keystone 역할(`admin`) 확인 및 권한 요청 |
 | **SSE 스트림 단선 (Stream Disconnect)** | 클라이언트 타임아웃 또는 프록시 연결 끊김 | 백그라운드 Worker에서 자원 생성을 계속 진행 (`WAITING_CALLBACK` ➔ `RUNNING`) | `GET /v1/operations/{operation_id}` 조회를 통해 수동 폴링 전환 |

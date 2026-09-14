@@ -6,7 +6,7 @@
 
 ## 1. 레거시 기능 그룹별 교체 및 SDK 매핑 서열 (Feature Replacement Mapping)
 
-Drover는 Magnum REST wire API의 드롭인 대체가 아니라, Afterglow가 직접 URL로 호출하던 K3s 관리 기능을 Keystone catalog 기반 **Drover Native v1 API** 및 Python SDK (`drover-sdk`)로 전환하는 서비스입니다. Catalog service name/type은 모두 `drover`이며, SDK에서 `container-infra`는 alias입니다. 직접 URL에서 catalog로 옮기는 단계와 완료 여부는 [Afterglow 통합 rollout 계획](afterglow-service-integration.md) 및 현재 source를 별도로 확인해야 합니다.
+Drover는 Magnum REST wire API의 드롭인 대체가 아니라, Afterglow가 직접 URL로 호출하던 K3s 관리 기능을 Keystone 카탈로그 기반 **Drover Native v1 API** 및 Python SDK (`drover-sdk`)로 전환하는 서비스입니다.
 
 | 기능 그룹 (Functional Group) | 레거시 / 이전 방식 | Drover 네이티브 엔드포인트 교체 사양 | SDK (`drover-sdk`) 매핑 메서드 |
 | :--- | :--- | :--- | :--- |
@@ -57,7 +57,8 @@ graph TD
 ### 2.5 Keystone (Identity & Access)
 - 사용자 요청 시 호출자의 `X-Auth-Token`을 검증하고 프로젝트 스코프를 확인합니다. 프로젝트 헤더가 없으면 제출된 토큰 범위를 보존합니다.
 - 서비스 자격으로 catalog의 `identity` internal endpoint를 해석하여 토큰 introspection, 명시적 rescope 및 관리자 역할 조회를 보냅니다. internal endpoint가 없거나 연결할 수 없으면 external/public endpoint로 fallback하지 않고 fail closed 합니다.
-- 서비스 카탈로그 자동 등록 (`deploy/kolla/ansible/roles/drover/tasks/preconditions_keystone.yml`의 `name: drover`, `type: drover`).
+- 서비스 카탈로그 자동 등록 (`drover_keystone_service_name: drover`, `drover_keystone_service_type: container-infra`).
+- **클러스터 전용 Application Credentials**: OCCM, Cinder CSI, Manila CSI 플러그인을 위해 클러스터별 최소 권한의 Keystone Application Credential을 자동 발급하고 클러스터 삭제 시 즉시 파기.
 
 ### 2.6 Barbican & Manila (선택적 커스텀 연동)
 - **Barbican KMS Plugin**: K3s Secret 암호화를 위한 KMS 바인딩 지원.
@@ -117,7 +118,7 @@ Drover 서비스의 아키텍처 단순화와 성능 최적화를 위해 아래 
 
 2. **OpenStack Placement API 직접 할당 연동 미지원**
    - Placement 서비스의 Resource Class 직접 커스텀 allocation 할당을 사용하지 않습니다.
-   - 노드 배치는 Nova Flavor 스케줄링을 따르며, GPU quota 판단 권한은 Afterglow (`app.services.gpu_quota`)에 있습니다. Drover는 일반 cluster create에서 quota authority가 되지 않고, 현재 `drover/services/stampede.py`의 GPU nodegroup scale 경로에서만 `drover/services/afterglow.py:check_gpu_admission`을 통해 admission 결과를 받아 provisioning intent를 제한적으로 진행합니다.
+   - 노드 배치는 Nova Flavor 스케줄링을 따르며, GPU 쿼터 정책 검증 권한(Authority)은 Afterglow (`app.services.gpu_quota`)가 단독 소유합니다. Drover는 K3s GPU 용량 계산, Allocatable/Readiness 헬스 체크, GPU flavor 사이징 및 스케줄링 로직만 담당합니다.
 
 ---
 
