@@ -46,7 +46,7 @@ graph TD
 
 * **Keystone Catalog Service**: `name: drover`, `type: container-infra`
 * **Keystone Endpoints**: `public`, `internal`, `admin` 모두 `/v1` 엔드포인트 URL 등록 (예: `http://<controller>:8011/v1`)
-* **인증 및 권한**: 프로젝트 범위 Keystone 토큰 (`X-Auth-Token`) 및 `oslo.policy` 기반 RBAC (`drover:clusters:*`, `drover:operations:*`, `drover:admin` 등)
+* **인증 및 권한**: 프로젝트 범위 Keystone 토큰 (`X-Auth-Token`) 및 `oslo.policy` 기반 RBAC (`drover:clusters:*`, `drover:operations:*`, `drover:admin` 등). 토큰 검증·관리자 역할 조회는 catalog의 `identity` internal endpoint만 사용하며 external/public fallback 없이 fail closed 합니다.
 * **SDK 패키지**: `drover-sdk` Python 라이브러리를 통해 `conn.drover` 바인딩 및 카탈로그 자동 인지 사용
 
 ---

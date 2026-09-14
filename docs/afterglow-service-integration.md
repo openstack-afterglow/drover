@@ -12,7 +12,7 @@ Drover 서비스는 Magnum REST wire 호환 형식이 아닌 **Drover 네이티�
 * **Keystone Service Name**: `drover`
 * **Keystone Service Type**: `container-infra` (새로운 SDK 패키지 `drover-sdk`가 `container-infra` 서비스 타입에 `drover` 앨리어스를 등록함)
 * **Keystone Endpoints**: `public`, `internal`, `admin` 모든 인터페이스 엔드포인트 URL이 `/v1`으로 종료됨 (예: `http://openstack.example.com:8011/v1`)
-* **인증 모델**: 호출자의 프로젝트 범주 Keystone 토큰 (`X-Auth-Token` 필수, 선택적 `X-Project-Id` 헤더)
+* **인증 모델**: 호출자의 프로젝트 범위 Keystone 토큰 (`X-Auth-Token` 필수, 선택적 `X-Project-Id` 헤더). Drover는 서비스 자격으로 catalog의 `identity` internal endpoint를 해석해 토큰 검증·관리자 역할 조회에 사용하며, internal endpoint 실패 시 external/public fallback을 하지 않는다.
 * **설정 관리 단순화**: Afterglow 서비스의 기존 직접 API URL 설정(`DROVER_SERVICE_URL` 등)을 완전히 제거하고 Keystone 인증 정보(`auth_url`, `token` 또는 credentials)만으로 카탈로그 디스커버리를 수행합니다.
 
 ---
@@ -207,7 +207,7 @@ if __name__ == "__main__":
 | 장애 상황 (Failure Scenario) | 원인 및 진단 방식 | 시스템 자동 동작 (System Behavior) | Afterglow 권장 대응 절차 (Action Required) |
 | :--- | :--- | :--- | :--- |
 | **Keystone 카탈로그 미조회** | Keystone 서비스 등록 누락 또는 네트워크 차단 | `drover_sdk` 예외 발생 (`EndpointNotFound`) | `openstack catalog show container-infra` 검증 후 Kolla `register.yml` 재실행. 비상 시에만 `SERVICE_DROVER_INTERNAL_URL` 임시 설정 |
-| **Keystone 토큰 만료 (401 Unauthorized)** | 호출자의 Keystone 토큰 유효기간 초과 | HTTP 401 및 `Invalid or expired Keystone token` 응답 | 호출자 토큰 재발급 후 API 요청 재시도 |
+| **Keystone 토큰 만료 또는 internal identity 경로 실패 (401 Unauthorized)** | 호출자의 토큰 만료/폐기, internal identity endpoint 누락 또는 내부 VIP 연결 실패 | HTTP 401 및 `Invalid or expired Keystone token` 응답. 토큰 검증과 관리자 역할 조회는 internal endpoint만 사용하고 external/public URL로 우회하지 않음 | 호출자 토큰 상태와 `identity` internal catalog endpoint/VIP/TLS 연결을 각각 확인한 뒤 재시도 |
 | **권한 부족 (403 Forbidden)** | 템플릿 관리 등 관리자 전용 API에 일반 프로젝트 토큰 사용 | HTTP 403 및 Policy rejection 응답 | Keystone 역할(`admin`) 확인 및 권한 요청 |
 | **SSE 스트림 단선 (Stream Disconnect)** | 클라이언트 타임아웃 또는 프록시 연결 끊김 | 백그라운드 Worker에서 자원 생성을 계속 진행 (`WAITING_CALLBACK` ➔ `RUNNING`) | `GET /v1/operations/{operation_id}` 조회를 통해 수동 폴링 전환 |
 | **cloud-init 콜백 타임아웃** | VM 인스턴스 네트워크 미연결 또는 cloud-init 실패 | 30분 콜백 미수신 시 작업 `FAILED` 전환 및 생성 자원 롤백 실행 | `get_operation_events()`를 통해 cloud-init 단계 오류 확인 후 네트워크/이미지 점검 |

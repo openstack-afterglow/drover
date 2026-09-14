@@ -12,6 +12,7 @@ Drover 서비스의 네이티브 REST, SSE(Server-Sent Events) 및 WebSocket API
 ### 1.1 HTTP 인증 및 콘텍스트 헤더
 * **`X-Auth-Token`** *(필수)*: OpenStack Keystone 프로젝트 스코프 인증 토큰. OpenAPI scheme 명칭: `KeystoneToken`.
 * **`X-Project-Id`** *(선택)*: Keystone 인증 시 명시적으로 타겟 프로젝트 ID를 지정할 때 사용.
+  생략하면 `GET /v3/auth/tokens`로 제출된 토큰 자체를 검증하고 원래 프로젝트 범위를 보존합니다. 사용자의 default project로 재인증하지 않습니다. 명시하면 Keystone이 승인하는 해당 프로젝트로의 rescope를 수행합니다. Drover는 서비스 자격으로 카탈로그의 `identity` **internal** 인터페이스를 먼저 해석하고, 토큰 검증과 관리자 역할 조회를 그 URL로만 보냅니다. internal identity endpoint가 없거나 조회에 실패하면 external/public URL로 우회하지 않고 인증을 거부합니다. 미스코프·폐기·만료 토큰과 검증 실패도 계속 거부합니다.
 * **`X-Openstack-Request-Id`** *(자동 생성/전달)*: 시스템 전반의 상관관계(Correlation) 추적용 요청 식별자. API 응답 헤더 및 로그/이벤트 페이로드에 포함됨.
 * **`Idempotency-Key`** *(생성 API에서 선택·권장)*: `POST /v1/clusters/async`의 재전송을 같은 오퍼레이션으로 귀속시키는 유니크 키입니다. 현재 스케일·삭제·노드그룹 변경에는 외부 멱동성 계약이 없습니다.
 

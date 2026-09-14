@@ -55,7 +55,8 @@ graph TD
 - **OCCM (OpenStack Cloud Controller Manager)**: Kubernetes Ingress / Service Type LoadBalancer 수용 및 Octavia 로드밸런서 자동 동기화 (`drover_occm_enabled: true`).
 
 ### 2.5 Keystone (Identity & Access)
-- 사용자 요청 시 호출자의 `X-Auth-Token`을 통한 토큰 검증 및 프로젝트 스코프 확인.
+- 사용자 요청 시 호출자의 `X-Auth-Token`을 검증하고 프로젝트 스코프를 확인합니다. 프로젝트 헤더가 없으면 제출된 토큰 범위를 보존합니다.
+- 서비스 자격으로 catalog의 `identity` internal endpoint를 해석하여 토큰 introspection, 명시적 rescope 및 관리자 역할 조회를 보냅니다. internal endpoint가 없거나 연결할 수 없으면 external/public endpoint로 fallback하지 않고 fail closed 합니다.
 - 서비스 카탈로그 자동 등록 (`drover_keystone_service_name: drover`, `drover_keystone_service_type: container-infra`).
 - **클러스터 전용 Application Credentials**: OCCM, Cinder CSI, Manila CSI 플러그인을 위해 클러스터별 최소 권한의 Keystone Application Credential을 자동 발급하고 클러스터 삭제 시 즉시 파기.
 
