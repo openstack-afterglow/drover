@@ -375,6 +375,8 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
         "resource_policy_snapshot": {
             "k3s.volume_availability_zone": {"id": "nova-az"}
         },
+        "key_name": "caller-key",
+        "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 caller@example",
         "api_lb_id": "lb-ha-1",
         "api_lb_pool_id": "pool-ha-1",
         "api_fip_address": "198.51.100.50",
@@ -434,7 +436,7 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
             return_value=agent_userdata,
         ) as generate_userdata,
         patch("drover.services.cinder.create_volume_from_image", side_effect=[mock_vol2, mock_vol3]),
-        patch("drover.services.nova.create_server", side_effect=[mock_vm2, mock_vm3]),
+        patch("drover.services.nova.create_server", side_effect=[mock_vm2, mock_vm3]) as nova_create_server,
         patch("drover.services.store.create_ha_callback_token", new=AsyncMock(return_value="ha-tok-123")),
     ):
         await provisioner.bootstrap_ha_servers(
@@ -456,6 +458,12 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
         call.kwargs["extra_tls_sans"] == ["192.168.240.50", "198.51.100.50"]
         for call in generate_userdata.call_args_list
     )
+    assert all(
+        call.kwargs["ssh_public_key"] == "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"
+        for call in generate_userdata.call_args_list
+    )
+    for create_call in nova_create_server.call_args_list:
+        assert "key_name" not in create_call.kwargs
 
     # Server #2 and Server #3 callback -> _handle_ha_joiner
     mock_mem2 = {"id": "member-master-2"}

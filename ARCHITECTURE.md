@@ -5,8 +5,8 @@
 Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 생성·운영·삭제를 담당하는 독립적인 control plane 서비스다. Afterglow가 화면과 외부 BFF를 소유한다면 Drover는 `/v1` API, 내구성 작업 큐, OpenStack 자원 inventory, VM callback 이후의 K3s 조정을 소유한다.
 
 - Repository: https://github.com/openstack-afterglow/drover
-- 분석 기준: `dev` 브랜치, 커밋 `3264e7c`, 작업 트리의 소스와 테스트
-- 패키지: `drover==0.2.20`, `drover-sdk==0.2.20`
+- 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
+- 패키지: `drover==0.2.21`, `drover-sdk==0.2.21`
 - 주요 런타임: Python `>=3.12`, FastAPI `0.125.0`, Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -70,6 +70,8 @@ graph LR
 4. 서버 VM이 `/v1/callback`으로 성공 결과를 보내면 Redis에서 callback token을 GETDEL 의미로 소비하고 kubeconfig를 암호화해 MariaDB에 저장한다. 단일 master는 `provision_agents`, HA는 `bootstrap_ha_servers`와 joiner callback을 거쳐 agent job을 enqueue한다.
 5. agent job이 완료되면 cluster가 `ACTIVE`가 되고 create operation이 `SUCCEEDED`가 된다. callback 실패·누락·30분 timeout은 operation/cluster를 실패 처리한다.
 
+선택한 `key_name`은 API admission에서 요청자 connection으로 공개키를 조회·검증한 뒤 기존 cluster/job `ssh_public_key`에 snapshot으로 저장한다. Worker는 tenant manager 계정으로 Nova를 호출하므로 caller의 keypair 이름을 전달하지 않는다. primary·HA server 및 agent의 Ubuntu cloud-init/FCOS Ignition이 같은 공개키를 설치한다. API/worker가 모두 새 버전이어야 이 계약을 보장하며, named-key job/cluster에 snapshot이 없는 구 데이터는 fail-closed 처리한다. 새 schema나 manager 키페어 리소스는 추가하지 않는다.
+
 ### Reconnection, idempotency, scale/delete
 
 - create에 같은 idempotency key와 같은 canonical request hash를 재전송하면 기존 operation/cluster를 재사용하고, hash가 다르면 `409`다. 이 계약은 `POST /v1/clusters/async`에 한정된다.
@@ -122,7 +124,7 @@ API namespace는 `/v1`이며 health/discovery도 `/v1` 아래에 있다. Keyston
 | 경계 | 실제 계약 |
 |---|---|
 | 사용자/프로젝트 → API | `X-Auth-Token` Keystone token과 optional project context를 검증하고 `oslo.policy`와 project ownership으로 접근을 제한한다. `X-Openstack-Request-Id`는 correlation/audit용이다. |
-| Drover → OpenStack | Worker가 service/admin project connection을 사용해 Nova, Neutron, Cinder, Octavia, Keystone, 선택적 Barbican/Manila를 호출한다. 자원 metadata/tag와 DB inventory로 소유 경계를 추적한다. |
+| Drover → OpenStack | Worker는 tenant project의 별도 manager connection으로 Nova, Neutron, Cinder, Octavia 등을 호출한다. Service/admin scope는 manager identity bootstrap에 사용한다. 자원 metadata/tag와 DB inventory로 소유 경계를 추적한다. |
 | VM → callback | cloud-init이 callback URL과 one-time token을 사용한다. `drover_callback_allowed_cidrs`가 설정되면 source IP를 먼저 제한하고 token은 Redis에서 소비한다. |
 | Drover → Afterglow | Stampede의 제한된 GPU admission/provisioning intent만 전용 내부 URL과 설정된 token으로 호출한다. Afterglow의 사용자 API token이나 내부 secret을 문서에 기록하지 않는다. |
 | cluster plugin → OpenStack | OCCM/CSI/Ingress/KMS가 필요한 경우 cluster별 최소권한 application credential을 userdata에 전달하며 삭제 시 회수 경로를 사용한다. |
@@ -172,9 +174,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "b7e899cccab5a09e738086f8cb971095793d768cf07c8df6ebf101f29e6f7f37",
-  "reviewed_at": "2026-09-16T17:28:40Z",
-  "summary": "Release v0.2.20 with architecture guard and session leak fixes"
+  "source_sha256": "e7e452b9c2b98a82e508be8361555290f080e93fc195265db71fb1ddebf45a91",
+  "reviewed_at": "2026-09-17T04:12:29Z",
+  "summary": "Caller-selected Nova keypair is resolved on the request connection and canonicalized into the existing ssh_public_key snapshot before queueing; worker primary/HA/agents and nodegroup provisioning consume that snapshot through server Ubuntu/FCOS userdata instead of forwarding the caller key_name under the tenant manager identity, and legacy named-key rows without a snapshot fail closed. No new schema or manager keypair resources."
 }
 ```
 <!-- architecture-review:end -->

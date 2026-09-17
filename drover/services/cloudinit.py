@@ -9,7 +9,7 @@ from typing import Any, NamedTuple
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-from drover.utils.ssh_keys import validate_ssh_public_key
+from drover.utils.ssh_keys import normalize_ssh_public_key
 
 TEMPLATE_DIR = Path(__file__).parent.parent / "templates"
 _jinja = Environment(
@@ -48,6 +48,7 @@ def _validate_pin_input(name: str, value: str) -> str:
 def verify_no_service_password(text: str, settings: Any = None) -> None:
     """Ensure rendered cloud-init or manifest content does not contain service password."""
     from drover.config import get_settings
+
     if settings is None:
         try:
             settings = get_settings()
@@ -57,6 +58,7 @@ def verify_no_service_password(text: str, settings: Any = None) -> None:
         pwd = settings.os_password.strip()
         if pwd in text:
             raise ValueError("Rendered output contains service os_password")
+
 
 def _build_k3s_network_pin_script(
     *,
@@ -352,6 +354,7 @@ def _build_server_ignition(
     extra_tls_sans: list[str],
     needs_external_cloud_provider: bool,
     primary_network_id: str,
+    ssh_public_key: str = "",
     server_node_name: str = "",
     cluster_init: bool = False,
     join_url: str = "",
@@ -470,6 +473,8 @@ WantedBy=multi-user.target
             ]
         },
     }
+    if ssh_public_key:
+        ignition["passwd"] = {"users": [{"name": "core", "sshAuthorizedKeys": [ssh_public_key]}]}
     return json.dumps(ignition)
 
 
@@ -552,6 +557,7 @@ def generate_server_userdata(
     callback_token: str,
     *,
     primary_network_id: str,
+    ssh_public_key: str | None = None,
     cloud_conf: str | None = None,
     plugin_manifests: list[dict] | None = None,  # [{"name": "occm", "content": "..."}]
     extra_server_args: list[str] | None = None,
@@ -583,6 +589,7 @@ def generate_server_userdata(
         needs_external_cloud_provider = True
     primary_network_id = _validate_pin_input("primary_network_id", primary_network_id)
     pin_script = _build_k3s_network_pin_script(primary_network_id=primary_network_id, server=True)
+    ssh_public_key = normalize_ssh_public_key(ssh_public_key) if ssh_public_key else ""
 
     if os_type == OS_TYPE_FCOS:
         ign_str = _build_server_ignition(
@@ -597,6 +604,7 @@ def generate_server_userdata(
             extra_tls_sans=extra_tls_sans or [],
             needs_external_cloud_provider=needs_external_cloud_provider,
             primary_network_id=primary_network_id,
+            ssh_public_key=ssh_public_key,
             server_node_name=server_node_name or "",
             cluster_init=cluster_init,
             join_url=join_url or "",
@@ -613,6 +621,7 @@ def generate_server_userdata(
 
     # Ubuntu (기본)
     template_vars = dict(
+        ssh_public_key=ssh_public_key,
         cluster_name=cluster_name,
         k3s_version=k3s_version,
         callback_url=callback_url,
@@ -655,9 +664,8 @@ def generate_agent_userdata(
     primary_network_id = _validate_pin_input("primary_network_id", primary_network_id)
     pin_script = _build_k3s_network_pin_script(primary_network_id=primary_network_id, server=False)
 
-    # SSH 공개키 형식 검증 (YAML injection 방지)
     if ssh_public_key:
-        validate_ssh_public_key(ssh_public_key)
+        ssh_public_key = normalize_ssh_public_key(ssh_public_key)
 
     # 하위호환: occm_enabled → cloud-provider=external
     agent_args = list(extra_agent_args or [])

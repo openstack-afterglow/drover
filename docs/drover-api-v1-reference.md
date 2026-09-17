@@ -119,6 +119,9 @@ Drover 서비스의 네이티브 REST, SSE(Server-Sent Events) 및 WebSocket API
   - 이벤트 라인 형식 (`K3sProgressMessage`):
     `data: {"step": "security_group", "progress": 10, "message": "...", "cluster_id": "...", "operation_id": "op-123"}`
 
+- **SSH 키 소유권**: `key_name`은 요청자의 Nova 키페어 이름이다. API가 요청자 connection으로 공개키를 조회·검증하고 기존 `ssh_public_key` cluster/job 필드에 snapshot을 저장한다. Worker는 tenant manager 계정으로 실행하므로 요청자의 `key_name`을 Nova server 생성에 넘기지 않는다. 서버·HA joiner·agent는 snapshot을 Ubuntu cloud-init 또는 FCOS Ignition의 authorized keys로 받는다. 공개키만 저장하며 private key나 caller token은 job에 보관하지 않는다.
+- **실패 및 upgrade 경계**: 선택한 키를 조회·검증할 수 없으면 cluster/job 생성 전에 요청을 거부한다. 이미 승인된 idempotent 요청은 저장된 operation을 재사용한다. 업그레이드 전 생성된 named-key job/cluster에 공개키 snapshot이 없으면 worker는 키를 무시하거나 manager 이름으로 추정하지 않고 실패한다. 기존 실패 job을 재시도하는 대신 API/worker 업그레이드 후 새 요청으로 생성한다. 기존 부분 생성 자원은 inventory를 확인해 별도 정리해야 하며 자동 삭제를 보장하지 않는다.
+
 ### `PATCH /v1/clusters/{cluster_id}/scale`
 - **설명**: 클러스터 워커(Agent) 노드 수 변경. (Rate limit: 10/min)
 - **요청 바디 (`ScaleK3sClusterRequest`)**: `{"agent_count": 4}`

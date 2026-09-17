@@ -51,11 +51,12 @@ def store():
 @pytest.fixture
 def test_app(store):
     app = FastAPI()
+    conn = MagicMock()
+    conn._afterglow_project_id = "proj-test-123"
+    conn._afterglow_user_id = "user-test-123"
+    app.state.caller_conn = conn
 
     async def mock_os_conn():
-        conn = MagicMock()
-        conn._afterglow_project_id = "proj-test-123"
-        conn._afterglow_user_id = "user-test-123"
         return conn
 
     async def mock_token_info():
@@ -173,6 +174,7 @@ def mock_durable_services(store, monkeypatch):
             project_id=project_id,
             kind=kind,
             status="queued",
+            payload_json=dict(payload),
             operation_id=op_id,
         )
         return job_id
@@ -323,3 +325,63 @@ async def test_disconnected_stream_does_not_cancel_job(async_client, store):
     op = store.operations.get(job.operation_id)
     assert op is not None
     assert op.status in ("QUEUED", "RUNNING", "WAITING_CALLBACK", "SUCCEEDED")
+
+
+async def test_unknown_keypair_prevents_enqueue(async_client, store, test_app):
+    """A caller-visible missing keypair is rejected before durable state is created."""
+    test_app.state.caller_conn.compute.find_keypair.return_value = None
+
+    response = await async_client.post(
+        "/v1/clusters/async",
+        json={"name": "missing-key", "key_name": "caller-key"},
+    )
+
+    assert response.status_code == 400
+    assert store.clusters == {}
+    assert store.jobs == {}
+
+
+async def test_public_key_snapshot_survives_durable_queue(async_client, store, test_app):
+    """The first caller key snapshot survives idempotent replay without a new job."""
+    headers = {"Idempotency-Key": "ssh-key-snapshot-replay"}
+    body = {"name": "snapshotted-key", "key_name": "caller-key"}
+    test_app.state.caller_conn.compute.find_keypair.return_value = MagicMock(
+        public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 caller@example"
+    )
+
+    async with async_client.stream("POST", "/v1/clusters/async", json=body, headers=headers) as response:
+        assert response.status_code == 200
+        await _parse_sse(response)
+
+    expected_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"
+    cluster = next(iter(store.clusters.values()))
+    job = next(iter(store.jobs.values()))
+    assert cluster["ssh_public_key"] == expected_key
+    assert job.payload_json["ssh_public_key"] == expected_key
+
+    test_app.state.caller_conn.compute.find_keypair.return_value = MagicMock(
+        public_key="ssh-ed25519 changed-key-material"
+    )
+    async with async_client.stream("POST", "/v1/clusters/async", json=body, headers=headers) as response:
+        assert response.status_code == 200
+        await _parse_sse(response)
+
+    assert len(store.clusters) == 1
+    assert len(store.jobs) == 1
+    assert next(iter(store.jobs.values())).payload_json["ssh_public_key"] == expected_key
+
+
+async def test_multiline_keypair_prevents_enqueue(async_client, store, test_app):
+    """Caller key material that could extend userdata is rejected before enqueue."""
+    test_app.state.caller_conn.compute.find_keypair.return_value = MagicMock(
+        public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 caller@example\nssh-rsa injected"
+    )
+
+    response = await async_client.post(
+        "/v1/clusters/async",
+        json={"name": "invalid-key", "key_name": "caller-key"},
+    )
+
+    assert response.status_code == 400
+    assert store.clusters == {}
+    assert store.jobs == {}

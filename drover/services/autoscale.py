@@ -11,6 +11,7 @@ import random
 import string
 
 from drover.config import get_settings
+from drover.utils.ssh_keys import normalize_ssh_public_key
 
 _logger = logging.getLogger(__name__)
 
@@ -71,6 +72,10 @@ async def provision_nodegroup_vms(
     os_type = cluster.get("os_type") or "ubuntu"
     network_id = cluster.get("network_id") or ""
     ssh_public_key = cluster.get("ssh_public_key") or None
+    if cluster.get("key_name") and not ssh_public_key:
+        raise RuntimeError("SSH public key snapshot is missing for the requested keypair")
+    if ssh_public_key:
+        ssh_public_key = normalize_ssh_public_key(ssh_public_key)
     sg_id = cluster.get("security_group_id") or None
     boot_volume_size = s.drover_boot_volume_size_gb
     volume_availability_zone = (resource_snapshot.get("k3s.volume_availability_zone") or {}).get("id") or ""

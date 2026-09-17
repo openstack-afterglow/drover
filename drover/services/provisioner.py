@@ -8,12 +8,21 @@ import random
 import string
 
 from drover.services import store as k3s_cluster
+from drover.utils.ssh_keys import normalize_ssh_public_key
 
 _logger = logging.getLogger(__name__)
 
 
 def _rand_suffix(length: int = 5) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+
+def _require_ssh_public_key_snapshot(source: dict) -> str | None:
+    """Return the persisted caller key without falling back to manager keypairs."""
+    ssh_public_key = source.get("ssh_public_key")
+    if source.get("key_name") and not ssh_public_key:
+        raise RuntimeError("SSH public key snapshot is missing for the requested keypair")
+    return normalize_ssh_public_key(ssh_public_key) if ssh_public_key else None
 
 
 async def _resolve_ha_join_endpoint(
@@ -167,7 +176,7 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
     plugin_settings = k3s_plugins.with_resource_policy_snapshot(s, resource_snapshot)
     agent_flavor_id = cluster.get("agent_flavor_id") or ""
     network_id = cluster.get("network_id") or ""
-    ssh_public_key = cluster.get("ssh_public_key") or None
+    ssh_public_key = _require_ssh_public_key_snapshot(cluster)
     cluster_name = cluster.get("name") or cluster_id
     k3s_version = cluster.get("k3s_version") or ""
     os_type = cluster.get("os_type") or "ubuntu"
@@ -329,7 +338,7 @@ async def bootstrap_ha_servers(
     network_id = cluster.get("network_id") or ""
     volume_availability_zone = (resource_snapshot.get("k3s.volume_availability_zone") or {}).get("id") or ""
     sg_id = cluster.get("security_group_id") or None
-    key_name = cluster.get("key_name") or None
+    ssh_public_key = _require_ssh_public_key_snapshot(cluster)
     callback_url = s.drover_callback_base_url.rstrip("/")
     if not all((k3s_version, image_id, server_flavor_id, network_id, volume_availability_zone)):
         _logger.error("HA bootstrap: creation-time resource snapshot is incomplete")
@@ -417,6 +426,7 @@ async def bootstrap_ha_servers(
                     extra_write_files=extra_write_files,
                     extra_tls_sans=ha_extra_tls_sans,
                     needs_external_cloud_provider=k3s_plugins.needs_external_cloud_provider(s),
+                    ssh_public_key=ssh_public_key,
                     os_type=os_type,
                     server_node_name=server_vm_name,
                     cluster_init=False,
@@ -432,7 +442,6 @@ async def bootstrap_ha_servers(
                     network_id,
                     boot_vol.id,
                     userdata=userdata_result.data,
-                    key_name=key_name,
                     metadata={
                         "k3s_horse_generator_role": "k3s_server",
                         "k3s_horse_generator_cluster_id": cluster_id,
@@ -480,6 +489,7 @@ async def create_cluster_job(
     from drover.services import plugins as k3s_plugins
 
     s = get_settings()
+    ssh_public_key = _require_ssh_public_key_snapshot(payload)
     try:
         conn = await keystone.get_project_manager_connection(project_id)
     except Exception as e:
@@ -504,7 +514,6 @@ async def create_cluster_job(
     server_flavor_id = payload.get("server_flavor_id") or ""
     boot_volume_size = s.drover_boot_volume_size_gb
     volume_availability_zone = (policy_snapshot.get("k3s.volume_availability_zone") or {}).get("id") or ""
-    key_name = payload.get("key_name") or None
     network_id = payload.get("network_id") or ""
     k3s_version = payload.get("k3s_version") or ""
     os_type = payload.get("os_type") or "ubuntu"
@@ -724,15 +733,6 @@ async def create_cluster_job(
                 payload_json={"step": K3sProgressStep.SERVER_CREATING.value, "progress": 40},
             )
 
-        ssh_public_key = ""
-        if key_name:
-            try:
-                kp = await asyncio.to_thread(conn.compute.find_keypair, key_name)
-                if kp:
-                    ssh_public_key = kp.public_key or ""
-            except Exception:
-                pass
-
         callback_token = await k3s_cluster.create_callback_token(project_id, cluster_id)
         callback_url = s.drover_callback_base_url.rstrip("/")
 
@@ -829,6 +829,7 @@ async def create_cluster_job(
             extra_server_args=extra_server_args,
             extra_write_files=extra_write_files,
             extra_tls_sans=extra_tls_sans,
+            ssh_public_key=ssh_public_key,
             needs_external_cloud_provider=k3s_plugins.needs_external_cloud_provider(plugin_settings),
             os_type=os_type,
             server_node_name=server_vm_name,
@@ -862,7 +863,6 @@ async def create_cluster_job(
             network_id,
             boot_volume_id,
             userdata=userdata_result.data,
-            key_name=key_name,
             metadata=server_vm_metadata,
             delete_boot_volume_on_termination=True,
             security_groups=[sg_id],

@@ -267,7 +267,7 @@ class TestFCOSAgentUserdata:
         assert units["k3s-agent-join.service"]["enabled"] is True
 
     def test_fcos_agent_ignition_with_ssh_key(self):
-        """FCOS 에이전트 Ignition에 SSH 공개키가 passwd.users에 포함되어야 한다."""
+        """FCOS 에이전트 Ignition에는 정규화된 SSH 공개키가 포함되어야 한다."""
         from drover.services.cloudinit import generate_agent_userdata
 
         result = generate_agent_userdata(
@@ -280,10 +280,8 @@ class TestFCOSAgentUserdata:
             os_type="fcos",
         )
         ign = _decode_userdata(result.data)
-        assert "passwd" in ign
         users = {u["name"]: u for u in ign["passwd"]["users"]}
-        assert "core" in users
-        assert "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 test@host" in users["core"]["sshAuthorizedKeys"]
+        assert users["core"]["sshAuthorizedKeys"] == ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"]
 
     def test_fcos_agent_ignition_without_ssh_key(self):
         """SSH 키 없을 때 FCOS 에이전트 Ignition에 passwd 섹션이 없어야 한다."""
