@@ -70,19 +70,22 @@ graph TD
 Drover는 **Kolla-Ansible** 컨테이너 배포 환경을 표준으로 지원합니다.
 
 ```
-deploy/kolla/
-├── defaults/main.yml         # Kolla 기본 포트, 이미지, 시크릿 경로 설정
-├── tasks/
-│   ├── bootstrap.yml         # MariaDB 데이터베이스 및 계정 생성
-│   ├── config.yml            # ConfigMap 및 drover.conf/policy.yaml 렌더링
-│   ├── register.yml          # Keystone 서비스 카탈로그 및 엔드포인트 atomic 등록
-│   └── deploy.yml            # 컨테이너 서비스 및 pre-start 마이그레이션 실행
-└── templates/
-    ├── drover.conf.j2        # Drover 메인 구성 파일 템플릿
-    ├── drover-api.json.j2    # Kolla config_files 템플릿
-    ├── drover-worker.json.j2 # Worker 컨테이너 템플릿
-    └── drover-migrate.json.j2# Pre-start Migration 컨테이너 템플릿
+drover wheel
+└── share/kolla-ansible/ansible/roles/drover/
+    ├── defaults/main.yml     # Kolla 기본 포트, 이미지, 시크릿 경로 설정
+    ├── tasks/
+    │   ├── bootstrap_service.yml # MariaDB 데이터베이스 및 계정 생성과 migration 실행
+    │   ├── config.yml            # drover.conf/policy.yaml 렌더링
+    │   ├── preconditions_keystone.yml # Keystone service catalog 등록
+    │   └── deploy.yml            # API/Worker container lifecycle
+    └── templates/
+        ├── drover.conf.j2        # Drover 메인 구성 파일 템플릿
+        ├── drover-api.json.j2    # Kolla config_files 템플릿
+        ├── drover-worker.json.j2 # Worker 컨테이너 템플릿
+        └── drover-migrate.json.j2# Pre-start Migration 컨테이너 템플릿
 ```
+
+소스 role은 `deploy/kolla/ansible/roles/drover`에 있으며 root `drover` wheel의 shared data로 설치됩니다. wheel 기본 설치는 Kolla-Ansible 및 API/Worker runtime dependencies를 포함하지 않으며 서비스 process에는 `drover[service]` extra가 필요합니다. role의 `drover_image_tag`은 root Python package patch version과 독립적으로 마지막 공개 runtime image를 가리킵니다.
 
 ### Schema Readiness 및 Pre-start Migration
 - API 및 Worker 프로세스 시작 전, `drover-migrate` 컨테이너가 먼저 실행되어 `drover/migrations/manifest.txt` 및 `001_baseline.sql` 래저 체크섬을 검증하고 DB 마이그레이션을 안전하게 수행합니다.

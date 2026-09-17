@@ -3,7 +3,8 @@
 The repository validates unit behavior locally. The `Manual Live OpenStack Gate` workflow is `workflow_dispatch`-only and is excluded from push, pull-request, and post-CI automation. It verifies a separately deployed live Drover service; it does not install or reconfigure Kolla from a GitHub-hosted runner. Live checks require `DROVER_INTEGRATION_CLOUD=1` and the GitHub `staging` environment:
 
 - The manually requested revision is checked out exactly, while concurrency prevents overlapping cluster lifecycles.
-- Packaged Kolla assets are validated locally; the live `drover` Keystone catalog entry and public `/v1/health/live` endpoint prove the external deployment separately.
+- Root `drover` wheel installs the role at `share/kolla-ansible/ansible/roles/drover` beneath the selected Python prefix. Its base install deliberately has no Kolla-Ansible or service-runtime dependencies; install the `service` extra only when this environment runs Drover processes.
+- The workflow validates the role source at `deploy/kolla/ansible/roles/drover`; release CI separately builds, installs, and uninstalls the root wheel to prove the shared-data ownership.
 - A dedicated project, network, subnet, image, flavor, volume availability zone, and external network must be configured for disposable tests.
 - Drover resource policies must be pinned to those staging resources, including the HA load-balancer subnet, and `k3s.version` must be configured.
 - A one-master lifecycle exercises create, scale, inventory, delete, and fail-closed cleanup.

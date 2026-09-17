@@ -6,7 +6,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: `drover==0.2.21`, `drover-sdk==0.2.21`
+- 패키지: `drover==0.2.22`, `drover-sdk==0.2.21`
 - 주요 런타임: Python `>=3.12`, FastAPI `0.125.0`, Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -114,6 +114,8 @@ API namespace는 `/v1`이며 health/discovery도 `/v1` 아래에 있다. Keyston
 - `drover-migrate` (`drover.scripts.migrate:main`): `manifest.txt` checksum ledger를 적용·검사하며 API/Worker보다 schema를 먼저 준비한다.
 - `drover-sdk`: `sdk/`의 독립 Python package이며 API/Worker process에 import되어야 하는 내부 module이 아니다.
 - `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
+- 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
+- Kolla role의 `drover_image_tag`은 root wheel 버전과 별개로 마지막으로 공개된 runtime image tag를 가리킨다. 새 image를 실제 publish하기 전에는 package patch release가 이 기본값을 변경하지 않는다.
 
 `GET /v1/health`와 `/v1/health/live`는 process liveness만 의미한다. `/v1/health/ready`는 MariaDB, Redis ping, migration ledger, Keystone service credentials를 모두 확인하고 하나라도 unavailable이면 `503`을 반환한다. 로그는 각 process의 표준 logging과 correlation ID에 남고, operation event 및 reconciliation drift는 MariaDB API 조회로 확인한다. health 결과·Stampede event는 Redis cache이므로 장애 시 최신 값이 없을 수 있다.
 
@@ -136,7 +138,9 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 
 소스에서 확인한 계층별 명령은 다음과 같다. 아래 명령은 외부 OpenStack/Keystone 환경 또는 dev dependencies가 필요할 수 있다.
 
-- API/Worker/migration package: `uv sync --all-extras --frozen`
+- service runtime package: `uv sync --extra service --frozen`
+- development dependencies and service runtime: `uv sync --all-extras --frozen`
+- root wheel with the Kolla role: `uv build --wheel`
 - durable create contract: `uv run pytest tests/test_durable_create.py -q`
 - callback contract: `uv run pytest tests/test_k3s_callback.py -q`
 - operations/jobs contract: `uv run pytest tests/test_operations_jobs.py tests/test_jobs.py -q`
@@ -174,9 +178,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "c723cffadf9365da2c109ad2a453ee07b002bfdfda5ac4853a6404d65d367ef8",
-  "reviewed_at": "2026-09-17T04:23:56Z",
-  "summary": "docker-build.yml now publishes the raw v-prefixed git tag (type=ref,event=tag) so GHCR tags match deploy/kolla drover_image_tag and precheck, enforced by a producer/consumer contract test tied to the package version."
+  "source_sha256": "de405c3a21aa71091023c13269cd16758867cfb36d1b21b2e2fb1835cc2802b5",
+  "reviewed_at": "2026-09-17T11:37:36Z",
+  "summary": "Root drover wheel ships Kolla role shared data; service extra isolates runtime deps; Dockerfile under docker/ with root context; image default decoupled"
 }
 ```
 <!-- architecture-review:end -->

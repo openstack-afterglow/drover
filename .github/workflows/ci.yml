@@ -53,6 +53,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: docker/Dockerfile
           target: drover-api
           load: true
           tags: drover-api:local
@@ -60,6 +61,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: docker/Dockerfile
           target: drover-worker
           load: true
           tags: drover-worker:local
@@ -141,14 +143,19 @@ jobs:
           asyncio.run(main())
           "
 
-  package-kolla-assets:
-    name: Package Kolla deployment assets artifact
+  package-wheel:
+    name: Package Drover wheel with Kolla role
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Upload Kolla deployment assets
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv build --wheel
+      - name: Upload Drover wheel
         uses: actions/upload-artifact@v4
         with:
-          name: kolla-deployment-assets
-          path: deploy/kolla/
+          name: drover-wheel
+          path: dist/*.whl
           if-no-files-found: error

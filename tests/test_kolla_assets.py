@@ -1,4 +1,4 @@
-"""Tests for Drover Kolla-Ansible deployment assets and wheel packaging."""
+"""Tests for Drover Kolla-Ansible deployment assets and root-wheel packaging."""
 
 import subprocess
 import sys
@@ -95,7 +95,7 @@ def test_defaults_variable_interface():
 
     # Image namespace and tags
     assert defaults["drover_image_namespace"] == "ghcr.io/openstack-afterglow"
-    assert defaults["drover_image_tag"] == f"v{drover.__version__}"
+    assert defaults["drover_image_tag"] == "v0.2.21"  # Published image default, deliberately decoupled from root wheel version.
     assert defaults["drover_source_version"] == "66d33447d0a6f8b1b2ba34f88b360a6bf9c28399"
 
     # Required service definitions
@@ -162,28 +162,23 @@ def test_defaults_variable_interface():
     assert "my_secret_key" not in raw_defaults
 
 
-def test_version_lockstep():
-    """Verify version lockstep between root Drover package, marker, default image tag, and wheel metadata."""
+def test_root_wheel_metadata_and_published_image_default():
+    """Verify root wheel metadata owns role assets without changing published image defaults."""
     root_version = drover.__version__
     project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert root_version == project["project"]["version"]
+    assert "dependencies" not in project["project"]
+    assert "service" in project["project"]["optional-dependencies"]
+    assert "kolla-ansible" not in project["project"]["optional-dependencies"]["service"]
+    assert project["tool"]["hatch"]["build"]["targets"]["wheel"]["shared-data"] == {
+        "deploy/kolla/ansible/roles/drover": "share/kolla-ansible/ansible/roles/drover"
+    }
+    assert not (KOLLA_DIR / "pyproject.toml").exists()
+    assert not (KOLLA_DIR / "uv.lock").exists()
+    assert not (KOLLA_DIR / "src" / "drover_kolla").exists()
 
-    # Marker distribution package check
-    marker_file = KOLLA_DIR / "src" / "drover_kolla" / "__init__.py"
-    assert marker_file.is_file(), "Marker package deploy/kolla/src/drover_kolla/__init__.py missing"
-
-    # Defaults image tag check
-    defaults_file = ROLE_DIR / "defaults" / "main.yml"
-    defaults = yaml.safe_load(defaults_file.read_text(encoding="utf-8"))
-    assert defaults["drover_image_tag"] == f"v{root_version}"
-
-    # Wheel pyproject metadata check
-    pyproject_file = KOLLA_DIR / "pyproject.toml"
-    assert pyproject_file.is_file()
-    kolla_project = tomllib.loads(pyproject_file.read_text(encoding="utf-8"))
-    assert kolla_project["project"]["name"] == "drover-kolla"
-    assert kolla_project["project"]["requires-python"] == ">=3.11"
-    assert kolla_project["tool"]["hatch"]["version"]["path"] == "../../drover/__init__.py"
+    defaults = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
+    assert defaults["drover_image_tag"] == "v0.2.21"
 
 
 def test_action_dispatch_and_ordering():
@@ -374,35 +369,29 @@ def test_haproxy_loadbalancer_contract():
     assert any("option httpchk GET /v1/health" in opt for opt in backend_extra)
 
 
-def test_drover_kolla_wheel_packaging_lifecycle(tmp_path):
-    """Build deploy/kolla wheel, inspect RECORD/shared-data, install into prefix, verify role tree, uninstall."""
+def test_root_wheel_packaging_lifecycle(tmp_path):
+    """Build the root wheel, verify shared role data, install it, and verify uninstall cleanup."""
     dist_dir = tmp_path / "dist"
     dist_dir.mkdir()
 
     build_cmd = ["uv", "build", "--wheel", "--out-dir", str(dist_dir)]
-    res = subprocess.run(build_cmd, cwd=KOLLA_DIR, capture_output=True, text=True)
+    res = subprocess.run(build_cmd, cwd=REPO_ROOT, capture_output=True, text=True)
     assert res.returncode == 0, f"uv build failed:\nstdout: {res.stdout}\nstderr: {res.stderr}"
 
     wheels = list(dist_dir.glob("*.whl"))
     assert len(wheels) == 1, f"Expected 1 wheel file, found {wheels}"
     wheel_path = wheels[0]
     version = drover.__version__
-    assert f"drover_kolla-{version}" in wheel_path.name
+    assert wheel_path.name == f"drover-{version}-py3-none-any.whl"
 
-    # 2. Inspect wheel archive shared-data and RECORD
     with zipfile.ZipFile(wheel_path, "r") as zf:
         namelist = zf.namelist()
-        shared_data_prefix = f"drover_kolla-{version}.data/data/share/kolla-ansible/ansible/roles/drover/"
+        shared_data_prefix = f"drover-{version}.data/data/share/kolla-ansible/ansible/roles/drover/"
         role_files_in_zip = [name for name in namelist if name.startswith(shared_data_prefix)]
-        assert len(role_files_in_zip) > 0, "No shared-data role files found in wheel archive!"
-
-        # Destination path check: must be share/kolla-ansible/ansible/roles/drover/
+        assert role_files_in_zip, "No shared-data role files found in wheel archive!"
         for member in role_files_in_zip:
             if not member.endswith("/"):
-                info = zf.getinfo(member)
-                assert info.file_size > 0, f"Shared data file in wheel is empty: {member}"
-
-        # Verify key role files in wheel archive
+                assert zf.getinfo(member).file_size > 0, f"Shared data file in wheel is empty: {member}"
         assert any(member.endswith("defaults/main.yml") for member in role_files_in_zip)
         assert any(member.endswith("tasks/main.yml") for member in role_files_in_zip)
         assert any(member.endswith("tasks/preconditions_keystone.yml") for member in role_files_in_zip)
@@ -411,15 +400,15 @@ def test_drover_kolla_wheel_packaging_lifecycle(tmp_path):
         metadata_members = [name for name in namelist if name.endswith(".dist-info/METADATA")]
         assert len(metadata_members) == 1
         metadata_content = zf.read(metadata_members[0]).decode("utf-8")
-        assert "Requires-Python: >=3.11" in metadata_content
+        assert "Requires-Python: >=3.12" in metadata_content
+        assert "Provides-Extra: service" in metadata_content
+        assert "Requires-Dist: kolla-ansible" not in metadata_content
 
-        # Inspect RECORD file
         record_members = [name for name in namelist if name.endswith("RECORD")]
         assert len(record_members) == 1
         record_content = zf.read(record_members[0]).decode("utf-8")
         assert "share/kolla-ansible/ansible/roles/drover/tasks/main.yml" in record_content
 
-    # 3. Install into an isolated venv without application dependencies.
     venv_dir = tmp_path / "venv"
     create_venv = subprocess.run(
         ["uv", "venv", "--python", sys.executable, str(venv_dir)],
@@ -441,13 +430,10 @@ def test_drover_kolla_wheel_packaging_lifecycle(tmp_path):
     assert (installed_role_dir / "templates" / "drover.conf.j2").is_file()
 
     inst_defaults = yaml.safe_load((installed_role_dir / "defaults" / "main.yml").read_text(encoding="utf-8"))
-    assert inst_defaults["drover_image_tag"] == f"v{version}"
+    assert inst_defaults["drover_image_tag"] == "v0.2.21"
 
-    # 4. Uninstall the wheel and confirm its owned role files are removed.
-    uninstall_cmd = ["uv", "pip", "uninstall", "--python", str(venv_python), "drover-kolla"]
+    uninstall_cmd = ["uv", "pip", "uninstall", "--python", str(venv_python), "drover"]
     res_uninst = subprocess.run(uninstall_cmd, capture_output=True, text=True)
-    assert res_uninst.returncode == 0, (
-        f"uv pip uninstall failed:\nstdout: {res_uninst.stdout}\nstderr: {res_uninst.stderr}"
-    )
+    assert res_uninst.returncode == 0, f"uv pip uninstall failed:\nstdout: {res_uninst.stdout}\nstderr: {res_uninst.stderr}"
     remaining_files = list(installed_role_dir.glob("**/*")) if installed_role_dir.exists() else []
     assert not [path for path in remaining_files if path.is_file()]

@@ -12,3 +12,19 @@ Drover는 OpenStack 환경에서 K3s 클러스터와 노드그룹의 lifecycle, 
 ```bash
 python3 scripts/check_architecture.py
 ```
+
+## Package and Kolla role
+
+The root `drover` wheel owns the Python package and the Kolla-Ansible role as wheel shared data. Installing the wheel places the role at `share/kolla-ansible/ansible/roles/drover` under the installation prefix; it does not install Kolla-Ansible or service runtime dependencies.
+
+Use the `service` extra to run the API, worker, or migration entry points locally:
+
+```bash
+uv sync --extra service --extra dev --frozen
+```
+
+Build the distributable root wheel with `uv build --wheel`. Container builds use the repository-root context and `docker/Dockerfile`:
+
+```bash
+docker build --file docker/Dockerfile --target drover-api .
+```

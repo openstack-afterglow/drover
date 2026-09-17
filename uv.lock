@@ -327,9 +327,17 @@ wheels = [
 
 [[package]]
 name = "drover"
-version = "0.2.21"
+version = "0.2.22"
 source = { editable = "." }
-dependencies = [
+
+[package.optional-dependencies]
+dev = [
+    { name = "fakeredis", extra = ["lua"] },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+]
+service = [
     { name = "afterglow-crypto" },
     { name = "aiomysql" },
     { name = "fastapi" },
@@ -349,39 +357,31 @@ dependencies = [
     { name = "websockets" },
 ]
 
-[package.optional-dependencies]
-dev = [
-    { name = "fakeredis", extra = ["lua"] },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "ruff" },
-]
-
 [package.metadata]
 requires-dist = [
-    { name = "afterglow-crypto", git = "https://github.com/openstack-afterglow/afterglow-crypto.git?rev=aee36e8ea173e486f443fa816de4e6397d11cff2" },
-    { name = "aiomysql", specifier = ">=0.2.0" },
+    { name = "afterglow-crypto", marker = "extra == 'service'", git = "https://github.com/openstack-afterglow/afterglow-crypto.git?rev=aee36e8ea173e486f443fa816de4e6397d11cff2" },
+    { name = "aiomysql", marker = "extra == 'service'", specifier = ">=0.2.0" },
     { name = "fakeredis", extras = ["lua"], marker = "extra == 'dev'", specifier = ">=2.21" },
-    { name = "fastapi", specifier = "==0.125.0" },
-    { name = "httpx", specifier = ">=0.28.1" },
-    { name = "jinja2", specifier = "==3.1.6" },
-    { name = "keystoneauth1", specifier = ">=5.12.0" },
-    { name = "openstacksdk", specifier = "==3.3.0" },
-    { name = "oslo-policy", specifier = ">=4.0.0" },
-    { name = "pydantic", specifier = "==2.13.4" },
-    { name = "pydantic-settings", specifier = "==2.14.2" },
+    { name = "fastapi", marker = "extra == 'service'", specifier = "==0.125.0" },
+    { name = "httpx", marker = "extra == 'service'", specifier = ">=0.28.1" },
+    { name = "jinja2", marker = "extra == 'service'", specifier = "==3.1.6" },
+    { name = "keystoneauth1", marker = "extra == 'service'", specifier = ">=5.12.0" },
+    { name = "openstacksdk", marker = "extra == 'service'", specifier = "==3.3.0" },
+    { name = "oslo-policy", marker = "extra == 'service'", specifier = ">=4.0.0" },
+    { name = "pydantic", marker = "extra == 'service'", specifier = "==2.13.4" },
+    { name = "pydantic-settings", marker = "extra == 'service'", specifier = "==2.14.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
-    { name = "python-keystoneclient", specifier = "==5.4.0" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "redis", extras = ["hiredis"], specifier = "==5.0.0" },
+    { name = "python-keystoneclient", marker = "extra == 'service'", specifier = "==5.4.0" },
+    { name = "pyyaml", marker = "extra == 'service'", specifier = ">=6.0" },
+    { name = "redis", extras = ["hiredis"], marker = "extra == 'service'", specifier = "==5.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7.0" },
-    { name = "slowapi", specifier = ">=0.1.9" },
-    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.0" },
-    { name = "uvicorn", extras = ["standard"], specifier = "==0.39.0" },
-    { name = "websockets", specifier = ">=12.0" },
+    { name = "slowapi", marker = "extra == 'service'", specifier = ">=0.1.9" },
+    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'service'", specifier = ">=2.0.0" },
+    { name = "uvicorn", extras = ["standard"], marker = "extra == 'service'", specifier = "==0.39.0" },
+    { name = "websockets", marker = "extra == 'service'", specifier = ">=12.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["service", "dev"]
 
 [[package]]
 name = "fakeredis"

@@ -85,19 +85,19 @@ jobs:
           print('Staging environment contract verified.')
           "
 
-      - name: Validate packaged Kolla role assets
+      - name: Validate Kolla role source assets
         run: |
           uv run python -c "
           import yaml
           from pathlib import Path
 
-          kolla_dir = Path('deploy/kolla')
-          assert (kolla_dir / 'tasks' / 'main.yml').exists(), 'Kolla main task missing'
-          assert (kolla_dir / 'defaults' / 'main.yml').exists(), 'Kolla defaults missing'
+          role_dir = Path('deploy/kolla/ansible/roles/drover')
+          assert (role_dir / 'tasks' / 'main.yml').exists(), 'Kolla main task missing'
+          assert (role_dir / 'defaults' / 'main.yml').exists(), 'Kolla defaults missing'
 
-          defaults = yaml.safe_load((kolla_dir / 'defaults' / 'main.yml').read_text())
-          assert defaults.get('drover_keystone_service_name') == 'drover'
-          print('Packaged Kolla role assets validated; live deployment is verified separately.')
+          defaults = yaml.safe_load((role_dir / 'defaults' / 'main.yml').read_text())
+          assert defaults.get('drover_keystone_user') == 'drover'
+          print('Kolla role source assets validated; live deployment is verified separately.')
           "
 
       - name: Assert live Drover catalog and liveness

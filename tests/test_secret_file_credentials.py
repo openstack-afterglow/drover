@@ -154,7 +154,7 @@ def test_kolla_drover_conf_renders_only_secret_paths():
 def test_kolla_secret_files_are_root_group_readable_for_non_root_container():
     role_root = Path(__file__).parents[1] / "deploy" / "kolla" / "ansible" / "roles" / "drover"
     tasks_text = (role_root / "tasks" / "config.yml").read_text()
-    dockerfile_text = (Path(__file__).parents[1] / "Dockerfile").read_text()
+    dockerfile_text = (Path(__file__).parents[1] / "docker" / "Dockerfile").read_text()
 
     assert 'mode: "0750"' in tasks_text
     assert tasks_text.count('mode: "0640"') >= 5

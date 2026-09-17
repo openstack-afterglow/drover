@@ -87,6 +87,7 @@
     name: "afterglow-local/{{ item }}:{{ drover_source_version | truncate(12, True, '') }}"
     build:
       path: "{{ drover_source_dir }}"
+      dockerfile: "{{ drover_source_dir }}/docker/Dockerfile"
       target: "{{ item }}"
     source: build
     force_source: false
