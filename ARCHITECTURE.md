@@ -174,9 +174,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e7e452b9c2b98a82e508be8361555290f080e93fc195265db71fb1ddebf45a91",
-  "reviewed_at": "2026-09-17T04:12:29Z",
-  "summary": "Caller-selected Nova keypair is resolved on the request connection and canonicalized into the existing ssh_public_key snapshot before queueing; worker primary/HA/agents and nodegroup provisioning consume that snapshot through server Ubuntu/FCOS userdata instead of forwarding the caller key_name under the tenant manager identity, and legacy named-key rows without a snapshot fail closed. No new schema or manager keypair resources."
+  "source_sha256": "c723cffadf9365da2c109ad2a453ee07b002bfdfda5ac4853a6404d65d367ef8",
+  "reviewed_at": "2026-09-17T04:23:56Z",
+  "summary": "docker-build.yml now publishes the raw v-prefixed git tag (type=ref,event=tag) so GHCR tags match deploy/kolla drover_image_tag and precheck, enforced by a producer/consumer contract test tied to the package version."
 }
 ```
 <!-- architecture-review:end -->

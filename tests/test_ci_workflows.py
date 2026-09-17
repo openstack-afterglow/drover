@@ -44,8 +44,7 @@ def test_ci_workflow_structure():
     trivy_steps = [s for s in steps if "trivy-action" in s.get("uses", "")]
     assert len(trivy_steps) >= 2, "Expected Trivy scanning steps for both Docker targets"
     assert all(
-        s["uses"] == "aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1"
-        for s in trivy_steps
+        s["uses"] == "aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1" for s in trivy_steps
     ), "Trivy action must use the immutable known-safe 0.35.0 revision"
 
     # Validate db-migration-and-readiness services & steps
@@ -73,6 +72,31 @@ def test_ci_workflow_structure():
     assert artifact_step["with"]["path"] == "deploy/kolla/"
 
 
+def test_docker_build_publishes_kolla_tag_contract():
+    """docker-build.yml tag rules must publish the exact ref Kolla defaults pull."""
+    import drover
+
+    workflow_file = WORKFLOWS_DIR / "docker-build.yml"
+    assert workflow_file.is_file()
+    workflow = yaml.safe_load(workflow_file.read_text(encoding="utf-8"))
+    triggers = workflow.get("on", workflow.get(True, {}))
+    assert triggers.get("push", {}).get("tags") == ["v*"], "tag push must drive image publication"
+    expected_tag = f"v{drover.__version__}"
+    kolla_defaults = yaml.safe_load(
+        (REPO_ROOT / "deploy" / "kolla" / "ansible" / "roles" / "drover" / "defaults" / "main.yml").read_text(encoding="utf-8")
+    )
+    assert kolla_defaults["drover_image_tag"] == expected_tag, "release tag must match the tag Kolla consumes"
+    for image_key in ("meta-api", "meta-worker"):
+        step = next(s for s in workflow["jobs"]["build-and-push"]["steps"] if s.get("id") == image_key)
+        tags = step["with"]["tags"]
+        assert "type=ref,event=tag" in tags, (
+            f"{image_key} must publish the raw git tag; metadata-action semver strips the v prefix "
+            "that deploy/kolla drover_image_tag and precheck consume"
+        )
+        assert "type=semver" not in tags, f"{image_key} must not strip the v prefix"
+        assert "type=raw,value=dev" in tags, f"{image_key} must keep the dev floating tag"
+
+
 def test_staging_workflow_structure():
     """Verify the manual live gate is isolated from automatic CI and fail-closed."""
     staging_file = WORKFLOWS_DIR / "staging.yml"
@@ -94,9 +118,7 @@ def test_staging_workflow_structure():
     checkout_step = next(step for step in steps if step.get("name") == "Checkout requested revision")
     assert checkout_step["with"]["ref"] == "${{ github.sha }}"
 
-    assertion_step = next(
-        step for step in steps if "Assert required staging gate secrets" in step.get("name", "")
-    )
+    assertion_step = next(step for step in steps if "Assert required staging gate secrets" in step.get("name", ""))
     assertion_env = assertion_step["env"]
     assert assertion_env["DROVER_INTEGRATION_CLOUD"] == "1"
     for required_name in (
@@ -175,7 +197,9 @@ def test_release_workflow_structure():
     assert setup_uv_step["with"]["python-version"] == "3.11"
 
     # Check lockstep step
-    lockstep_step = next((s for s in steps if "lockstep" in s.get("name", "").lower() or "lockstep" in s.get("run", "").lower()), None)
+    lockstep_step = next(
+        (s for s in steps if "lockstep" in s.get("name", "").lower() or "lockstep" in s.get("run", "").lower()), None
+    )
     assert lockstep_step is not None, "Missing tag and version lockstep check step"
 
     # Check wheel build step
