@@ -229,7 +229,7 @@ async def test_handle_ha_joiner_adds_lb_member_and_triggers_agents():
             "drover.services.store.get_cluster_node_token",
             new=AsyncMock(return_value="K10abc::server:xyz"),
         ) as get_node_token,
-        patch("drover.services.keystone.get_admin_connection_for_project") as mock_conn,
+        patch("drover.services.keystone.get_project_manager_connection") as mock_conn,
         patch("drover.services.octavia.add_member") as mock_add,
         patch("drover.api.callback._jobs_svc.enqueue_job", new=AsyncMock()) as enqueue_job,
     ):
@@ -272,7 +272,7 @@ async def test_handle_ha_joiner_no_agents_if_not_all_joined():
     with (
         patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
         patch("drover.services.store.incr_ha_join_count", new=AsyncMock(return_value=1)),
-        patch("drover.services.keystone.get_admin_connection_for_project") as mock_conn,
+        patch("drover.services.keystone.get_project_manager_connection") as mock_conn,
         patch("drover.services.octavia.add_member"),
         patch("drover.api.callback._jobs_svc.enqueue_job", new=AsyncMock()) as enqueue_job,
     ):
@@ -375,6 +375,8 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
         "resource_policy_snapshot": {
             "k3s.volume_availability_zone": {"id": "nova-az"}
         },
+        "key_name": "caller-key",
+        "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 caller@example",
         "api_lb_id": "lb-ha-1",
         "api_lb_pool_id": "pool-ha-1",
         "api_fip_address": "198.51.100.50",
@@ -423,7 +425,7 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
 
     with (
         patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
-        patch("drover.services.keystone.get_admin_connection_for_project", return_value=mock_conn),
+        patch("drover.services.keystone.get_project_manager_connection", return_value=mock_conn),
         patch("drover.services.octavia.add_member", return_value=mock_mem1),
         patch(
             "drover.services.octavia.get_load_balancer",
@@ -434,7 +436,7 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
             return_value=agent_userdata,
         ) as generate_userdata,
         patch("drover.services.cinder.create_volume_from_image", side_effect=[mock_vol2, mock_vol3]),
-        patch("drover.services.nova.create_server", side_effect=[mock_vm2, mock_vm3]),
+        patch("drover.services.nova.create_server", side_effect=[mock_vm2, mock_vm3]) as nova_create_server,
         patch("drover.services.store.create_ha_callback_token", new=AsyncMock(return_value="ha-tok-123")),
     ):
         await provisioner.bootstrap_ha_servers(
@@ -456,6 +458,12 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
         call.kwargs["extra_tls_sans"] == ["192.168.240.50", "198.51.100.50"]
         for call in generate_userdata.call_args_list
     )
+    assert all(
+        call.kwargs["ssh_public_key"] == "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"
+        for call in generate_userdata.call_args_list
+    )
+    for create_call in nova_create_server.call_args_list:
+        assert "key_name" not in create_call.kwargs
 
     # Server #2 and Server #3 callback -> _handle_ha_joiner
     mock_mem2 = {"id": "member-master-2"}
@@ -468,7 +476,7 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
             "drover.services.store.get_cluster_node_token",
             new=AsyncMock(return_value="K10node::token123"),
         ),
-        patch("drover.services.keystone.get_admin_connection_for_project", return_value=mock_conn),
+        patch("drover.services.keystone.get_project_manager_connection", return_value=mock_conn),
         patch("drover.services.octavia.add_member", side_effect=[mock_mem2, mock_mem3]),
         patch("drover.services.operations.get_active_operation", new=AsyncMock(return_value=MagicMock(id=op_id))),
         patch("drover.api.callback._jobs_svc.enqueue_job", new=AsyncMock()),

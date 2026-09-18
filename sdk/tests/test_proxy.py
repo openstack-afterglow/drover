@@ -401,47 +401,6 @@ JSON_METHOD_TABLE = [
         {"value": "v1.31.5+k3s1"},
         None,
     ),
-    ("effective_gpu_quotas", (), {}, "GET", "/v1/gpu-quotas/effective", None, None),
-    ("gpu_quota_status", (), {}, "GET", "/v1/gpu-quotas/status", None, None),
-    (
-        "check_gpu_quota",
-        (),
-        {"extra_specs": {"pci_passthrough:alias": "RTX3090:1"}},
-        "POST",
-        "/v1/gpu-quotas/check",
-        {"extra_specs": {"pci_passthrough:alias": "RTX3090:1"}},
-        None,
-    ),
-    ("default_gpu_quotas", (), {}, "GET", "/v1/admin/gpu-quotas/defaults", None, None),
-    (
-        "set_default_gpu_quota",
-        ("RTX3090", 4),
-        {},
-        "PUT",
-        "/v1/admin/gpu-quotas/defaults",
-        {"gpu_type": "RTX3090", "limit": 4},
-        None,
-    ),
-    ("delete_default_gpu_quota", ("RTX3090",), {}, "DELETE", "/v1/admin/gpu-quotas/defaults/RTX3090", None, None),
-    ("project_gpu_quotas", ("proj-1",), {}, "GET", "/v1/admin/gpu-quotas/proj-1", None, None),
-    (
-        "set_project_gpu_quota",
-        ("proj-1", "RTX3090", 2),
-        {},
-        "PUT",
-        "/v1/admin/gpu-quotas/proj-1",
-        {"gpu_type": "RTX3090", "limit": 2},
-        None,
-    ),
-    (
-        "delete_project_gpu_quota",
-        ("proj-1", "RTX3090"),
-        {},
-        "DELETE",
-        "/v1/admin/gpu-quotas/proj-1/RTX3090",
-        None,
-        None,
-    ),
     (
         "callback",
         (),
@@ -471,9 +430,7 @@ STREAM_METHOD_TABLE = [
 ]
 
 _PUBLIC_PROXY_METHODS = {
-    name
-    for name in vars(Proxy)
-    if name != "request" and not name.startswith("_") and callable(getattr(Proxy, name))
+    name for name in vars(Proxy) if name != "request" and not name.startswith("_") and callable(getattr(Proxy, name))
 }
 
 
@@ -534,24 +491,6 @@ def test_stream_methods_request_without_buffering(method_name, args, http_method
     proxy.request.assert_called_once_with(path, http_method, **expected_kwargs)
     response.iter_lines.assert_called_once_with(decode_unicode=True)
     assert actual_lines == lines
-
-def test_gpu_quota_identifiers_are_escaped_in_paths():
-    proxy = Proxy(session=MagicMock(), service_type="drover")
-    proxy.request = MagicMock(return_value=_response(200, payload={"ok": True}))
-
-    proxy.delete_default_gpu_quota("RTX/3090")
-    proxy.request.assert_called_with("/v1/admin/gpu-quotas/defaults/RTX%2F3090", "DELETE", raise_exc=True)
-
-    proxy.project_gpu_quotas("proj/1")
-    proxy.request.assert_called_with("/v1/admin/gpu-quotas/proj%2F1", "GET", raise_exc=True)
-
-    proxy.set_project_gpu_quota("proj/1", "RTX/3090", 2)
-    proxy.request.assert_called_with(
-        "/v1/admin/gpu-quotas/proj%2F1", "PUT", raise_exc=True, json={"gpu_type": "RTX/3090", "limit": 2}
-    )
-
-    proxy.delete_project_gpu_quota("proj/1", "RTX/3090")
-    proxy.request.assert_called_with("/v1/admin/gpu-quotas/proj%2F1/RTX%2F3090", "DELETE", raise_exc=True)
 
     proxy = Proxy(session=MagicMock(), service_type="drover")
     proxy.request = MagicMock(return_value=_response(200, payload={"ok": True}))
@@ -694,7 +633,9 @@ def test_request_version_contract(monkeypatch, endpoint, url, expected):
     request.assert_called_once_with(expected, "GET", "request failed", True)
 
 
-@pytest.mark.parametrize("malformed_endpoint", ["http://drover-api:8011/v1?query=1", "http://drover-api:8011/v1#fragment"])
+@pytest.mark.parametrize(
+    "malformed_endpoint", ["http://drover-api:8011/v1?query=1", "http://drover-api:8011/v1#fragment"]
+)
 def test_request_rejects_malformed_endpoint_query_fragment(monkeypatch, malformed_endpoint):
     catalog_proxy = Proxy(session=MagicMock(), service_type="drover")
     catalog_proxy.endpoint_override = malformed_endpoint
@@ -724,6 +665,8 @@ def test_request_inspects_effective_endpoint_from_get_endpoint(monkeypatch):
     catalog_proxy.request("/v1/clusters", "GET")
 
     request.assert_called_once_with("/clusters", "GET")
+
+
 def test_idempotency_key_header_forwarding():
     proxy = Proxy(session=MagicMock(), service_type="drover")
     response = SimpleNamespace(iter_lines=MagicMock(return_value=iter([])))
@@ -760,14 +703,16 @@ def test_disconnect_then_poll_completion():
     response = SimpleNamespace(iter_lines=MagicMock(side_effect=failing_stream))
     proxy.request = MagicMock(return_value=response)
 
-    op_events_mock = MagicMock(return_value=[
-        {
-            "sequence": 2,
-            "phase": "completed",
-            "message": "Done",
-            "payload_json": {"step": "completed", "progress": 100, "cluster_id": "c-99"},
-        }
-    ])
+    op_events_mock = MagicMock(
+        return_value=[
+            {
+                "sequence": 2,
+                "phase": "completed",
+                "message": "Done",
+                "payload_json": {"step": "completed", "progress": 100, "cluster_id": "c-99"},
+            }
+        ]
+    )
     get_op_mock = MagicMock(return_value={"id": "op-99", "status": "SUCCEEDED"})
     proxy.operation_events = op_events_mock
     proxy.get_operation = get_op_mock

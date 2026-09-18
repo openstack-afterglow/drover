@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -461,7 +460,7 @@ async def reconcile_cluster(
 
     created_conn = False
     if conn is None:
-        conn = await asyncio.to_thread(keystone.get_admin_connection_for_project, project_id)
+        conn = await keystone.get_project_manager_connection(project_id)
         created_conn = True
 
     try:
@@ -612,7 +611,7 @@ async def reconcile_cluster(
         return drift_summary
     finally:
         if created_conn and hasattr(conn, "close"):
-            await asyncio.to_thread(conn.close)
+            await keystone.close_connection(conn)
 
 
 async def schedule_worker_reconciliations(max_per_project: int = 2) -> list[str]:

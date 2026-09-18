@@ -46,13 +46,14 @@ jobs:
           tags: |
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern={{version}}
+            type=ref,event=tag
             type=sha,prefix=sha-
 
       - name: Build and push API
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: docker/Dockerfile
           target: drover-api
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta-api.outputs.tags }}
@@ -66,13 +67,14 @@ jobs:
           tags: |
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern={{version}}
+            type=ref,event=tag
             type=sha,prefix=sha-
 
       - name: Build and push Worker
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: docker/Dockerfile
           target: drover-worker
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta-worker.outputs.tags }}

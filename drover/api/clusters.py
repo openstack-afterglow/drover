@@ -46,6 +46,7 @@ from drover.services.cache import cached_call, invalidate, ttl_normal, ttl_slow
 from drover.services.cache import invalidation as cache_invalidation
 from drover.services.cache import keys as cache_keys
 from drover.services.deletion import delete_cluster_progress as _delete_cluster_progress
+from drover.utils.ssh_keys import normalize_ssh_public_key
 
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
@@ -348,7 +349,9 @@ async def create_k3s_cluster_async(
             agent_flavor_id = policy_snapshot["k3s.default_agent_flavor"]["id"]
 
         if req.agent_count > 0 and not agent_flavor_id:
-            raise HTTPException(status_code=503, detail="에이전트 플레이버가 설정되지 않았습니다. 관리자에게 문의하세요.")
+            raise HTTPException(
+                status_code=503, detail="에이전트 플레이버가 설정되지 않았습니다. 관리자에게 문의하세요."
+            )
 
         agent_image_snapshot = dict(policy_snapshot[image_policy_key])
         if template_default_image_id:
@@ -373,6 +376,19 @@ async def create_k3s_cluster_async(
             policy_snapshot[optional_key] = {"id": selection["id"], "name": selection["name"]}
 
         network_id = req.network_id or await _instance_orch.resolve_default_network(conn, s)
+        ssh_public_key = None
+        if req.key_name:
+            try:
+                keypair = await asyncio.to_thread(conn.compute.find_keypair, req.key_name)
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="SSH keypair lookup is temporarily unavailable") from exc
+            if not keypair:
+                raise HTTPException(status_code=400, detail=f"SSH keypair not found: {req.key_name}")
+            try:
+                ssh_public_key = normalize_ssh_public_key(keypair.public_key or "")
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="SSH keypair has an invalid public key") from exc
+
         k3s_version = await get_required_runtime_setting("k3s.version")
 
         cluster_id = str(uuid.uuid4())
@@ -399,7 +415,7 @@ async def create_k3s_cluster_async(
             "server_ip": "",
             "api_address": "",
             "key_name": req.key_name or "",
-            "ssh_public_key": None,
+            "ssh_public_key": ssh_public_key,
             "k3s_version": k3s_version,
             "occm_enabled": False,
             "plugins_enabled": None,
@@ -510,6 +526,7 @@ async def create_k3s_cluster_async(
         headers=_SSE_HEADERS,
     )
 
+
 @router.patch("/{cluster_id}/scale")
 @limiter.limit("10/minute")
 async def scale_k3s_cluster(
@@ -565,9 +582,6 @@ async def scale_k3s_cluster(
         extra={"desired_count": desired},
     )
     return {"message": f"스케일링 시작: {current} → {desired}", "agent_count": desired}
-
-
-
 
 
 @router.delete("/{cluster_id}", status_code=204)

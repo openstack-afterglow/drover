@@ -12,6 +12,7 @@ Drover 서비스의 네이티브 REST, SSE(Server-Sent Events) 및 WebSocket API
 ### 1.1 HTTP 인증 및 콘텍스트 헤더
 * **`X-Auth-Token`** *(필수)*: OpenStack Keystone 프로젝트 스코프 인증 토큰. OpenAPI scheme 명칭: `KeystoneToken`.
 * **`X-Project-Id`** *(선택)*: Keystone 인증 시 명시적으로 타겟 프로젝트 ID를 지정할 때 사용.
+  생략하면 `GET /v3/auth/tokens`로 제출된 토큰 자체를 검증하고 원래 프로젝트 범위를 보존합니다. 사용자의 default project로 재인증하지 않습니다. 명시하면 Keystone이 승인하는 해당 프로젝트로의 rescope를 수행합니다. Drover는 서비스 자격으로 카탈로그의 `identity` **internal** 인터페이스를 먼저 해석하고, 토큰 검증과 관리자 역할 조회를 그 URL로만 보냅니다. internal identity endpoint가 없거나 조회에 실패하면 external/public URL로 우회하지 않고 인증을 거부합니다. 미스코프·폐기·만료 토큰과 검증 실패도 계속 거부합니다.
 * **`X-Openstack-Request-Id`** *(자동 생성/전달)*: 시스템 전반의 상관관계(Correlation) 추적용 요청 식별자. API 응답 헤더 및 로그/이벤트 페이로드에 포함됨.
 * **`Idempotency-Key`** *(생성 API에서 선택·권장)*: `POST /v1/clusters/async`의 재전송을 같은 오퍼레이션으로 귀속시키는 유니크 키입니다. 현재 스케일·삭제·노드그룹 변경에는 외부 멱동성 계약이 없습니다.
 
@@ -117,6 +118,9 @@ Drover 서비스의 네이티브 REST, SSE(Server-Sent Events) 및 WebSocket API
 - **응답 (200 OK)**: `text/event-stream` (SSE 스트림)
   - 이벤트 라인 형식 (`K3sProgressMessage`):
     `data: {"step": "security_group", "progress": 10, "message": "...", "cluster_id": "...", "operation_id": "op-123"}`
+
+- **SSH 키 소유권**: `key_name`은 요청자의 Nova 키페어 이름이다. API가 요청자 connection으로 공개키를 조회·검증하고 기존 `ssh_public_key` cluster/job 필드에 snapshot을 저장한다. Worker는 tenant manager 계정으로 실행하므로 요청자의 `key_name`을 Nova server 생성에 넘기지 않는다. 서버·HA joiner·agent는 snapshot을 Ubuntu cloud-init 또는 FCOS Ignition의 authorized keys로 받는다. 공개키만 저장하며 private key나 caller token은 job에 보관하지 않는다.
+- **실패 및 upgrade 경계**: 선택한 키를 조회·검증할 수 없으면 cluster/job 생성 전에 요청을 거부한다. 이미 승인된 idempotent 요청은 저장된 operation을 재사용한다. 업그레이드 전 생성된 named-key job/cluster에 공개키 snapshot이 없으면 worker는 키를 무시하거나 manager 이름으로 추정하지 않고 실패한다. 기존 실패 job을 재시도하는 대신 API/worker 업그레이드 후 새 요청으로 생성한다. 기존 부분 생성 자원은 inventory를 확인해 별도 정리해야 하며 자동 삭제를 보장하지 않는다.
 
 ### `PATCH /v1/clusters/{cluster_id}/scale`
 - **설명**: 클러스터 워커(Agent) 노드 수 변경. (Rate limit: 10/min)
@@ -293,24 +297,12 @@ Policy `drover:admin` (시스템 관리자 전용) 인증이 요구되는 관리
 
 ---
 
-## 9. 통계 및 GPU 쿼터 API (Stats & GPU Quotas)
+## 9. 통계 API (Stats API)
 
 ### 9.1 테넌트 통계 API
 * **`GET /v1/stats/clusters`**: 현재 프로젝트 소유의 클러스터 개수 및 상태별 통계 반환.
 
-### 9.2 테넌트 GPU 쿼터 API (`/v1/gpu-quotas`)
-* **`GET /v1/gpu-quotas/effective`**: 적용된 실효 GPU 쿼터 한도 조회
-* **`GET /v1/gpu-quotas/status`**: GPU 타입별 한도(`limit`), 사용량(`in_use`), 잔여량(`available`) 조회
-* **`POST /v1/gpu-quotas/check`**: 요청 Flavor의 `extra_specs` 기반 GPU 쿼터 충족 여부 사전 검증 (`GpuQuotaCheckRequest`)
-
-### 9.3 관리자 GPU 쿼터 API (`/v1/admin/gpu-quotas`)
-* **`GET /v1/admin/gpu-quotas/defaults`**: 기본 GPU 쿼터 조회
-* **`PUT /v1/admin/gpu-quotas/defaults`**: 기본 GPU 쿼터 설정 (`GpuQuotaRequest`)
-* **`DELETE /v1/admin/gpu-quotas/defaults/{gpu_type}`**: 기본 GPU 쿼터 삭제
-* **`GET /v1/admin/gpu-quotas/{project_id}`**: 특정 프로젝트 GPU 쿼터 및 사용량 조회
-* **`PUT /v1/admin/gpu-quotas/{project_id}`**: 특정 프로젝트 GPU 쿼터 지정
-* **`DELETE /v1/admin/gpu-quotas/{project_id}/{gpu_type}`**: 특정 프로젝트 GPU 쿼터 삭제
-
+> **참고 (GPU 쿼터 이관)**: `/v1/gpu-quotas` 및 `/v1/admin/gpu-quotas` API는 Afterglow 서비스(`app.services.gpu_quota`)로 완전히 이관 및 이관 완료되어 Drover API에서 제거되었습니다. GPU 쿼터 관련 모든 조회 및 설정은 Afterglow API (`/api/v1/admin/gpu-quotas`)를 사용합니다.
 ---
 
 ## 10. 인프라 전용 Guest Callback API (System Callback)

@@ -225,7 +225,7 @@ async def _handle_ha_joiner(
         try:
             from drover.services import keystone
 
-            conn = await asyncio.to_thread(keystone.get_admin_connection_for_project, project_id)
+            conn = await keystone.get_project_manager_connection(project_id)
             subnets = await asyncio.to_thread(lambda: list(conn.network.subnets(network_id=network_id)))
             subnet_id = subnets[0].id if subnets else None
             cluster_name = cluster_info.get("name") or cluster_id
@@ -257,7 +257,7 @@ async def _handle_ha_joiner(
             _logger.warning("HA: failed to add server#%d to LB pool: %s", server_index, e)
         finally:
             if conn is not None:
-                await asyncio.to_thread(conn.close)
+                await keystone.close_connection(conn)
     join_count = await k3s_cluster.incr_ha_join_count(cluster_id)
     _logger.info("HA: cluster %s join count: %d / %d", cluster_id, join_count, master_count - 1)
 

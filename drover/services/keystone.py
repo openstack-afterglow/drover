@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 from typing import TYPE_CHECKING
@@ -282,11 +283,8 @@ def get_openstack_connection(token: str, project_id: str) -> openstack.connectio
     )
 
 
-def get_admin_connection_for_project(project_id: str) -> openstack.connection.Connection:
-    """관리자 크리덴셜로 특정 프로젝트에 스코프된 OpenStack 연결 반환.
-
-    콜백 등 사용자 토큰이 없는 상황에서 프로젝트 리소스를 조작할 때 사용.
-    """
+def _connect_as_service(project_id: str) -> openstack.connection.Connection:
+    """Return the service account scoped only to its assigned service project."""
     import openstack
 
     settings = get_settings()
@@ -345,7 +343,7 @@ def get_service_project_connection() -> openstack.connection.Connection:
             "os_service_project_id 설정이 없습니다. "
             "afterglow.conf [openstack] service_project_id 또는 OS_SERVICE_PROJECT_ID 환경변수를 설정하세요."
         )
-    return get_admin_connection_for_project(settings.os_service_project_id)
+    return _connect_as_service(settings.os_service_project_id)
 
 
 def revoke_token(token: str) -> None:
@@ -433,7 +431,7 @@ async def ensure_cluster_manager_user(project_id: str) -> tuple[str, str]:
         return cached["user_id"], decrypt_manager_password(cached["encrypted_password"])
 
     settings = get_settings()
-    admin_conn = await asyncio.to_thread(get_admin_connection_for_project, project_id)
+    admin_conn = await asyncio.to_thread(get_admin_project_connection)
     try:
         user_id, username, password = await asyncio.to_thread(
             _ensure_cluster_manager_user_sync_with_admin_conn, project_id, admin_conn, settings
@@ -442,7 +440,7 @@ async def ensure_cluster_manager_user(project_id: str) -> tuple[str, str]:
         await save_manager_credentials(project_id, user_id, username, encrypted_pw)
         return user_id, password
     finally:
-        await asyncio.to_thread(admin_conn.close)
+        await close_connection(admin_conn)
 
 
 def _connect_as_manager(project_id: str, password: str, settings):
@@ -465,6 +463,40 @@ def _connect_as_manager(project_id: str, password: str, settings):
     )
 
 
+async def get_project_manager_connection(project_id: str) -> openstack.connection.Connection:
+    """Return the durable per-project manager connection used by background jobs."""
+    _, password = await ensure_cluster_manager_user(project_id)
+    settings = get_settings()
+    return await asyncio.to_thread(_connect_as_manager, project_id, password, settings)
+
+
+def _close_connection_sync(conn) -> None:
+    """Close both the keystoneauth HTTP pool and openstacksdk resources."""
+    sdk_session = getattr(conn, "_session", None)
+    try:
+        if sdk_session is not None:
+            http_session = getattr(sdk_session, "session", None)
+            if http_session is not None:
+                http_session.close()
+    finally:
+        conn.close()
+
+
+async def close_connection(conn) -> None:
+    """Release every resource held by an openstacksdk connection."""
+    await asyncio.to_thread(_close_connection_sync, conn)
+
+
+@contextlib.asynccontextmanager
+async def project_manager_connection(project_id: str):
+    """Yield a durable per-project manager connection and ensure it is closed."""
+    conn = await get_project_manager_connection(project_id)
+    try:
+        yield conn
+    finally:
+        await close_connection(conn)
+
+
 def _create_app_cred_sync(project_id: str, cluster_name: str, user_id: str, password: str) -> dict:
     settings = get_settings()
     mgr_conn = _connect_as_manager(project_id, password, settings)
@@ -477,7 +509,7 @@ def _create_app_cred_sync(project_id: str, cluster_name: str, user_id: str, pass
         )
         return {"id": app_cred.id, "secret": app_cred.secret, "user_id": user_id}
     finally:
-        mgr_conn.close()
+        _close_connection_sync(mgr_conn)
 
 
 async def create_app_credential_for_cluster(project_id: str, cluster_name: str) -> dict:
@@ -496,7 +528,7 @@ def _delete_app_cred_sync(project_id: str, app_cred_id: str, user_id: str, passw
     try:
         mgr_conn.identity.delete_application_credential(user_id, app_cred_id, ignore_missing=True)
     finally:
-        mgr_conn.close()
+        _close_connection_sync(mgr_conn)
 
 
 async def delete_app_credential(project_id: str, app_cred_id: str) -> None:

@@ -8,9 +8,17 @@ _SSH_KEY_RE = re.compile(
 )
 
 
-def validate_ssh_public_key(key: str) -> None:
-    """SSH 공개키 형식 검증. 유효하지 않으면 ValueError 발생."""
+def normalize_ssh_public_key(key: str) -> str:
+    """Validate an SSH public key and return its comment-free form."""
     if "\n" in key or "\r" in key:
         raise ValueError("SSH 공개키에 개행 문자가 포함될 수 없습니다")
-    if not _SSH_KEY_RE.match(key.strip()):
+    parts = key.strip().split()
+    canonical = " ".join(parts[:2])
+    if len(parts) < 2 or not _SSH_KEY_RE.match(canonical):
         raise ValueError(f"유효하지 않은 SSH 공개키 형식입니다: {key[:40]!r}...")
+    return canonical
+
+
+def validate_ssh_public_key(key: str) -> None:
+    """SSH 공개키 형식 검증. 유효하지 않으면 ValueError 발생."""
+    normalize_ssh_public_key(key)

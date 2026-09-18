@@ -92,6 +92,28 @@
   no_log: true
   when: inventory_hostname in groups['drover']
 
+- name: Config | Render Drover Afterglow admission token secret file
+  become: true
+  ansible.builtin.copy:
+    content: "{{ drover_afterglow_admission_token }}"
+    dest: "{{ drover_secrets_dir }}/afterglow_admission_token"
+    mode: "0640"
+    owner: root
+    group: root
+  no_log: true
+  when: inventory_hostname in groups['drover']
+
+- name: Config | Render Drover Afterglow provisioning token secret file
+  become: true
+  ansible.builtin.copy:
+    content: "{{ drover_afterglow_provisioning_token }}"
+    dest: "{{ drover_secrets_dir }}/afterglow_k3s_provisioning_token"
+    mode: "0640"
+    owner: root
+    group: root
+  no_log: true
+  when: inventory_hostname in groups['drover']
+
 - name: Config | Render drover.conf
   become: true
   ansible.builtin.template:

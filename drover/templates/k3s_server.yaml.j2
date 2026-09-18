@@ -2,6 +2,11 @@
 # 주의: /api/ 경로는 레거시 유지 - cloud-init baked VM 호환 (dual-mount 보장)
 # k3s 서버(control plane) 노드 — 클러스터: {{ cluster_name }}
 
+{% if ssh_public_key %}
+ssh_authorized_keys:
+  - {{ ssh_public_key }}
+{% endif %}
+
 package_update: true
 packages:
   - curl

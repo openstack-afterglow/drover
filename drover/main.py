@@ -20,7 +20,6 @@ from drover.api import (
     certificates,
     clusters,
     configmaps,
-    gpu_quotas,
     health,
     k3s_services,
     nodegroups,
@@ -64,11 +63,7 @@ async def _check_migration_ledger() -> bool:
     try:
         manifest = load_manifest()
         async with session_factory() as session:
-            rows = (
-                await session.execute(
-                    text("SELECT logical_id, sha256 FROM schema_migrations")
-                )
-            ).all()
+            rows = (await session.execute(text("SELECT logical_id, sha256 FROM schema_migrations"))).all()
     except Exception:
         _logger.warning("Drover migration ledger readiness check failed", exc_info=True)
         return False
@@ -95,10 +90,7 @@ async def readiness_checks() -> dict[str, str]:
         return_exceptions=True,
     )
     names = ("database", "redis", "migrations", "keystone")
-    return {
-        name: "ok" if result is True else "unavailable"
-        for name, result in zip(names, results, strict=True)
-    }
+    return {name: "ok" if result is True else "unavailable" for name, result in zip(names, results, strict=True)}
 
 
 @asynccontextmanager
@@ -149,8 +141,6 @@ app.include_router(operations.router, prefix="/v1/operations", tags=["operations
 app.include_router(admin.router, prefix="/v1/admin", tags=["admin"])
 app.include_router(resource_policies.router, prefix="/v1/admin", tags=["admin"])
 app.include_router(stats.router, prefix="/v1/stats", tags=["stats"])
-app.include_router(gpu_quotas.tenant_router, prefix="/v1/gpu-quotas", tags=["gpu-quotas"])
-app.include_router(gpu_quotas.admin_router, prefix="/v1/admin/gpu-quotas", tags=["admin-gpu-quotas"])
 
 
 def _version_document(request: Request) -> dict:
@@ -194,7 +184,6 @@ async def health_check():
     return {"status": "ok"}
 
 
-
 @app.get(
     "/v1/health/live",
     response_model=HealthResponse,
@@ -219,6 +208,7 @@ async def readiness_check():
         status_code=503,
         content={"status": "unavailable", "checks": checks},
     )
+
 
 def run() -> None:
     uvicorn.run("drover.main:app", host="0.0.0.0", port=8011)

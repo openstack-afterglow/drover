@@ -21,7 +21,7 @@ def test_workflow_yaml_syntax():
 
 
 def test_ci_workflow_structure():
-    """Verify CI workflow contains required jobs, services, targets, and artifact steps."""
+    """Verify CI jobs, service dependencies, Docker targets, and root-wheel artifact packaging."""
     ci_file = WORKFLOWS_DIR / "ci.yml"
     assert ci_file.is_file()
     ci = yaml.safe_load(ci_file.read_text(encoding="utf-8"))
@@ -31,7 +31,7 @@ def test_ci_workflow_structure():
     assert "sdk" in jobs
     assert "docker-build-and-scan" in jobs
     assert "db-migration-and-readiness" in jobs
-    assert "package-kolla-assets" in jobs
+    assert "package-wheel" in jobs
 
     # Validate docker-build-and-scan job
     scan_job = jobs["docker-build-and-scan"]
@@ -40,12 +40,13 @@ def test_ci_workflow_structure():
     worker_target_step = next((s for s in steps if s.get("with", {}).get("target") == "drover-worker"), None)
     assert api_target_step is not None, "Missing drover-api docker build step"
     assert worker_target_step is not None, "Missing drover-worker docker build step"
+    assert api_target_step["with"]["file"] == "docker/Dockerfile"
+    assert worker_target_step["with"]["file"] == "docker/Dockerfile"
 
     trivy_steps = [s for s in steps if "trivy-action" in s.get("uses", "")]
     assert len(trivy_steps) >= 2, "Expected Trivy scanning steps for both Docker targets"
     assert all(
-        s["uses"] == "aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1"
-        for s in trivy_steps
+        s["uses"] == "aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1" for s in trivy_steps
     ), "Trivy action must use the immutable known-safe 0.35.0 revision"
 
     # Validate db-migration-and-readiness services & steps
@@ -65,12 +66,37 @@ def test_ci_workflow_structure():
     assert readiness_step is not None, "Missing readiness check smoke step"
     assert "init_db(os.environ['DATABASE_URL'])" in readiness_step["run"]
 
-    # Validate package-kolla-assets
-    kolla_job = jobs["package-kolla-assets"]
-    kolla_steps = kolla_job.get("steps", [])
-    artifact_step = next((s for s in kolla_steps if "upload-artifact" in s.get("uses", "")), None)
-    assert artifact_step is not None, "Missing upload-artifact step in package-kolla-assets job"
-    assert artifact_step["with"]["path"] == "deploy/kolla/"
+    # Validate root-wheel artifact packaging
+    wheel_job = jobs["package-wheel"]
+    wheel_steps = wheel_job.get("steps", [])
+    artifact_step = next((s for s in wheel_steps if "upload-artifact" in s.get("uses", "")), None)
+    assert artifact_step is not None, "Missing upload-artifact step in package-wheel"
+    assert artifact_step["with"]["name"] == "drover-wheel"
+    assert artifact_step["with"]["path"] == "dist/*.whl"
+
+
+def test_docker_build_preserves_published_kolla_image_tag():
+    """docker-build.yml must preserve the published tag the Kolla role consumes."""
+
+    workflow_file = WORKFLOWS_DIR / "docker-build.yml"
+    assert workflow_file.is_file()
+    workflow = yaml.safe_load(workflow_file.read_text(encoding="utf-8"))
+    triggers = workflow.get("on", workflow.get(True, {}))
+    assert triggers.get("push", {}).get("tags") == ["v*"], "tag push must drive image publication"
+    expected_tag = "v0.2.21"
+    kolla_defaults = yaml.safe_load(
+        (REPO_ROOT / "deploy" / "kolla" / "ansible" / "roles" / "drover" / "defaults" / "main.yml").read_text(encoding="utf-8")
+    )
+    assert kolla_defaults["drover_image_tag"] == expected_tag, "Kolla must keep the published image tag until images are released"
+    for image_key in ("meta-api", "meta-worker"):
+        step = next(s for s in workflow["jobs"]["build-and-push"]["steps"] if s.get("id") == image_key)
+        tags = step["with"]["tags"]
+        assert "type=ref,event=tag" in tags, (
+            f"{image_key} must publish the raw git tag; metadata-action semver strips the v prefix "
+            "that deploy/kolla drover_image_tag and precheck consume"
+        )
+        assert "type=semver" not in tags, f"{image_key} must not strip the v prefix"
+        assert "type=raw,value=dev" in tags, f"{image_key} must keep the dev floating tag"
 
 
 def test_staging_workflow_structure():
@@ -94,9 +120,7 @@ def test_staging_workflow_structure():
     checkout_step = next(step for step in steps if step.get("name") == "Checkout requested revision")
     assert checkout_step["with"]["ref"] == "${{ github.sha }}"
 
-    assertion_step = next(
-        step for step in steps if "Assert required staging gate secrets" in step.get("name", "")
-    )
+    assertion_step = next(step for step in steps if "Assert required staging gate secrets" in step.get("name", ""))
     assertion_env = assertion_step["env"]
     assert assertion_env["DROVER_INTEGRATION_CLOUD"] == "1"
     for required_name in (
@@ -114,8 +138,8 @@ def test_staging_workflow_structure():
         assert required_name in assertion_env
     assert "HTTPS required" in assertion_step["run"]
 
-    asset_step = next(step for step in steps if step.get("name") == "Validate packaged Kolla role assets")
-    assert "live deployment is verified separately" in asset_step["run"]
+    asset_step = next(step for step in steps if step.get("name") == "Validate Kolla role source assets")
+    assert "Kolla role source assets validated" in asset_step["run"]
 
     catalog_step = next(step for step in steps if step.get("name") == "Assert live Drover catalog and liveness")
     catalog_code = catalog_step["run"]
@@ -145,7 +169,7 @@ def test_pyproject_script_entrypoints():
 
 
 def test_release_workflow_structure():
-    """Verify GitHub Release workflow structure, tag trigger, permissions, and wheel verification."""
+    """Verify GitHub Release workflow packages the root wheel and its role data."""
     release_file = WORKFLOWS_DIR / "release.yml"
     assert release_file.is_file(), "release.yml must exist in .github/workflows/"
 
@@ -172,23 +196,25 @@ def test_release_workflow_structure():
 
     steps = release_job.get("steps", [])
     setup_uv_step = next(step for step in steps if step.get("uses") == "astral-sh/setup-uv@v6")
-    assert setup_uv_step["with"]["python-version"] == "3.11"
+    assert setup_uv_step["with"]["python-version"] == "3.12"
 
     # Check lockstep step
-    lockstep_step = next((s for s in steps if "lockstep" in s.get("name", "").lower() or "lockstep" in s.get("run", "").lower()), None)
+    lockstep_step = next(
+        (s for s in steps if "lockstep" in s.get("name", "").lower() or "lockstep" in s.get("run", "").lower()), None
+    )
     assert lockstep_step is not None, "Missing tag and version lockstep check step"
 
-    # Check wheel build step
-    build_step = next((s for s in steps if "deploy/kolla" in s.get("run", "")), None)
-    assert build_step is not None, "Missing deploy/kolla wheel build step"
+    build_step = next((s for s in steps if s.get("name") == "Build root wheel"), None)
+    assert build_step is not None, "Missing root wheel build step"
+    assert "uv build --wheel" in build_step["run"]
 
     # Check clean venv test & uninstall step
     venv_step = next((s for s in steps if "kolla-ansible" in s.get("run", "") and "venv" in s.get("run", "")), None)
     assert venv_step is not None, "Missing clean venv installation & verification step"
     venv_run = venv_step["run"]
     assert "share/kolla-ansible/ansible/roles/drover" in venv_run
-    assert "uv pip uninstall --python /tmp/kolla-venv/bin/python" in venv_run
-    assert "uv venv --python 3.11" in venv_run
+    assert "uv pip uninstall --python /tmp/drover-venv/bin/python drover" in venv_run
+    assert "uv venv --python 3.12" in venv_run
 
     # Check upload artifact step
     upload_step = next((s for s in steps if "upload-artifact" in s.get("uses", "")), None)
@@ -198,7 +224,7 @@ def test_release_workflow_structure():
     # Check softprops/action-gh-release step
     gh_release_step = next((s for s in steps if "action-gh-release" in s.get("uses", "")), None)
     assert gh_release_step is not None, "Missing action-gh-release step"
-    assert gh_release_step["with"]["files"] == "deploy/kolla/dist/*.whl"
+    assert gh_release_step["with"]["files"] == "dist/*.whl"
 
     # Must not publish to PyPI
     assert "pypa/gh-action-pypi-publish" not in workflow_source

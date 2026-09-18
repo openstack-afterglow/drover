@@ -39,7 +39,7 @@ async def ensure_project_kek(project_id: str) -> str:
 
 
 def _ensure_project_kek_sync(project_id: str, password: str, settings) -> str:
-    from drover.services.keystone import _connect_as_manager
+    from drover.services.keystone import _close_connection_sync, _connect_as_manager
 
     conn = _connect_as_manager(project_id, password, settings)
     try:
@@ -89,7 +89,7 @@ def _ensure_project_kek_sync(project_id: str, password: str, settings) -> str:
             time.sleep(1)
         raise RuntimeError("Barbican KEK order timeout (30s)")
     finally:
-        conn.close()
+        _close_connection_sync(conn)
 
 
 # ── Key Manager API helpers ───────────────────────────────────────────────────

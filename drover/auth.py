@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 from fastapi import Depends, Header, HTTPException, Request
 from fastapi.security import APIKeyHeader
+from keystoneauth1 import access as ks_access
 from keystoneauth1 import session as ks_session
 from keystoneauth1.identity import v3
 
@@ -16,6 +17,7 @@ from drover.config import get_settings
 
 _logger = logging.getLogger(__name__)
 _admin_role_id_cache: str | None = None
+_internal_keystone_endpoint_cache: str | None = None
 keystone_token_scheme = APIKeyHeader(
     name="X-Auth-Token",
     auto_error=False,
@@ -37,9 +39,7 @@ def cache_mode(
     return CacheMode(enabled=not no_cache, refresh=refresh_cache)
 
 
-def _get_admin_ks_client():
-    from keystoneclient.v3 import client as ks_client
-
+def _get_admin_ks_session() -> ks_session.Session:
     settings = get_settings()
     auth = v3.Password(
         auth_url=settings.os_auth_url,
@@ -49,8 +49,39 @@ def _get_admin_ks_client():
         user_domain_name=settings.os_user_domain_name,
         project_domain_name=settings.os_project_domain_name,
     )
-    session = ks_session.Session(auth=auth, timeout=15, verify=settings.ssl_verify)
-    return ks_client.Client(session=session)
+    return ks_session.Session(auth=auth, timeout=15, verify=settings.ssl_verify)
+
+
+def _resolve_internal_keystone_endpoint(session: ks_session.Session | None = None) -> str:
+    global _internal_keystone_endpoint_cache
+    if _internal_keystone_endpoint_cache:
+        return _internal_keystone_endpoint_cache
+
+    settings = get_settings()
+    session = session or _get_admin_ks_session()
+    endpoint = session.get_endpoint(
+        service_type="identity",
+        interface="internal",
+        region_name=settings.os_region_name,
+    )
+    if not endpoint:
+        raise RuntimeError("Keystone internal endpoint is unavailable")
+
+    # Kolla registers the identity catalog entry without a version path, so the
+    # bare endpoint answers 404 for /auth/tokens and /roles.
+    endpoint = endpoint.rstrip("/")
+    if not endpoint.endswith("/v3"):
+        endpoint += "/v3"
+    _internal_keystone_endpoint_cache = endpoint
+    return endpoint
+
+
+def _get_admin_ks_client():
+    from keystoneclient.v3 import client as ks_client
+
+    session = _get_admin_ks_session()
+    endpoint = _resolve_internal_keystone_endpoint(session)
+    return ks_client.Client(session=session, endpoint_override=endpoint)
 
 
 def _resolve_admin_role_id() -> str | None:
@@ -87,12 +118,21 @@ def _is_system_admin(user_id: str) -> bool:
 
 def validate_token(token: str, project_id: str = "") -> dict:
     settings = get_settings()
-    kwargs: dict = {"auth_url": settings.os_auth_url, "token": token}
+    auth_url = _resolve_internal_keystone_endpoint()
     if project_id:
-        kwargs["project_id"] = project_id
-    auth_plugin = v3.Token(**kwargs)
-    session = ks_session.Session(auth=auth_plugin, timeout=30, verify=settings.ssl_verify)
-    access = auth_plugin.get_access(session)
+        auth_plugin = v3.Token(auth_url=auth_url, token=token, project_id=project_id)
+        session = ks_session.Session(auth=auth_plugin, timeout=30, verify=settings.ssl_verify)
+        access = auth_plugin.get_access(session)
+    else:
+        # Token reauthentication without a target selects the user's default
+        # project (or an unscoped token), not the submitted token's project.
+        session = ks_session.Session(timeout=30, verify=settings.ssl_verify)
+        response = session.get(
+            f"{auth_url}/auth/tokens",
+            headers={"X-Auth-Token": token, "X-Subject-Token": token},
+            authenticated=False,
+        )
+        access = ks_access.create(resp=response, auth_token=token)
     roles = list(access.role_names) if access.role_names else []
     return {
         "token": access.auth_token,
@@ -189,4 +229,6 @@ async def get_os_conn(
     try:
         yield conn
     finally:
-        await asyncio.to_thread(conn.close)
+        from drover.services.keystone import close_connection
+
+        await close_connection(conn)

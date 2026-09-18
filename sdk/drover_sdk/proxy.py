@@ -45,18 +45,12 @@ class Proxy(proxy.Proxy):
             if parsed_endpoint.query or parsed_endpoint.fragment:
                 raise ValueError("Endpoint URL cannot contain a query or fragment")
             has_version = any(
-                _VERSION_SEGMENT_RE.fullmatch(segment)
-                for segment in parsed_endpoint.path.split("/")
-                if segment
+                _VERSION_SEGMENT_RE.fullmatch(segment) for segment in parsed_endpoint.path.split("/") if segment
             )
 
         if has_version:
             path_parts = parsed_url.path.split("/")
-            if (
-                parsed_url.path.startswith("/")
-                and len(path_parts) > 1
-                and _VERSION_SEGMENT_RE.fullmatch(path_parts[1])
-            ):
+            if parsed_url.path.startswith("/") and len(path_parts) > 1 and _VERSION_SEGMENT_RE.fullmatch(path_parts[1]):
                 remaining = path_parts[2:]
                 url = "/" + "/".join(remaining) if remaining else "/"
                 if parsed_url.query:
@@ -209,6 +203,7 @@ class Proxy(proxy.Proxy):
                 if status in terminal_statuses:
                     break
                 time.sleep(0.1)
+
     # -- Tenant clusters -----------------------------------------------
 
     def clusters(self, **query):
@@ -469,6 +464,7 @@ class Proxy(proxy.Proxy):
 
     def admin_cluster_templates(self):
         return self._json_request("GET", "/v1/admin/cluster-templates")
+
     def admin_managed_resources(self, **query):
         return self._json_request("GET", "/v1/admin/managed-resources", params=_query(**query))
 
@@ -497,37 +493,6 @@ class Proxy(proxy.Proxy):
             f"/v1/admin/runtime-settings/{_segment(setting_key)}",
             body=attrs,
         )
-
-    # -- GPU Quotas -----------------------------------------------------------
-
-    def effective_gpu_quotas(self):
-        return self._json_request("GET", "/v1/gpu-quotas/effective")
-
-    def gpu_quota_status(self):
-        return self._json_request("GET", "/v1/gpu-quotas/status")
-
-    def check_gpu_quota(self, extra_specs: dict):
-        return self._json_request("POST", "/v1/gpu-quotas/check", body={"extra_specs": extra_specs})
-
-    def default_gpu_quotas(self):
-        return self._json_request("GET", "/v1/admin/gpu-quotas/defaults")
-
-    def set_default_gpu_quota(self, gpu_type: str, limit: int):
-        return self._json_request("PUT", "/v1/admin/gpu-quotas/defaults", body={"gpu_type": gpu_type, "limit": limit})
-
-    def delete_default_gpu_quota(self, gpu_type: str):
-        return self._json_request("DELETE", f"/v1/admin/gpu-quotas/defaults/{_segment(gpu_type)}")
-
-    def project_gpu_quotas(self, project_id: str):
-        return self._json_request("GET", f"/v1/admin/gpu-quotas/{_segment(project_id)}")
-
-    def set_project_gpu_quota(self, project_id: str, gpu_type: str, limit: int):
-        return self._json_request(
-            "PUT", f"/v1/admin/gpu-quotas/{_segment(project_id)}", body={"gpu_type": gpu_type, "limit": limit}
-        )
-
-    def delete_project_gpu_quota(self, project_id: str, gpu_type: str):
-        return self._json_request("DELETE", f"/v1/admin/gpu-quotas/{_segment(project_id)}/{_segment(gpu_type)}")
 
     # -- Baked guest callback ------------------------------------------------
 

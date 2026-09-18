@@ -5,17 +5,32 @@ Stampede Reconciler(k3s_stampede.py)와 수동 스케일 핸들러(clusters.py) 
 """
 
 import asyncio
+import hashlib
 import logging
 import random
 import string
 
 from drover.config import get_settings
+from drover.utils.ssh_keys import normalize_ssh_public_key
 
 _logger = logging.getLogger(__name__)
 
 
+class ProvisioningInProgress(RuntimeError):
+    """A claimed Afterglow intent must be retried with its existing key."""
+
+
 def _rand_suffix(n: int = 5) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
+
+def _stampede_node_key(key_prefix: str, index: int) -> str:
+    return f"{key_prefix}-node-{index}"
+
+
+def _stampede_node_name(cluster_name: str, provisioning_key: str) -> str:
+    digest = hashlib.sha256(provisioning_key.encode("utf-8")).hexdigest()[:12]
+    return f"{cluster_name}-stampede-{digest}"
 
 
 async def provision_nodegroup_vms(
@@ -28,30 +43,19 @@ async def provision_nodegroup_vms(
     image_id: str | None = None,
     labels: dict | None = None,
     taints: list | None = None,
+    provisioning_key_prefix: str | None = None,
 ) -> list[dict]:
     """노드그룹에 agent VM을 add_count개 생성해 k3s 클러스터에 join시킨다.
 
     labels/taints는 cloud-init extra_agent_args로 주입.
     생성된 VM 목록 {vm_id, name}을 반환한다 (실패한 것은 포함하지 않음).
     """
-    from drover.services import (
-        cinder,
-        inventory,
-        keystone,
-        nova,
-    )
-    from drover.services import (
-        cloudinit as k3s_cloudinit,
-    )
-    from drover.services import (
-        nodegroup as k3s_nodegroup,
-    )
-    from drover.services import (
-        plugins as k3s_plugins,
-    )
-    from drover.services import (
-        store as k3s_db,
-    )
+    from drover.services import cloudinit as k3s_cloudinit
+    from drover.services import inventory
+    from drover.services import nodegroup as k3s_nodegroup
+    from drover.services import plugins as k3s_plugins
+    from drover.services import store as k3s_db
+
     s = get_settings()
 
     # 클러스터 기본 정보 조회 (admin: project_id 필터 없음)
@@ -68,6 +72,10 @@ async def provision_nodegroup_vms(
     os_type = cluster.get("os_type") or "ubuntu"
     network_id = cluster.get("network_id") or ""
     ssh_public_key = cluster.get("ssh_public_key") or None
+    if cluster.get("key_name") and not ssh_public_key:
+        raise RuntimeError("SSH public key snapshot is missing for the requested keypair")
+    if ssh_public_key:
+        ssh_public_key = normalize_ssh_public_key(ssh_public_key)
     sg_id = cluster.get("security_group_id") or None
     boot_volume_size = s.drover_boot_volume_size_gb
     volume_availability_zone = (resource_snapshot.get("k3s.volume_availability_zone") or {}).get("id") or ""
@@ -82,99 +90,207 @@ async def provision_nodegroup_vms(
         _logger.error("provision_nodegroup_vms: creation-time resource snapshot is incomplete")
         return []
 
-    try:
-        conn = keystone.get_admin_connection_for_project(project_id)
-    except Exception as exc:
-        _logger.error("provision_nodegroup_vms: OpenStack connection failed: %s", exc)
-        return []
+    conn = None
+    if provisioning_key_prefix is None:
+        from drover.services import cinder, keystone, nova
 
-    # extra_agent_args 구성 (플러그인 + labels/taints + nodegroup 식별 라벨)
-    _agent_args = k3s_plugins.aggregate_agent_args(s)
-    if not _agent_args and cluster.get("occm_enabled"):
-        _agent_args = ["--kubelet-arg=cloud-provider=external"]
-
-    # 노드그룹 labels → --node-label
-    for k, v in (labels or {}).items():
-        _agent_args.append(f"--node-label={k}={v}")
-
-    # nodegroup 식별 라벨 (Stampede 내부 추적용)
-    _agent_args.append(f"--node-label=afterglow.io/nodegroup={nodegroup_id}")
-    _agent_args.append("--node-label=afterglow.io/stampede=true")
-
-    # 노드그룹 taints → --node-taint
-    for taint in taints or []:
-        # taint 형식: {"key": "k", "value": "v", "effect": "NoSchedule"}
-        # 또는 단순 문자열 "k=v:Effect"
-        if isinstance(taint, dict):
-            key = taint.get("key", "")
-            value = taint.get("value", "")
-            effect = taint.get("effect", "NoSchedule")
-            if value:
-                _agent_args.append(f"--node-taint={key}={value}:{effect}")
-            else:
-                _agent_args.append(f"--node-taint={key}:{effect}")
-        elif isinstance(taint, str):
-            _agent_args.append(f"--node-taint={taint}")
-
-    new_entries: list[dict] = []
-    for _i in range(add_count):
-        agent_name = f"{cluster_name}-{_rand_suffix()}"
         try:
-            vol_metadata = inventory.build_drover_metadata(cluster_id, None, "volume")
-            vol = await asyncio.to_thread(
-                cinder.create_volume_from_image,
-                conn,
-                f"{agent_name}-boot",
-                image_id,
-                boot_volume_size,
-                volume_availability_zone,
-                metadata=vol_metadata,
-            )
-            await inventory.record_resource(
-                None, cluster_id=cluster_id, service="cinder", resource_type="volume", resource_id=vol.id, name=f"{agent_name}-boot"
-            )
-            userdata = k3s_cloudinit.generate_agent_userdata(
-                cluster_name=cluster_name,
-                k3s_version=k3s_version,
-                server_ip=server_ip,
-                node_token=node_token or "",
-                primary_network_id=network_id,
-                ssh_public_key=ssh_public_key,
-                extra_agent_args=_agent_args,
-                os_type=os_type,
-            )
-            agent_metadata = inventory.build_drover_metadata(cluster_id, None, "server")
-            agent_metadata.update({
-                "k3s_horse_generator_role": "k3s_agent",
-                "k3s_horse_generator_cluster_id": cluster_id,
-                "k3s_horse_generator_nodegroup_id": nodegroup_id,
-            })
-            vm = await asyncio.to_thread(
-                nova.create_server,
-                conn,
-                agent_name,
-                flavor_id,
-                network_id,
-                vol.id,
-                userdata=userdata.data,
-                metadata=agent_metadata,
-                delete_boot_volume_on_termination=True,
-                security_groups=[sg_id] if sg_id else None,
-                config_drive=userdata.config_drive,
-            )
-            await inventory.record_resource(
-                None, cluster_id=cluster_id, service="nova", resource_type="server", resource_id=vm.id, name=agent_name
-            )
-            new_entries.append({"vm_id": vm.id, "name": agent_name})
-            _logger.info("stampede: nodegroup %s — agent %s (%s) 생성됨", nodegroup_id, agent_name, vm.id)
-        except Exception as e:
-            _logger.error("stampede: nodegroup %s — agent %s 생성 실패: %s", nodegroup_id, agent_name, e)
+            conn = await keystone.get_project_manager_connection(project_id)
+        except Exception as exc:
+            _logger.error("provision_nodegroup_vms: OpenStack connection failed: %s", exc)
+            return []
+    try:
+        # extra_agent_args 구성 (플러그인 + labels/taints + nodegroup 식별 라벨)
+        _agent_args = k3s_plugins.aggregate_agent_args(s)
+        if not _agent_args and cluster.get("occm_enabled"):
+            _agent_args = ["--kubelet-arg=cloud-provider=external"]
 
-    # DB에 VM 추적 레코드 추가
-    if new_entries:
-        await k3s_nodegroup.add_nodegroup_vms(nodegroup_id, cluster_id, new_entries)
+        # 노드그룹 labels → --node-label
+        for k, v in (labels or {}).items():
+            _agent_args.append(f"--node-label={k}={v}")
 
-    return new_entries
+        # nodegroup 식별 라벨 (Stampede 내부 추적용)
+        _agent_args.append(f"--node-label=afterglow.io/nodegroup={nodegroup_id}")
+        _agent_args.append("--node-label=afterglow.io/stampede=true")
+
+        # 노드그룹 taints → --node-taint
+        for taint in taints or []:
+            # taint 형식: {"key": "k", "value": "v", "effect": "NoSchedule"}
+            # 또는 단순 문자열 "k=v:Effect"
+            if isinstance(taint, dict):
+                key = taint.get("key", "")
+                value = taint.get("value", "")
+                effect = taint.get("effect", "NoSchedule")
+                if value:
+                    _agent_args.append(f"--node-taint={key}={value}:{effect}")
+                else:
+                    _agent_args.append(f"--node-taint={key}:{effect}")
+            elif isinstance(taint, str):
+                _agent_args.append(f"--node-taint={taint}")
+        new_entries: list[dict] = []
+        for _i in range(add_count):
+            provisioning_key = (
+                _stampede_node_key(provisioning_key_prefix, _i) if provisioning_key_prefix is not None else None
+            )
+            agent_name = (
+                _stampede_node_name(cluster_name, provisioning_key)
+                if provisioning_key is not None
+                else f"{cluster_name}-{_rand_suffix()}"
+            )
+            try:
+                agent_metadata = inventory.build_drover_metadata(cluster_id, None, "server")
+                agent_metadata.update(
+                    {
+                        "k3s_horse_generator_role": "k3s_agent",
+                        "k3s_horse_generator_cluster_id": cluster_id,
+                        "k3s_horse_generator_nodegroup_id": nodegroup_id,
+                    }
+                )
+                if provisioning_key is not None:
+                    from drover.services import afterglow as afterglow_service
+
+                    agent_metadata["drover.provisioning_idempotency_key"] = provisioning_key
+                    intent = await afterglow_service.create_provisioning_intent(
+                        idempotency_key=provisioning_key,
+                        project_id=project_id,
+                        cluster_id=cluster_id,
+                        nodegroup_id=nodegroup_id,
+                        name=agent_name,
+                        flavor_id=flavor_id,
+                        image_id=image_id,
+                        network_id=network_id,
+                        boot_volume_size_gb=boot_volume_size,
+                        volume_availability_zone=volume_availability_zone,
+                        security_group_id=sg_id,
+                        metadata=agent_metadata,
+                        config_drive=os_type == "fcos",
+                        settings=s,
+                    )
+                    state = intent.get("state")
+                    if state == "succeeded":
+                        result = intent
+                    elif state in {"pending", "submitting"}:
+                        userdata = k3s_cloudinit.generate_agent_userdata(
+                            cluster_name=cluster_name,
+                            k3s_version=k3s_version,
+                            server_ip=server_ip,
+                            node_token=node_token or "",
+                            primary_network_id=network_id,
+                            ssh_public_key=ssh_public_key,
+                            extra_agent_args=_agent_args,
+                            os_type=os_type,
+                        )
+                        try:
+                            result = await afterglow_service.submit_provisioning_intent(
+                                provisioning_key,
+                                userdata.data,
+                                settings=s,
+                            )
+                        except afterglow_service.ProvisioningRemoteError as exc:
+                            if exc.status_code == 409 and exc.state == "submitting" and exc.no_duplicate:
+                                raise ProvisioningInProgress(provisioning_key) from exc
+                            raise
+                    else:
+                        _logger.warning(
+                            "stampede: nodegroup %s — provisioning intent %s is %s; no local VM",
+                            nodegroup_id,
+                            provisioning_key,
+                            state or "unknown",
+                        )
+                        continue
+                    if result.get("state") != "succeeded" or not result.get("server_id") or not result.get("volume_id"):
+                        _logger.warning(
+                            "stampede: nodegroup %s — provisioning intent %s did not succeed; no local VM",
+                            nodegroup_id,
+                            provisioning_key,
+                        )
+                        continue
+                    await inventory.record_resource(
+                        None,
+                        cluster_id=cluster_id,
+                        service="cinder",
+                        resource_type="volume",
+                        resource_id=str(result["volume_id"]),
+                        name=f"{agent_name}-boot",
+                    )
+                    await inventory.record_resource(
+                        None,
+                        cluster_id=cluster_id,
+                        service="nova",
+                        resource_type="server",
+                        resource_id=str(result["server_id"]),
+                        name=agent_name,
+                    )
+                    new_entries.append({"vm_id": str(result["server_id"]), "name": agent_name})
+                    _logger.info("stampede: nodegroup %s — agent %s 생성됨", nodegroup_id, agent_name)
+                    continue
+
+                vol_metadata = inventory.build_drover_metadata(cluster_id, None, "volume")
+                vol = await asyncio.to_thread(
+                    cinder.create_volume_from_image,
+                    conn,
+                    f"{agent_name}-boot",
+                    image_id,
+                    boot_volume_size,
+                    volume_availability_zone,
+                    metadata=vol_metadata,
+                )
+                await inventory.record_resource(
+                    None,
+                    cluster_id=cluster_id,
+                    service="cinder",
+                    resource_type="volume",
+                    resource_id=vol.id,
+                    name=f"{agent_name}-boot",
+                )
+                userdata = k3s_cloudinit.generate_agent_userdata(
+                    cluster_name=cluster_name,
+                    k3s_version=k3s_version,
+                    server_ip=server_ip,
+                    node_token=node_token or "",
+                    primary_network_id=network_id,
+                    ssh_public_key=ssh_public_key,
+                    extra_agent_args=_agent_args,
+                    os_type=os_type,
+                )
+                vm = await asyncio.to_thread(
+                    nova.create_server,
+                    conn,
+                    agent_name,
+                    flavor_id,
+                    network_id,
+                    vol.id,
+                    userdata=userdata.data,
+                    metadata=agent_metadata,
+                    delete_boot_volume_on_termination=True,
+                    security_groups=[sg_id] if sg_id else None,
+                    config_drive=userdata.config_drive,
+                )
+                await inventory.record_resource(
+                    None,
+                    cluster_id=cluster_id,
+                    service="nova",
+                    resource_type="server",
+                    resource_id=vm.id,
+                    name=agent_name,
+                )
+                new_entries.append({"vm_id": vm.id, "name": agent_name})
+                _logger.info("stampede: nodegroup %s — agent %s (%s) 생성됨", nodegroup_id, agent_name, vm.id)
+            except ProvisioningInProgress:
+                raise
+            except Exception as e:
+                _logger.error("stampede: nodegroup %s — agent %s 생성 실패: %s", nodegroup_id, agent_name, e)
+                if provisioning_key is not None:
+                    raise
+
+        # DB에 VM 추적 레코드 추가
+        if new_entries:
+            await k3s_nodegroup.add_nodegroup_vms(nodegroup_id, cluster_id, new_entries)
+
+        return new_entries
+    finally:
+        if conn is not None:
+            await keystone.close_connection(conn)
 
 
 async def delete_nodegroup_vms(
@@ -206,40 +322,42 @@ async def delete_nodegroup_vms(
 
     # Nova VM 삭제
     try:
-        conn = keystone.get_admin_connection_for_project(project_id)
+        conn = await keystone.get_project_manager_connection(project_id)
     except Exception as e:
         _logger.error("delete_nodegroup_vms: OpenStack 연결 실패: %s", e)
         return
+    try:
+        vm_ids = [e["vm_id"] for e in vm_entries if e.get("vm_id")]
+        for vm_id in vm_ids:
+            try:
+                await asyncio.to_thread(nova.delete_server, conn, vm_id)
+                _logger.info("stampede: VM %s 삭제됨", vm_id)
+            except Exception as e:
+                _logger.warning("stampede: VM %s 삭제 실패: %s", vm_id, e)
 
-    vm_ids = [e["vm_id"] for e in vm_entries if e.get("vm_id")]
-    for vm_id in vm_ids:
-        try:
-            await asyncio.to_thread(nova.delete_server, conn, vm_id)
-            _logger.info("stampede: VM %s 삭제됨", vm_id)
-        except Exception as e:
-            _logger.warning("stampede: VM %s 삭제 실패: %s", vm_id, e)
+        # DB 레코드 제거
+        await k3s_nodegroup.remove_nodegroup_vms(nodegroup_id, vm_ids)
 
-    # DB 레코드 제거
-    await k3s_nodegroup.remove_nodegroup_vms(nodegroup_id, vm_ids)
+        # scale-down 완료 이벤트 (best-effort, project_id 없으면 스킵)
+        if project_id:
+            try:
+                from drover.services.activity import record
 
-    # scale-down 완료 이벤트 (best-effort, project_id 없으면 스킵)
-    if project_id:
-        try:
-            from drover.services.activity import record
-
-            await record(
-                project_id=project_id,
-                user_id="stampede-system",
-                username="Stampede",
-                resource_type="k3s_stampede",
-                resource_id=cluster_id,
-                resource_name=nodegroup_id,
-                action="scale_down",
-                status="success",
-                extra={"removed_count": len(vm_entries), "node_names": [e.get("name") for e in vm_entries]},
-            )
-        except Exception:
-            pass
+                await record(
+                    project_id=project_id,
+                    user_id="stampede-system",
+                    username="Stampede",
+                    resource_type="k3s_stampede",
+                    resource_id=cluster_id,
+                    resource_name=nodegroup_id,
+                    action="scale_down",
+                    status="success",
+                    extra={"removed_count": len(vm_entries), "node_names": [e.get("name") for e in vm_entries]},
+                )
+            except Exception:
+                pass
+    finally:
+        await keystone.close_connection(conn)
 
 
 async def reconcile_nodegroup_vms(
@@ -264,38 +382,48 @@ async def reconcile_nodegroup_vms(
     verified_vms: list[dict] = []
     conn = None
     try:
-        conn = keystone.get_admin_connection_for_project(project_id)
+        conn = await keystone.get_project_manager_connection(project_id)
     except Exception as exc:
         _logger.debug("reconcile_nodegroup_vms: OpenStack connection unavailable: %s", exc)
+    try:
+        cluster_tag = f"drover.cluster_id={cluster_id}"
+        for vm_entry in vms:
+            vm_id = vm_entry.get("vm_id")
+            if not vm_id:
+                continue
+            if conn is not None:
+                try:
+                    s = await asyncio.to_thread(nova.get_server, conn, vm_id)
+                    if s:
+                        status = str(
+                            getattr(s, "status", None) or (s.get("status") if isinstance(s, dict) else "")
+                        ).upper()
+                        meta = getattr(s, "metadata", None) or (s.get("metadata") if isinstance(s, dict) else {})
+                        tags = getattr(s, "tags", None) or (s.get("tags") if isinstance(s, dict) else [])
+                        has_tag = (
+                            isinstance(meta, dict)
+                            and (
+                                meta.get("drover.cluster_id") == cluster_id
+                                or meta.get("k3s_horse_generator_nodegroup_id") == nodegroup_id
+                            )
+                        ) or (isinstance(tags, (list, tuple, set)) and cluster_tag in tags)
+                        if status in ("ACTIVE", "BUILD") or (
+                            has_tag and status not in ("ERROR", "DELETED", "SOFT_DELETED")
+                        ):
+                            verified_vms.append(vm_entry)
+                except Exception as e:
+                    _logger.debug("reconcile_nodegroup_vms: VM %s check failed: %s", vm_id, e)
+            else:
+                if vm_entry.get("status") != "ERROR":
+                    verified_vms.append(vm_entry)
 
-    cluster_tag = f"drover.cluster_id={cluster_id}"
-    for vm_entry in vms:
-        vm_id = vm_entry.get("vm_id")
-        if not vm_id:
-            continue
+        actual_count = len(verified_vms)
+        if ng.get("node_count") != actual_count:
+            await nodegroup_store.set_nodegroup_count(cluster_id, nodegroup_id, actual_count)
+        return verified_vms
+    finally:
         if conn is not None:
-            try:
-                s = await asyncio.to_thread(nova.get_server, conn, vm_id)
-                if s:
-                    status = str(getattr(s, "status", None) or (s.get("status") if isinstance(s, dict) else "")).upper()
-                    meta = getattr(s, "metadata", None) or (s.get("metadata") if isinstance(s, dict) else {})
-                    tags = getattr(s, "tags", None) or (s.get("tags") if isinstance(s, dict) else [])
-                    has_tag = (
-                        (isinstance(meta, dict) and (meta.get("drover.cluster_id") == cluster_id or meta.get("k3s_horse_generator_nodegroup_id") == nodegroup_id))
-                        or (isinstance(tags, (list, tuple, set)) and cluster_tag in tags)
-                    )
-                    if status in ("ACTIVE", "BUILD") or (has_tag and status not in ("ERROR", "DELETED", "SOFT_DELETED")):
-                        verified_vms.append(vm_entry)
-            except Exception as e:
-                _logger.debug("reconcile_nodegroup_vms: VM %s check failed: %s", vm_id, e)
-        else:
-            if vm_entry.get("status") != "ERROR":
-                verified_vms.append(vm_entry)
-
-    actual_count = len(verified_vms)
-    if ng.get("node_count") != actual_count:
-        await nodegroup_store.set_nodegroup_count(cluster_id, nodegroup_id, actual_count)
-    return verified_vms
+            await keystone.close_connection(conn)
 
 
 async def provision_nodegroup_and_reconcile(
@@ -340,9 +468,7 @@ async def provision_nodegroup_and_reconcile(
         )
 
     if len(created) != add_count:
-        raise RuntimeError(
-            f"nodegroup {nodegroup['id']} provisioned {len(created)}/{add_count} requested nodes"
-        )
+        raise RuntimeError(f"nodegroup {nodegroup['id']} provisioned {len(created)}/{add_count} requested nodes")
 
 
 async def delete_nodegroup_and_reconcile(

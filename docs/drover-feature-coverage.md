@@ -6,7 +6,7 @@
 
 ## 1. 레거시 기능 그룹별 교체 및 SDK 매핑 서열 (Feature Replacement Mapping)
 
-Drover는 Magnum REST wire API의 드롭인 대체가 아니라, Afterglow가 직접 URL로 호출하던 K3s 관리 기능을 Keystone 카탈로그 기반 **Drover Native v1 API** 및 Python SDK (`drover-sdk`)로 전환하는 서비스입니다.
+Drover는 Magnum REST wire API의 드롭인 대체가 아니라, Afterglow가 직접 URL로 호출하던 K3s 관리 기능을 Keystone catalog 기반 **Drover Native v1 API** 및 Python SDK (`drover-sdk`)로 전환하는 서비스입니다. Catalog service name/type은 모두 `drover`이며, SDK에서 `container-infra`는 alias입니다. 직접 URL에서 catalog로 옮기는 단계와 완료 여부는 [Afterglow 통합 rollout 계획](afterglow-service-integration.md) 및 현재 source를 별도로 확인해야 합니다.
 
 | 기능 그룹 (Functional Group) | 레거시 / 이전 방식 | Drover 네이티브 엔드포인트 교체 사양 | SDK (`drover-sdk`) 매핑 메서드 |
 | :--- | :--- | :--- | :--- |
@@ -55,9 +55,9 @@ graph TD
 - **OCCM (OpenStack Cloud Controller Manager)**: Kubernetes Ingress / Service Type LoadBalancer 수용 및 Octavia 로드밸런서 자동 동기화 (`drover_occm_enabled: true`).
 
 ### 2.5 Keystone (Identity & Access)
-- 사용자 요청 시 호출자의 `X-Auth-Token`을 통한 토큰 검증 및 프로젝트 스코프 확인.
-- 서비스 카탈로그 자동 등록 (`drover_keystone_service_name: drover`, `drover_keystone_service_type: container-infra`).
-- **클러스터 전용 Application Credentials**: OCCM, Cinder CSI, Manila CSI 플러그인을 위해 클러스터별 최소 권한의 Keystone Application Credential을 자동 발급하고 클러스터 삭제 시 즉시 파기.
+- 사용자 요청 시 호출자의 `X-Auth-Token`을 검증하고 프로젝트 스코프를 확인합니다. 프로젝트 헤더가 없으면 제출된 토큰 범위를 보존합니다.
+- 서비스 자격으로 catalog의 `identity` internal endpoint를 해석하여 토큰 introspection, 명시적 rescope 및 관리자 역할 조회를 보냅니다. internal endpoint가 없거나 연결할 수 없으면 external/public endpoint로 fallback하지 않고 fail closed 합니다.
+- 서비스 카탈로그 자동 등록 (`deploy/kolla/ansible/roles/drover/tasks/preconditions_keystone.yml`의 `name: drover`, `type: drover`).
 
 ### 2.6 Barbican & Manila (선택적 커스텀 연동)
 - **Barbican KMS Plugin**: K3s Secret 암호화를 위한 KMS 바인딩 지원.
@@ -70,19 +70,22 @@ graph TD
 Drover는 **Kolla-Ansible** 컨테이너 배포 환경을 표준으로 지원합니다.
 
 ```
-deploy/kolla/
-├── defaults/main.yml         # Kolla 기본 포트, 이미지, 시크릿 경로 설정
-├── tasks/
-│   ├── bootstrap.yml         # MariaDB 데이터베이스 및 계정 생성
-│   ├── config.yml            # ConfigMap 및 drover.conf/policy.yaml 렌더링
-│   ├── register.yml          # Keystone 서비스 카탈로그 및 엔드포인트 atomic 등록
-│   └── deploy.yml            # 컨테이너 서비스 및 pre-start 마이그레이션 실행
-└── templates/
-    ├── drover.conf.j2        # Drover 메인 구성 파일 템플릿
-    ├── drover-api.json.j2    # Kolla config_files 템플릿
-    ├── drover-worker.json.j2 # Worker 컨테이너 템플릿
-    └── drover-migrate.json.j2# Pre-start Migration 컨테이너 템플릿
+drover wheel
+└── share/kolla-ansible/ansible/roles/drover/
+    ├── defaults/main.yml     # Kolla 기본 포트, 이미지, 시크릿 경로 설정
+    ├── tasks/
+    │   ├── bootstrap_service.yml # MariaDB 데이터베이스 및 계정 생성과 migration 실행
+    │   ├── config.yml            # drover.conf/policy.yaml 렌더링
+    │   ├── preconditions_keystone.yml # Keystone service catalog 등록
+    │   └── deploy.yml            # API/Worker container lifecycle
+    └── templates/
+        ├── drover.conf.j2        # Drover 메인 구성 파일 템플릿
+        ├── drover-api.json.j2    # Kolla config_files 템플릿
+        ├── drover-worker.json.j2 # Worker 컨테이너 템플릿
+        └── drover-migrate.json.j2# Pre-start Migration 컨테이너 템플릿
 ```
+
+소스 role은 `deploy/kolla/ansible/roles/drover`에 있으며 root `drover` wheel의 shared data로 설치됩니다. wheel 기본 설치는 Kolla-Ansible 및 API/Worker runtime dependencies를 포함하지 않으며 서비스 process에는 `drover[service]` extra가 필요합니다. role의 `drover_image_tag`은 root Python package patch version과 독립적으로 마지막 공개 runtime image를 가리킵니다.
 
 ### Schema Readiness 및 Pre-start Migration
 - API 및 Worker 프로세스 시작 전, `drover-migrate` 컨테이너가 먼저 실행되어 `drover/migrations/manifest.txt` 및 `001_baseline.sql` 래저 체크섬을 검증하고 DB 마이그레이션을 안전하게 수행합니다.
@@ -117,7 +120,7 @@ Drover 서비스의 아키텍처 단순화와 성능 최적화를 위해 아래 
 
 2. **OpenStack Placement API 직접 할당 연동 미지원**
    - Placement 서비스의 Resource Class 직접 커스텀 allocation 할당을 사용하지 않습니다.
-   - 노드 배치는 Nova Flavor 스케줄링을 따르며, GPU 자원의 제어는 Drover 내부의 전용 **App-level GPU Quota Engine** (`/v1/gpu-quotas`)을 사용하여 제어합니다.
+   - 노드 배치는 Nova Flavor 스케줄링을 따르며, GPU quota 판단 권한은 Afterglow (`app.services.gpu_quota`)에 있습니다. Drover는 일반 cluster create에서 quota authority가 되지 않고, 현재 `drover/services/stampede.py`의 GPU nodegroup scale 경로에서만 `drover/services/afterglow.py:check_gpu_admission`을 통해 admission 결과를 받아 provisioning intent를 제한적으로 진행합니다.
 
 ---
 

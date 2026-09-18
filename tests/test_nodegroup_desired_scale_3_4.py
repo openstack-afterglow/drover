@@ -188,7 +188,7 @@ async def test_reconcile_nodegroup_vms_nova_tags_convergence():
     mock_conn = MagicMock()
     with (
         patch("drover.services.nodegroup.get_nodegroup", new=AsyncMock(return_value=ng)),
-        patch("drover.services.keystone.get_admin_connection_for_project", return_value=mock_conn),
+        patch("drover.services.keystone.get_project_manager_connection", return_value=mock_conn),
         patch("drover.services.nova.get_server", side_effect=[mock_server_active, None]),
         patch("drover.services.nodegroup.set_nodegroup_count", new=AsyncMock()) as set_count,
     ):
@@ -197,6 +197,7 @@ async def test_reconcile_nodegroup_vms_nova_tags_convergence():
     assert len(verified) == 1
     assert verified[0]["vm_id"] == "vm-active"
     set_count.assert_awaited_once_with(_CLUSTER_ID, _NODEGROUP_ID, 1)
+    mock_conn.close.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
