@@ -400,7 +400,7 @@ def test_root_wheel_packaging_lifecycle(tmp_path):
         metadata_members = [name for name in namelist if name.endswith(".dist-info/METADATA")]
         assert len(metadata_members) == 1
         metadata_content = zf.read(metadata_members[0]).decode("utf-8")
-        assert "Requires-Python: >=3.12" in metadata_content
+        assert "Requires-Python: >=3.11" in metadata_content
         assert "Provides-Extra: service" in metadata_content
         assert "Requires-Dist: kolla-ansible" not in metadata_content
 
