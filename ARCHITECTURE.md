@@ -178,9 +178,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "de405c3a21aa71091023c13269cd16758867cfb36d1b21b2e2fb1835cc2802b5",
-  "reviewed_at": "2026-09-17T11:37:36Z",
-  "summary": "Root drover wheel ships Kolla role shared data; service extra isolates runtime deps; Dockerfile under docker/ with root context; image default decoupled"
+  "source_sha256": "3ee8d856ce8b73b229b6668033435c0689a0c028bffdccf30c580c82c5fabcbc",
+  "reviewed_at": "2026-09-18T23:19:35Z",
+  "summary": "Relax requires-python to >=3.11 for Kolla control node compatibility; bump afterglow-crypto service pin to the matching >=3.11 commit"
 }
 ```
 <!-- architecture-review:end -->
