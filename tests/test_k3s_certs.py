@@ -187,12 +187,16 @@ async def test_certificate_expiry_structure(client, _fake_kc):
     async def _cached(key, ttl, fn, refresh=False, enabled=True):
         return await fn()
 
+    # endpoint가 함수 내부에서 import하므로 source module을 patch한다. 실제 10.0.0.1:6443 TLS 접속을 막는다.
+    probe = AsyncMock(return_value=[])
     with (
         patch("drover.api.certificates.k3s_db.get_cluster", new=AsyncMock(return_value=cluster_rec)),
         patch("drover.api.certificates.k3s_db.get_kubeconfig", new=AsyncMock(return_value=_fake_kc)),
         patch("drover.api.certificates.cached_call", new=AsyncMock(side_effect=_cached)),
+        patch("drover.services.certs.probe_tls_server_cert", new=probe),
     ):
         resp = await client.get("/v1/clusters/c1/certificate-expiry")
+    probe.assert_awaited_once_with("10.0.0.1", 6443)
     assert resp.status_code == 200
     data = resp.json()
     assert "ca" in data

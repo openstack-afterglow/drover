@@ -178,9 +178,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6f7f7c132523a725250aca5df1e9f0fcea7d60d6105f1840b39982fc1ff0de15",
-  "reviewed_at": "2026-09-24T05:23:52Z",
-  "summary": "Bugfix drover/api/admin.py admin cert routes: certificate-expiry now awaits certs.probe_tls_server_cert with host/port parsed from api_address (callback stores https://<ip>:6443; fallback server_ip:6443); rotate-certs now calls cert_rotation.rotate_certificates(cluster_id, project_id, 'system-admin', settings node_timeout/job_image), streams K3sProgressMessage JSON, and takes the existing Redis rotation lock (409 if held). Regression tests in tests/test_admin.py; admin API lines in docs/drover-api-v1-reference.md. No topology, schema, dependency, or deploy change: same routes, same Redis lock already listed under Data and contracts."
+  "source_sha256": "0d39c471790c794bd871a8bddb4c77e14d7f1dd1443c8c46fadb07b4c21b586b",
+  "reviewed_at": "2026-09-23T19:17:02Z",
+  "summary": "drover/services/cert_rotation.py: node-Ready wait now returns as soon as wait_node_ready finishes (asyncio.wait with _NODE_READY_KEEPALIVE_SECONDS=10 keepalive cadence unchanged) instead of sleeping a fixed 10s per node; tests/test_k3s_cert_rotation.py adds prompt-completion and keepalive regression tests; tests/test_k3s_certs.py mocks probe_tls_server_cert so the expiry endpoint test no longer dials 10.0.0.1:6443. No topology, API, schema or deploy contract change; SSE step/progress sequence is unchanged."
 }
 ```
 <!-- architecture-review:end -->

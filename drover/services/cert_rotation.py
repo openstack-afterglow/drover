@@ -20,6 +20,8 @@ _logger = logging.getLogger(__name__)
 
 _REDIS_LOCK_TTL = 900  # 15분
 _JOB_NAMESPACE = "kube-system"
+# 노드 Ready 대기 중 SSE keepalive 간격(초). Ready가 되면 이 간격을 기다리지 않고 즉시 진행한다.
+_NODE_READY_KEEPALIVE_SECONDS = 10.0
 
 
 def _lock_key(cluster_id: str) -> str:
@@ -188,16 +190,18 @@ async def rotate_certificates(
 
         yield _msg(K3sProgressStep.ROTATE_SERVER, base + 15, f"[{i + 1}/{n}] {node_name}: 노드 Ready 대기 중...")
 
-        # 노드 Ready 대기 — 긴 대기 동안 SSE keepalive 전송
+        # 노드 Ready 대기 — 긴 대기 동안 SSE keepalive 전송. Ready 판정이 끝나면 keepalive 간격을
+        # 기다리지 않고 바로 다음 단계로 넘어간다.
         ready_task = asyncio.create_task(k3s_kube.wait_node_ready(cluster_id, node_name, timeout=node_timeout))
-        while not ready_task.done():
-            await asyncio.sleep(10)
-            if not ready_task.done():
-                yield _msg(
-                    K3sProgressStep.ROTATE_SERVER,
-                    base + 15,
-                    f"[{i + 1}/{n}] {node_name}: 노드 Ready 대기 중...",
-                )
+        while True:
+            done, _pending = await asyncio.wait({ready_task}, timeout=_NODE_READY_KEEPALIVE_SECONDS)
+            if done:
+                break
+            yield _msg(
+                K3sProgressStep.ROTATE_SERVER,
+                base + 15,
+                f"[{i + 1}/{n}] {node_name}: 노드 Ready 대기 중...",
+            )
 
         node_ready = await ready_task
         if not node_ready:
