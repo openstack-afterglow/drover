@@ -18,6 +18,47 @@ def _triggers(workflow: dict) -> dict:
     return workflow.get("on", workflow.get(True, {}))
 
 
+def _trigger_names(workflow: dict) -> set[str]:
+    # `on:` may be a mapping, a list (`on: [push, pull_request]`) or a single string (`on: push`).
+    triggers = _triggers(workflow)
+    if isinstance(triggers, str):
+        return {triggers}
+    return set(triggers or ())
+
+
+def _needs(job: dict) -> list[str]:
+    # `needs: test` and `needs: [test]` are equivalent.
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def _sets_continue_on_error(node: dict) -> bool:
+    # Absent or the literal `false` keep failures failing; `true` or any `${{ }}` expression may not.
+    return node.get("continue-on-error", False) is not False
+
+
+def _pr_reachable_workflows() -> dict[str, dict]:
+    """Workflows that run pull request code: PR-triggered files plus the local reusable workflows they call."""
+    paths = [*WORKFLOWS_DIR.glob("*.yml"), *WORKFLOWS_DIR.glob("*.yaml")]
+    workflows = {path.name: yaml.safe_load(path.read_text(encoding="utf-8")) for path in paths}
+    pending = [name for name, wf in workflows.items() if _trigger_names(wf) & {"pull_request", "pull_request_target"}]
+    reachable: dict[str, dict] = {}
+    while pending:
+        name = pending.pop()
+        if name in reachable:
+            continue
+        reachable[name] = workflows[name]
+        for job_name, job in workflows[name]["jobs"].items():
+            uses = job.get("uses")
+            if uses is None:
+                continue
+            assert uses.startswith("./.github/workflows/"), (
+                f"{name} `{job_name}` runs PR code through a remote reusable workflow whose runners this test cannot check"
+            )
+            pending.append(uses.removeprefix("./.github/workflows/"))
+    return reachable
+
+
 def test_workflow_yaml_syntax():
     """Verify all workflow files parse cleanly as valid YAML."""
     yml_files = list(WORKFLOWS_DIR.glob("*.yml"))
@@ -111,7 +152,95 @@ def test_suite_runs_once_per_event_and_gates_publication():
 
     jobs = docker["jobs"]
     assert jobs["test"]["uses"] == "./.github/workflows/ci.yml"
-    assert jobs["build-and-push"]["needs"] == "test", "image publication must wait for the whole test workflow"
+    assert "test" in _needs(jobs["build-and-push"]), "image publication must wait for the whole test workflow"
+
+
+def test_publication_gate_is_fail_closed():
+    """A failed, skipped or cancelled suite never publishes images and never reports success to its caller."""
+    docker_jobs = _load_workflow("docker-build.yml")["jobs"]
+    for name in ("test", "build-and-push"):
+        job = docker_jobs[name]
+        # A job-level if replaces the implicit success() on needs. always(), !cancelled() and
+        # !failure() && !cancelled() (the usual companion of change detection) all run
+        # build-and-push after `test` failed or was skipped.
+        assert "if" not in job, f"docker-build.yml `{name}` must not set a job-level if: {job.get('if')!r}"
+        assert not _sets_continue_on_error(job), f"docker-build.yml `{name}` must not set continue-on-error"
+
+    for job_name, job in _load_workflow("ci.yml")["jobs"].items():
+        assert not _sets_continue_on_error(job), (
+            f"ci.yml `{job_name}` continue-on-error reports a failing suite as success"
+        )
+        for step in job.get("steps", []):
+            label = step.get("name") or step.get("run") or step.get("uses")
+            assert not _sets_continue_on_error(step), (
+                f"ci.yml `{job_name}` step {label!r} continue-on-error reports a failing check as success"
+            )
+
+
+def test_every_ci_job_and_step_runs_unconditionally_in_parallel():
+    """Every ci.yml job and step runs for every PR and workflow_call, and no job waits on another."""
+    for job_name, job in _load_workflow("ci.yml")["jobs"].items():
+        # Skipped jobs and steps report success. A skip keyed on github.actor, head.repo, event_name
+        # or a branch name is exactly the bypass rule 9 forbids; a skip is allowed only for a
+        # same-repo PR whose merge tree equals an already tested head tree, and it must change
+        # this contract explicitly.
+        assert "if" not in job, f"ci.yml `{job_name}` must not set a job-level if: {job.get('if')!r}"
+        for step in job.get("steps", []):
+            label = step.get("name") or step.get("run") or step.get("uses")
+            assert "if" not in step, f"ci.yml `{job_name}` step {label!r} must not set if: {step.get('if')!r}"
+        # Rule 3: fail-fast checks run inside their job, not as a needs: gate in front of other jobs.
+        assert not _needs(job), f"ci.yml `{job_name}` must not wait on {_needs(job)}; ci.yml jobs run in parallel"
+
+
+def test_pr_code_runs_on_github_hosted_runners_with_read_only_token():
+    """Rule 10: public-repo PR code runs only on GitHub-hosted ubuntu runners with a read-only token."""
+    reachable = _pr_reachable_workflows()
+    assert "ci.yml" in reachable
+    for name, workflow in reachable.items():
+        assert workflow.get("permissions") == {"contents": "read"}, (
+            f"{name} runs PR code and must keep top-level permissions: contents: read"
+        )
+        for job_name, job in workflow["jobs"].items():
+            assert "permissions" not in job, f"{name} `{job_name}` job-level permissions override the read-only pin"
+            if "uses" in job:
+                continue  # the called workflow is itself in `reachable` and checked there
+            runs_on = job.get("runs-on")
+            assert isinstance(runs_on, str) and runs_on.startswith("ubuntu-"), (
+                f"{name} `{job_name}` runs PR code on {runs_on!r}; only GitHub-hosted ubuntu-* labels are allowed"
+            )
+
+
+def test_service_job_shape_and_every_built_image_is_scanned():
+    """The architecture check leads `service`, the full suite runs unfiltered, and Trivy scans each built image."""
+    jobs = _load_workflow("ci.yml")["jobs"]
+
+    service_steps = jobs["service"]["steps"]
+    assert service_steps[0].get("uses", "").startswith("actions/checkout@")
+    assert service_steps[1].get("run") == "python3 scripts/check_architecture.py", (
+        "rule 3: the fail-fast architecture check is the first step after checkout in `service`"
+    )
+    service_runs = [step["run"] for step in service_steps if "run" in step]
+    assert [run for run in service_runs if "pytest" in run] == ["uv run pytest tests"], (
+        "`service` runs the whole suite exactly once, with no path, -k or deselect filter"
+    )
+    assert "uv run ruff check ." in service_runs
+
+    sdk_job = jobs["sdk"]
+    assert sdk_job["defaults"]["run"]["working-directory"] == "sdk"
+    assert [step["run"] for step in sdk_job["steps"] if "pytest" in step.get("run", "")] == ["uv run pytest"]
+
+    scan_steps = jobs["docker-build-and-scan"]["steps"]
+    built_tag_sets = [
+        {tag.strip() for tag in re.split(r"[,\n]", step["with"]["tags"]) if tag.strip()}
+        for step in scan_steps
+        if "build-push-action" in step.get("uses", "")
+    ]
+    scanned = [step["with"]["image-ref"] for step in scan_steps if "trivy-action" in step.get("uses", "")]
+    for tags in built_tag_sets:
+        assert tags & set(scanned), f"built image {sorted(tags)} is never scanned by Trivy"
+    all_built = set().union(*built_tag_sets)
+    for ref in scanned:
+        assert ref in all_built, f"Trivy scans {ref!r}, which this job does not build"
 
 
 def test_scan_job_builds_into_daemon_with_docker_driver():

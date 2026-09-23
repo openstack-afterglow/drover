@@ -24,7 +24,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 | Afterglow provisioning intent/GPU admission 연동 | partial | source-reviewed, test-defined | 일반 create는 Drover가 직접 Nova/Cinder 등을 호출하고 intent/admission은 특정 Stampede 경로다 | `drover/services/afterglow.py`, `drover/services/stampede.py`, `tests/test_afterglow_admission.py`, `tests/test_afterglow_provisioning.py` |
 | legacy `gpu_quotas` 제거 | partial | source-reviewed, test-defined | 역사적 `001_baseline.sql` 테이블은 아직 물리 삭제하지 않았고 조건부 runbook만 있다 | `drover/migrations/001_baseline.sql`, `drover/migrations/README.md`, `docs/gpu-quota-table-retirement-runbook.md` |
 
-위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-24 로컬 `uv run pytest tests`는 638건 통과·3건 skip이었고 architecture guard 13건도 포함한다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
+위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-24 로컬 `uv run pytest tests`는 642건 통과·3건 skip이었고 architecture guard 13건도 포함한다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
 
 ## System context
 
@@ -86,7 +86,8 @@ graph LR
 
 `POST /v1/clusters/{cluster_id}/rotate-certs`(`drover/api/certificates.py`)는 `master_count>=3`인 `ACTIVE`/`ERROR` cluster에서만 Redis rotation lock을 얻고 `drover/services/cert_rotation.py:rotate_certificates` SSE를 연다. control-plane 노드마다 `kube-system` Job(`nsenter -t 1 ... systemctl restart k3s`)을 만들고, Job 성공(최대 120초)을 확인한 뒤 `wait_node_ready`(기본 `drover_cert_rotation_node_timeout_sec=300`)가 Ready=True를 처음 관측하면 바로 다음 노드로 넘어간다. 대기 중에는 10초(`_NODE_READY_KEEPALIVE_SECONDS`)마다 SSE keepalive를 보낸다.
 
-- 노드 사이에 고정 settle 대기는 없다. 안전 간격은 `systemctl restart k3s`가 k3s READY까지 블록한다는 가정에 기댄다(서버 설치 경로가 get.k3s.io 기본 unit `Type=notify`를 쓴다는 전제이며 이 저장소에서 검증하지 않았다). Node Ready condition은 node-monitor-grace-period 동안 stale True일 수 있으므로, control-plane restart 사이 최소 간격이 필요하면 이름 있는 settle 상수나 Job 완료 이후 heartbeat 확인을 추가한다.
+- 노드 사이에 고정 settle 대기는 없다. 안전 간격은 `systemctl restart k3s`가 k3s READY까지 블록한다는 데 기댄다. 서버 설치 경로는 모두 `INSTALL_K3S_TYPE` 없이 `curl -sfL https://get.k3s.io | ... sh -s - server`를 실행한다(`drover/templates/k3s_server.yaml.j2`의 서버 설치 단계 — Barbican KMS 경로도 KMS sock 준비 뒤 같은 단계를 쓴다 — 와 FCOS `drover/services/cloudinit.py`). upstream `install.sh`는 이때 unit을 `Type=notify`로 쓰고, upstream k3s server는 embedded etcd와 apiserver가 ready가 된 뒤 `READY=1`을 보내므로 restart는 그때까지 블록한다. 이 근거는 upstream master 소스이며 고정한 `k3s_version`이나 이 저장소 테스트로 확인하지 않았다.
+- 남은 위험: `wait_node_ready`의 첫 poll은 Job 완료 직후라 node-monitor-grace-period 동안 stale Ready=True를 볼 수 있고, restart 사이에 etcd member health는 확인하지 않는다. control-plane restart 사이 최소 간격이 필요하면 이름 있는 settle 상수(테스트는 0으로 patch)나 Job 완료 이후 Ready `lastHeartbeatTime`·etcd health 확인을 추가한다.
 - SSE 소비자가 끊기면 generator가 Ready polling task를 취소하고 endpoint가 rotation lock을 해제한다.
 - admin `GET /v1/admin/clusters/{cluster_id}/certificate-expiry`와 `POST /v1/admin/clusters/{cluster_id}/rotate-certs`(`drover/api/admin.py`)에는 알려진 결함이 있다. 전자는 async `probe_tls_server_cert`를 await하지 않는다. 후자는 `rotate_certificates(cluster_id, project_id, initiated_by)` 자리에 dict·`None`·cluster ID를 넘기고 `K3sProgressMessage`를 `step, pct, msg` tuple로 unpack하며 rotation lock을 잡지 않아 항상 FAILED로 끝난다. 두 경로에는 테스트가 없고 아직 수정하지 않았다.
 
@@ -158,9 +159,9 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 - migration: `uv run drover-migrate --apply`
 - architecture snapshot: `python3 scripts/check_architecture.py`
 
-2026-09-24 로컬 `uv run pytest tests`는 638건 통과·3건 skip(약 11-18초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
+2026-09-24 로컬 `uv run pytest tests`는 642건 통과·3건 skip(약 11-18초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
 
-GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규정과 기준선은 [`AGENTS.md`](AGENTS.md)의 CI 절에 있다.
+GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규정과 기준선은 [`AGENTS.md`](AGENTS.md)의 CI 절에 있다. 계약은 trigger 집합, fail-closed 발행 게이트(`build-and-push`의 `needs`에 `test`, `test`·`build-and-push`의 job-level `if`·`continue-on-error` 금지, `ci.yml` 잡·스텝의 `continue-on-error` 금지), `ci.yml` 잡·스텝의 `if`와 잡 간 `needs` 금지, PR 코드를 실행하는 workflow의 `ubuntu-*` runner와 `permissions: contents: read`, `service`의 checkout 다음 첫 스텝인 architecture check와 `uv run pytest tests`, 빌드한 두 이미지의 Trivy 스캔을 포함한다.
 
 - main/dev 대상 PR(fork·dependabot 포함)은 `CI`(`.github/workflows/ci.yml`)를 한 번 실행한다. `ci.yml`에는 push trigger가 없고 `workflow_call`과 `workflow_dispatch`가 있다.
 - dev/main push와 `v*` tag의 suite는 `Docker Build & Push`(`.github/workflows/docker-build.yml`)에서만 실행한다(tag는 별도로 `release.yml` wheel release도 실행한다). 그 `test` job이 `ci.yml`을 reusable workflow로 실행하고 `build-and-push`가 `needs: test`로 전체 결과를 기다린 뒤 GHCR에 발행한다. 이 workflow에는 `pull_request` trigger가 없다.
@@ -194,9 +195,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1acfc2bfbdd9e7e1af1bd9818e66a78b1875daf31a46fe9637af0af835364387",
-  "reviewed_at": "2026-09-23T21:34:03Z",
-  "summary": "CI review round 1: drover/services/cert_rotation.py wraps the node-Ready keepalive loop in try/finally and cancels the wait_node_ready task when the SSE consumer disconnects (runtime change: no orphan K8s polling), and documents the unverified Type=notify settle assumption that replaced the old implicit 10s gap; tests/test_k3s_cert_rotation.py adds the disconnect-cancel regression; tests/test_k3s_certs.py patches socket.create_connection so the TLS probe failure test no longer dials 192.0.2.1:6443; tests/test_ci_workflows.py pins the full ci.yml and docker-build.yml trigger sets; docker-build.yml comments the fail-safe push expression. AGENTS.md CI section adds per-event baselines (CI PR 106/153s n=10, CI push 98/144s n=30, Docker push test span 99/123s n=32), the post-change measurement method, the accepted post-merge Buildx gap, and relabels projections; ARCHITECTURE.md adds the Certificate rotation runtime flow with the known admin rotate-certs/certificate-expiry defects (unfixed), the Buildx gap, and 638 passed/3 skipped. No API, schema or deploy contract change."
+  "source_sha256": "d3e604f00ea39ba8fad71850f809c5c7a3354dcf1654ec67fa0027bdbdb2b62b",
+  "reviewed_at": "2026-09-23T22:05:00Z",
+  "summary": "CI review round 2: tests/test_ci_workflows.py pins the fail-closed publication gate (needs normalized to a list containing test; no job-level if or truthy continue-on-error on docker-build.yml test/build-and-push; no continue-on-error on any ci.yml job or step), unconditional parallel ci.yml jobs and steps (no if, no needs), GitHub-hosted ubuntu-* runners with top-level permissions contents: read and no job-level permissions for every PR-reachable workflow including local reusable callees, the service job shape (architecture check first after checkout, exact uv run pytest tests, sdk uv run pytest) and Trivy coverage of every built image; 29 scratch mutations behaved as expected. drover/services/cert_rotation.py changes comments only (settle assumption now cites k3s_server.yaml.j2 incl. the Barbican KMS path and the FCOS cloudinit.py path, upstream install.sh Type=notify and upstream server READY=1 after etcd/apiserver; residual stale-Ready and no etcd health check); no runtime behavior change. AGENTS.md CI section: CI PR baseline extended to n=20 (104.5/148.1s, runs 33299439644..35405417634), rule 12 CI PR threshold 125s, measured setup-uv/uv sync fixed cost and pruned uv cache (no wheel reuse, 0.1-0.6s restore, kept), runner health-poll backoff making the 2s interval saving quantized and unproven, rule 9/10/11 contract wording. ARCHITECTURE.md: cert rotation wording, CI contract list, 642 passed/3 skipped. No API, schema, workflow or deploy change."
 }
 ```
 <!-- architecture-review:end -->

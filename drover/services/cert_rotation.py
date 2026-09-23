@@ -193,13 +193,17 @@ async def rotate_certificates(
         # 노드 Ready 대기 — 긴 대기 동안 SSE keepalive 전송. Ready 판정이 끝나면 keepalive 간격을
         # 기다리지 않고 바로 다음 단계로 넘어간다.
         #
-        # 가정(이 저장소에서 미검증): 다음 노드 restart 전의 안전 간격은 restart Job의
-        # `systemctl restart k3s`가 k3s READY까지 블록한다는 데 기댄다. 서버 설치 경로
-        # (k3s_server.yaml.j2, FCOS cloudinit.py)는 get.k3s.io를 쓰고 INSTALL_K3S_TYPE을 지정하지 않으므로
-        # 그 기본 unit Type=notify를 전제한다. wait_node_ready는 첫 Ready=True 관측에서 반환하고 Node
-        # condition은 node-monitor-grace-period 동안 stale True일 수 있다. 이전 루프의 암묵적 10초
-        # 하한은 제거됐으므로, control-plane restart 사이 최소 간격이 필요하면 이름 있는 settle 상수나
-        # Job 완료 이후의 Ready heartbeat(lastHeartbeatTime) 확인을 명시적으로 추가한다.
+        # 가정: 다음 노드 restart 전의 안전 간격은 restart Job의 `systemctl restart k3s`가 k3s READY까지
+        # 블록한다는 데 기댄다. 서버 설치 경로는 모두 INSTALL_K3S_TYPE 없이
+        # `curl -sfL https://get.k3s.io | ... sh -s - server`를 실행한다(cloud-init
+        # templates/k3s_server.yaml.j2 — Barbican KMS 경로도 KMS sock 준비 뒤 같은 설치 단계를 쓴다 —
+        # 와 FCOS services/cloudinit.py). upstream install.sh는 이때 unit을 Type=notify로 쓰고, upstream
+        # k3s server는 embedded etcd와 apiserver가 ready가 된 뒤 READY=1을 보내므로 restart는 그때까지
+        # 블록한다. 이는 upstream master 기준이며 고정한 k3s_version이나 이 저장소 테스트로 확인하지 않았다.
+        # 남은 위험: wait_node_ready는 첫 Ready=True 관측에서 반환하는데 Node condition은 Job 완료 직후
+        # stale True일 수 있고(node-monitor-grace-period), restart 사이에 etcd member health는 확인하지
+        # 않는다. 이전 루프의 암묵적 10초 하한은 제거됐으므로 최소 간격이 필요하면 이름 있는 settle
+        # 상수(테스트는 0으로 patch)나 Job 완료 이후 Ready lastHeartbeatTime·etcd health 확인을 명시적으로 추가한다.
         ready_task = asyncio.create_task(k3s_kube.wait_node_ready(cluster_id, node_name, timeout=node_timeout))
         try:
             while True:
