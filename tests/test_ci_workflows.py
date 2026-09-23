@@ -1,11 +1,21 @@
 """Tests for GitHub Actions CI/CD workflows and deployment gate contracts."""
 
+import re
 from pathlib import Path
 
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
+
+
+def _load_workflow(name: str) -> dict:
+    return yaml.safe_load((WORKFLOWS_DIR / name).read_text(encoding="utf-8"))
+
+
+def _triggers(workflow: dict) -> dict:
+    # PyYAML parses the bare `on:` key as boolean True.
+    return workflow.get("on", workflow.get(True, {}))
 
 
 def test_workflow_yaml_syntax():
@@ -73,6 +83,57 @@ def test_ci_workflow_structure():
     assert artifact_step is not None, "Missing upload-artifact step in package-wheel"
     assert artifact_step["with"]["name"] == "drover-wheel"
     assert artifact_step["with"]["path"] == "dist/*.whl"
+
+
+def test_suite_runs_once_per_event_and_gates_publication():
+    """PR는 CI 한 번, push/tag는 Docker Build & Push의 reusable `test` 한 번만 실행한다."""
+    ci_triggers = _triggers(_load_workflow("ci.yml"))
+    # 값 없는 `workflow_call:`은 None으로 파싱되므로 truthiness가 아니라 key 존재로 확인한다.
+    assert "workflow_call" in ci_triggers, "Docker Build & Push reuses ci.yml as its test gate"
+    assert "push" not in ci_triggers, "push is tested once by docker-build.yml `test`; a CI push trigger duplicates it"
+    assert ci_triggers["pull_request"] == {"branches": ["main", "dev"]}, (
+        "every PR (fork and dependabot included) runs CI without path or branch-name skips"
+    )
+
+    docker = _load_workflow("docker-build.yml")
+    docker_triggers = _triggers(docker)
+    assert "pull_request" not in docker_triggers, "PRs are covered by CI; no duplicate suite or non-pushing image build"
+    assert docker_triggers["push"]["branches"] == ["main", "dev"]
+    assert docker_triggers["push"]["tags"] == ["v*"]
+
+    jobs = docker["jobs"]
+    assert jobs["test"]["uses"] == "./.github/workflows/ci.yml"
+    assert jobs["build-and-push"]["needs"] == "test", "image publication must wait for the whole test workflow"
+
+
+def test_scan_job_builds_into_daemon_with_docker_driver():
+    """스캔용 이미지는 default docker driver로 daemon에 직접 빌드해 BuildKit boot와 tarball load를 피한다."""
+    steps = _load_workflow("ci.yml")["jobs"]["docker-build-and-scan"]["steps"]
+    for step in steps:
+        if "setup-buildx-action" in step.get("uses", ""):
+            assert step.get("with", {}).get("driver") == "docker", (
+                "a docker-container builder re-adds the BuildKit boot and the load:true export/import"
+            )
+
+    build_steps = [s for s in steps if "build-push-action" in s.get("uses", "")]
+    assert {s["with"]["target"] for s in build_steps} == {"drover-api", "drover-worker"}
+    for step in build_steps:
+        assert step["with"].get("load") is True, "Trivy scans the locally loaded image"
+        assert "push" not in step["with"], "the scan job never publishes"
+        assert "cache-to" not in step["with"], "the docker driver cannot export a build cache"
+
+
+def test_db_service_health_checks_poll_fast_with_enough_retries():
+    """서비스 컨테이너 health-check는 짧은 interval과 충분한 retry window를 쓴다."""
+    services = _load_workflow("ci.yml")["jobs"]["db-migration-and-readiness"]["services"]
+    for name in ("mariadb", "redis"):
+        options = services[name]["options"]
+        interval = re.search(r"--health-interval=(\d+)s\b", options)
+        retries = re.search(r"--health-retries=(\d+)\b", options)
+        assert interval and retries, f"{name} must set --health-interval and --health-retries"
+        interval_s = int(interval.group(1))
+        assert interval_s <= 2, f"{name} health interval {interval_s}s delays job start"
+        assert interval_s * int(retries.group(1)) >= 30, f"{name} health window must stay at least 30s"
 
 
 def test_docker_build_preserves_published_kolla_image_tag():

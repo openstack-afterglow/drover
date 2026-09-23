@@ -7,7 +7,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
 - 패키지: `drover==0.2.22`, `drover-sdk==0.2.21`
-- 주요 런타임: Python `>=3.12`, FastAPI `0.125.0`, Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
+- 주요 런타임: Python `>=3.11`(root package `requires-python`; CI·container image는 3.12), FastAPI `0.125.0`, Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
 
@@ -24,7 +24,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 | Afterglow provisioning intent/GPU admission 연동 | partial | source-reviewed, test-defined | 일반 create는 Drover가 직접 Nova/Cinder 등을 호출하고 intent/admission은 특정 Stampede 경로다 | `drover/services/afterglow.py`, `drover/services/stampede.py`, `tests/test_afterglow_admission.py`, `tests/test_afterglow_provisioning.py` |
 | legacy `gpu_quotas` 제거 | partial | source-reviewed, test-defined | 역사적 `001_baseline.sql` 테이블은 아직 물리 삭제하지 않았고 조건부 runbook만 있다 | `drover/migrations/001_baseline.sql`, `drover/migrations/README.md`, `docs/gpu-quota-table-retirement-runbook.md` |
 
-위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-08 `uv run pytest tests`는 612건 통과·3건 skip이었고 architecture guard focused 13건도 통과했다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
+위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-24 로컬 `uv run pytest tests`는 637건 통과·3건 skip이었고 architecture guard 13건도 포함한다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
 
 ## System context
 
@@ -150,7 +150,14 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 - migration: `uv run drover-migrate --apply`
 - architecture snapshot: `python3 scripts/check_architecture.py`
 
-2026-09-08 `uv run pytest tests`는 612건 통과·3건 skip이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
+2026-09-24 로컬 `uv run pytest tests`는 637건 통과·3건 skip(약 11-18초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
+
+GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규정과 기준선은 [`AGENTS.md`](AGENTS.md)의 CI 절에 있다.
+
+- main/dev 대상 PR(fork·dependabot 포함)은 `CI`(`.github/workflows/ci.yml`)를 한 번 실행한다. `ci.yml`에는 push trigger가 없고 `workflow_call`과 `workflow_dispatch`가 있다.
+- dev/main push와 `v*` tag의 suite는 `Docker Build & Push`(`.github/workflows/docker-build.yml`)에서만 실행한다(tag는 별도로 `release.yml` wheel release도 실행한다). 그 `test` job이 `ci.yml`을 reusable workflow로 실행하고 `build-and-push`가 `needs: test`로 전체 결과를 기다린 뒤 GHCR에 발행한다. 이 workflow에는 `pull_request` trigger가 없다.
+- `docker-build-and-scan`은 `setup-buildx-action` 없이 default docker driver로 `drover-api`/`drover-worker` target을 daemon에 직접 빌드(`load: true`)하고 Trivy 두 단계로 스캔한다. 발행용 `build-and-push`는 Buildx를 그대로 쓴다. docker driver 경로는 로컬에서 실행하지 않았으므로 CI 실행으로만 확인된다.
+- `db-migration-and-readiness`의 MariaDB/Redis service health-check는 2초 interval에 각각 30회/15회 retry(60초/30초 window)다.
 
 ## Change guide
 
@@ -163,6 +170,7 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 | Stampede/GPU/Afterglow boundary | `drover/services/stampede.py`, `afterglow.py`, `docs/afterglow-service-integration.md` | current intent/admission scope, `tests/test_k3s_stampede.py`, `tests/test_afterglow_*`, feature coverage |
 | schema, migration, durable model | `drover/models/orm.py`, `drover/migrations/`, `drover/scripts/migrate.py` | migration ledger/readiness, `tests/test_durable_create.py`, Deployment and operations |
 | SDK/catalog | `sdk/drover_sdk/service.py`, `sdk/drover_sdk/proxy.py`, `sdk/pyproject.toml` | `/v1` and alias wording, `sdk/tests/test_proxy.py`, docs catalog sections |
+| CI workflow/test runtime | `.github/workflows/*.yml`, [`AGENTS.md`](AGENTS.md) CI 절 | `tests/test_ci_workflows.py`, 20회 이상 전후 실측 기록, Development and verification |
 | bugfix/refactor with no topology change | affected source and tests | explain why topology/data contract is unchanged in the Maintenance review summary and restamp |
 
 ## Maintenance
@@ -178,9 +186,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "0d39c471790c794bd871a8bddb4c77e14d7f1dd1443c8c46fadb07b4c21b586b",
-  "reviewed_at": "2026-09-23T19:17:02Z",
-  "summary": "drover/services/cert_rotation.py: node-Ready wait now returns as soon as wait_node_ready finishes (asyncio.wait with _NODE_READY_KEEPALIVE_SECONDS=10 keepalive cadence unchanged) instead of sleeping a fixed 10s per node; tests/test_k3s_cert_rotation.py adds prompt-completion and keepalive regression tests; tests/test_k3s_certs.py mocks probe_tls_server_cert so the expiry endpoint test no longer dials 10.0.0.1:6443. No topology, API, schema or deploy contract change; SSE step/progress sequence is unchanged."
+  "source_sha256": "33fbd4f0af486f5f1f68f4e7386947169a086b8bca6a48ebd2854c1544b7f301",
+  "reviewed_at": "2026-09-23T19:20:27Z",
+  "summary": ".github/workflows/ci.yml: drop push trigger (push/tag suite runs once via docker-build.yml test job), add workflow_dispatch, build scan images with the default docker driver (no setup-buildx), MariaDB/Redis health-check 2s interval with 60s/30s retry windows; .github/workflows/docker-build.yml: drop pull_request trigger, build-and-push still needs the whole reusable test workflow; tests/test_ci_workflows.py locks trigger dedup, needs: test, docker-driver scan build and health-check window; AGENTS.md adds the CI performance rules and the 2026-08-30..09-19 baseline. ARCHITECTURE.md Development and verification documents the CI topology, test counts refreshed to 637 passed/3 skipped, Overview Python floor corrected to pyproject >=3.11. No runtime, API, schema or deploy contract change."
 }
 ```
 <!-- architecture-review:end -->

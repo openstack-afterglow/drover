@@ -1,8 +1,8 @@
 name: Docker Build & Push
 
+# Pull requests are covered by the CI workflow (including its docker-build-and-scan job),
+# so this workflow no longer re-runs the suite and a non-pushing image build for PRs.
 on:
-  pull_request:
-    branches: [main, dev]
   push:
     branches: [main, dev]
     tags: ['v*']
