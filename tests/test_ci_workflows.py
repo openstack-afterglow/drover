@@ -159,9 +159,10 @@ def test_suite_runs_once_per_event_and_gates_publication():
     assert "test" in _needs(jobs["build-and-push"]), "image publication must wait for the whole test workflow"
 
 
-def _publishes(job: dict) -> bool:
+def _publishes(job: dict, workflow_permissions=None) -> bool:
     """A job that can push to a registry: packages write permission, a registry login, or a pushing build."""
-    permissions = job.get("permissions")
+    # A job without its own permissions block inherits the workflow-level one.
+    permissions = job.get("permissions", workflow_permissions)
     if permissions == "write-all" or (isinstance(permissions, dict) and permissions.get("packages") == "write"):
         return True
     for step in job.get("steps", []):
@@ -176,8 +177,11 @@ def _publishes(job: dict) -> bool:
 
 def test_publication_gate_is_fail_closed():
     """A failed, skipped or cancelled suite never publishes images and never reports success to its caller."""
-    docker_jobs = _load_workflow("docker-build.yml")["jobs"]
-    publishing = [name for name, job in docker_jobs.items() if name != "test" and _publishes(job)]
+    docker = _load_workflow("docker-build.yml")
+    docker_jobs = docker["jobs"]
+    publishing = [
+        name for name, job in docker_jobs.items() if name != "test" and _publishes(job, docker.get("permissions"))
+    ]
     assert "build-and-push" in publishing
     for name in publishing:
         assert "test" in _needs(docker_jobs[name]), (
@@ -230,8 +234,9 @@ def _string_values(node):
 
 
 # `secrets.X`, `secrets['X']` and `toJSON(secrets)` all expose repository secrets; the read-only
-# GITHUB_TOKEN is the one secret PR code may reference.
-_NON_TOKEN_SECRET = re.compile(r"\bsecrets\b(?!\.GITHUB_TOKEN\b)")
+# GITHUB_TOKEN is the one secret PR code may reference. Expression context and property names are
+# case-insensitive, so `Secrets.X` is the same reference.
+_NON_TOKEN_SECRET = re.compile(r"\bsecrets\b(?!\.GITHUB_TOKEN\b)", re.IGNORECASE)
 
 
 def test_pr_code_runs_on_github_hosted_runners_with_read_only_token():
