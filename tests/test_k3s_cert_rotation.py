@@ -192,6 +192,43 @@ async def test_rotate_certificates_emits_keepalive_while_waiting_for_node_ready(
     assert msgs[-1].step.value == "completed"
 
 
+@pytest.mark.asyncio
+async def test_rotate_certificates_cancels_node_ready_wait_when_consumer_disconnects():
+    """SSE 소비자가 keepalive 대기 중에 끊기면 wait_node_ready polling task를 취소한다."""
+    import asyncio
+
+    from drover.services.cert_rotation import rotate_certificates
+
+    cancelled = asyncio.Event()
+
+    async def _never_ready(*args, **kwargs) -> bool:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return True
+
+    with (
+        patch("drover.services.cert_rotation._NODE_READY_KEEPALIVE_SECONDS", 0.01),
+        patch("drover.services.cert_rotation.k3s_kube.list_server_nodes", new=AsyncMock(return_value=["node-1"])),
+        patch("drover.services.cert_rotation.k3s_kube.create_job", new=AsyncMock(return_value={})),
+        patch("drover.services.cert_rotation.k3s_kube.wait_job_completed", new=AsyncMock(return_value=True)),
+        patch("drover.services.cert_rotation.k3s_kube.wait_node_ready", new=AsyncMock(side_effect=_never_ready)),
+    ):
+        gen = rotate_certificates("c1", "proj1", "testuser")
+        wait_msgs = 0
+        async for msg in gen:
+            if msg.step.value == "rotate_server" and "노드 Ready 대기 중" in msg.message:
+                wait_msgs += 1
+                # 첫 안내는 task 생성 전이므로 keepalive(두 번째)까지 받은 뒤 끊는다.
+                if wait_msgs == 2:
+                    break
+        assert wait_msgs == 2
+        await gen.aclose()
+        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+
+
 # ---------------------------------------------------------------------------
 # API 엔드포인트 테스트
 # ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 | Afterglow provisioning intent/GPU admission 연동 | partial | source-reviewed, test-defined | 일반 create는 Drover가 직접 Nova/Cinder 등을 호출하고 intent/admission은 특정 Stampede 경로다 | `drover/services/afterglow.py`, `drover/services/stampede.py`, `tests/test_afterglow_admission.py`, `tests/test_afterglow_provisioning.py` |
 | legacy `gpu_quotas` 제거 | partial | source-reviewed, test-defined | 역사적 `001_baseline.sql` 테이블은 아직 물리 삭제하지 않았고 조건부 runbook만 있다 | `drover/migrations/001_baseline.sql`, `drover/migrations/README.md`, `docs/gpu-quota-table-retirement-runbook.md` |
 
-위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-24 로컬 `uv run pytest tests`는 637건 통과·3건 skip이었고 architecture guard 13건도 포함한다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
+위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-24 로컬 `uv run pytest tests`는 638건 통과·3건 skip이었고 architecture guard 13건도 포함한다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
 
 ## System context
 
@@ -81,6 +81,14 @@ graph LR
 ### Nodegroups, Stampede, reconciliation
 
 `drover/services/autoscale.py`는 desired nodegroup count를 durable `nodegroup_reconcile` job으로 맞추고, `stampede.py`는 K3s pod pending/resource pressure를 읽어 `min_size`·`max_size`, selector/taint, cooldown을 적용한다. GPU flavor가 필요한 경우 현재 GPU quota/admission authority인 Afterglow의 내부 admission을 조회하고, 특정 Stampede provisioning만 durable Afterglow intent를 claim/submit한다. Worker의 reconcile loop는 active cluster를 프로젝트별 concurrency로 enqueue하고 `reconcile_cluster`는 recorded resource ID를 다시 조회해 missing/mismatch/orphan을 DB에 기록한다.
+
+### Certificate rotation
+
+`POST /v1/clusters/{cluster_id}/rotate-certs`(`drover/api/certificates.py`)는 `master_count>=3`인 `ACTIVE`/`ERROR` cluster에서만 Redis rotation lock을 얻고 `drover/services/cert_rotation.py:rotate_certificates` SSE를 연다. control-plane 노드마다 `kube-system` Job(`nsenter -t 1 ... systemctl restart k3s`)을 만들고, Job 성공(최대 120초)을 확인한 뒤 `wait_node_ready`(기본 `drover_cert_rotation_node_timeout_sec=300`)가 Ready=True를 처음 관측하면 바로 다음 노드로 넘어간다. 대기 중에는 10초(`_NODE_READY_KEEPALIVE_SECONDS`)마다 SSE keepalive를 보낸다.
+
+- 노드 사이에 고정 settle 대기는 없다. 안전 간격은 `systemctl restart k3s`가 k3s READY까지 블록한다는 가정에 기댄다(서버 설치 경로가 get.k3s.io 기본 unit `Type=notify`를 쓴다는 전제이며 이 저장소에서 검증하지 않았다). Node Ready condition은 node-monitor-grace-period 동안 stale True일 수 있으므로, control-plane restart 사이 최소 간격이 필요하면 이름 있는 settle 상수나 Job 완료 이후 heartbeat 확인을 추가한다.
+- SSE 소비자가 끊기면 generator가 Ready polling task를 취소하고 endpoint가 rotation lock을 해제한다.
+- admin `GET /v1/admin/clusters/{cluster_id}/certificate-expiry`와 `POST /v1/admin/clusters/{cluster_id}/rotate-certs`(`drover/api/admin.py`)에는 알려진 결함이 있다. 전자는 async `probe_tls_server_cert`를 await하지 않는다. 후자는 `rotate_certificates(cluster_id, project_id, initiated_by)` 자리에 dict·`None`·cluster ID를 넘기고 `K3sProgressMessage`를 `step, pct, msg` tuple로 unpack하며 rotation lock을 잡지 않아 항상 FAILED로 끝난다. 두 경로에는 테스트가 없고 아직 수정하지 않았다.
 
 ## Data and contracts
 
@@ -150,13 +158,13 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 - migration: `uv run drover-migrate --apply`
 - architecture snapshot: `python3 scripts/check_architecture.py`
 
-2026-09-24 로컬 `uv run pytest tests`는 637건 통과·3건 skip(약 11-18초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
+2026-09-24 로컬 `uv run pytest tests`는 638건 통과·3건 skip(약 11-18초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
 
 GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규정과 기준선은 [`AGENTS.md`](AGENTS.md)의 CI 절에 있다.
 
 - main/dev 대상 PR(fork·dependabot 포함)은 `CI`(`.github/workflows/ci.yml`)를 한 번 실행한다. `ci.yml`에는 push trigger가 없고 `workflow_call`과 `workflow_dispatch`가 있다.
 - dev/main push와 `v*` tag의 suite는 `Docker Build & Push`(`.github/workflows/docker-build.yml`)에서만 실행한다(tag는 별도로 `release.yml` wheel release도 실행한다). 그 `test` job이 `ci.yml`을 reusable workflow로 실행하고 `build-and-push`가 `needs: test`로 전체 결과를 기다린 뒤 GHCR에 발행한다. 이 workflow에는 `pull_request` trigger가 없다.
-- `docker-build-and-scan`은 `setup-buildx-action` 없이 default docker driver로 `drover-api`/`drover-worker` target을 daemon에 직접 빌드(`load: true`)하고 Trivy 두 단계로 스캔한다. 발행용 `build-and-push`는 Buildx를 그대로 쓴다. docker driver 경로는 로컬에서 실행하지 않았으므로 CI 실행으로만 확인된다.
+- `docker-build-and-scan`은 `setup-buildx-action` 없이 default docker driver로 `drover-api`/`drover-worker` target을 daemon에 직접 빌드(`load: true`)하고 Trivy 두 단계로 스캔한다. 발행용 `build-and-push`는 Buildx를 그대로 쓴다. docker driver 경로는 로컬에서 실행하지 않았으므로 CI 실행으로만 확인된다. PR은 발행용 Buildx 빌드와 metadata/labels 단계를 실행하지 않으므로 그 경로에만 있는 실패는 merge 후 dev/main push에서 드러나며, `needs: test` 뒤 발행 단계라 fail-closed다. 이 post-merge 검출은 [`AGENTS.md`](AGENTS.md) CI 절에서 수용한 검증 공백이다.
 - `db-migration-and-readiness`의 MariaDB/Redis service health-check는 2초 interval에 각각 30회/15회 retry(60초/30초 window)다.
 
 ## Change guide
@@ -186,9 +194,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "33fbd4f0af486f5f1f68f4e7386947169a086b8bca6a48ebd2854c1544b7f301",
-  "reviewed_at": "2026-09-23T19:20:27Z",
-  "summary": ".github/workflows/ci.yml: drop push trigger (push/tag suite runs once via docker-build.yml test job), add workflow_dispatch, build scan images with the default docker driver (no setup-buildx), MariaDB/Redis health-check 2s interval with 60s/30s retry windows; .github/workflows/docker-build.yml: drop pull_request trigger, build-and-push still needs the whole reusable test workflow; tests/test_ci_workflows.py locks trigger dedup, needs: test, docker-driver scan build and health-check window; AGENTS.md adds the CI performance rules and the 2026-08-30..09-19 baseline. ARCHITECTURE.md Development and verification documents the CI topology, test counts refreshed to 637 passed/3 skipped, Overview Python floor corrected to pyproject >=3.11. No runtime, API, schema or deploy contract change."
+  "source_sha256": "1acfc2bfbdd9e7e1af1bd9818e66a78b1875daf31a46fe9637af0af835364387",
+  "reviewed_at": "2026-09-23T21:34:03Z",
+  "summary": "CI review round 1: drover/services/cert_rotation.py wraps the node-Ready keepalive loop in try/finally and cancels the wait_node_ready task when the SSE consumer disconnects (runtime change: no orphan K8s polling), and documents the unverified Type=notify settle assumption that replaced the old implicit 10s gap; tests/test_k3s_cert_rotation.py adds the disconnect-cancel regression; tests/test_k3s_certs.py patches socket.create_connection so the TLS probe failure test no longer dials 192.0.2.1:6443; tests/test_ci_workflows.py pins the full ci.yml and docker-build.yml trigger sets; docker-build.yml comments the fail-safe push expression. AGENTS.md CI section adds per-event baselines (CI PR 106/153s n=10, CI push 98/144s n=30, Docker push test span 99/123s n=32), the post-change measurement method, the accepted post-merge Buildx gap, and relabels projections; ARCHITECTURE.md adds the Certificate rotation runtime flow with the known admin rotate-certs/certificate-expiry defects (unfixed), the Buildx gap, and 638 passed/3 skipped. No API, schema or deploy contract change."
 }
 ```
 <!-- architecture-review:end -->

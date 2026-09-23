@@ -91,6 +91,11 @@ def test_suite_runs_once_per_event_and_gates_publication():
     # 값 없는 `workflow_call:`은 None으로 파싱되므로 truthiness가 아니라 key 존재로 확인한다.
     assert "workflow_call" in ci_triggers, "Docker Build & Push reuses ci.yml as its test gate"
     assert "push" not in ci_triggers, "push is tested once by docker-build.yml `test`; a CI push trigger duplicates it"
+    # 전체 trigger 집합을 고정한다. public 저장소에서 pull_request_target·workflow_run 같은
+    # 권한 있는 trigger나 schedule/push 재추가는 이 계약을 함께 바꾸는 명시적 결정이어야 한다.
+    assert set(ci_triggers) == {"workflow_call", "pull_request", "workflow_dispatch"}, (
+        f"unexpected ci.yml triggers: {sorted(ci_triggers)}"
+    )
     assert ci_triggers["pull_request"] == {"branches": ["main", "dev"]}, (
         "every PR (fork and dependabot included) runs CI without path or branch-name skips"
     )
@@ -98,6 +103,9 @@ def test_suite_runs_once_per_event_and_gates_publication():
     docker = _load_workflow("docker-build.yml")
     docker_triggers = _triggers(docker)
     assert "pull_request" not in docker_triggers, "PRs are covered by CI; no duplicate suite or non-pushing image build"
+    assert set(docker_triggers) == {"push", "workflow_dispatch"}, (
+        f"unexpected docker-build.yml triggers: {sorted(docker_triggers)}"
+    )
     assert docker_triggers["push"]["branches"] == ["main", "dev"]
     assert docker_triggers["push"]["tags"] == ["v*"]
 

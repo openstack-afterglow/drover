@@ -192,16 +192,29 @@ async def rotate_certificates(
 
         # 노드 Ready 대기 — 긴 대기 동안 SSE keepalive 전송. Ready 판정이 끝나면 keepalive 간격을
         # 기다리지 않고 바로 다음 단계로 넘어간다.
+        #
+        # 가정(이 저장소에서 미검증): 다음 노드 restart 전의 안전 간격은 restart Job의
+        # `systemctl restart k3s`가 k3s READY까지 블록한다는 데 기댄다. 서버 설치 경로
+        # (k3s_server.yaml.j2, FCOS cloudinit.py)는 get.k3s.io를 쓰고 INSTALL_K3S_TYPE을 지정하지 않으므로
+        # 그 기본 unit Type=notify를 전제한다. wait_node_ready는 첫 Ready=True 관측에서 반환하고 Node
+        # condition은 node-monitor-grace-period 동안 stale True일 수 있다. 이전 루프의 암묵적 10초
+        # 하한은 제거됐으므로, control-plane restart 사이 최소 간격이 필요하면 이름 있는 settle 상수나
+        # Job 완료 이후의 Ready heartbeat(lastHeartbeatTime) 확인을 명시적으로 추가한다.
         ready_task = asyncio.create_task(k3s_kube.wait_node_ready(cluster_id, node_name, timeout=node_timeout))
-        while True:
-            done, _pending = await asyncio.wait({ready_task}, timeout=_NODE_READY_KEEPALIVE_SECONDS)
-            if done:
-                break
-            yield _msg(
-                K3sProgressStep.ROTATE_SERVER,
-                base + 15,
-                f"[{i + 1}/{n}] {node_name}: 노드 Ready 대기 중...",
-            )
+        try:
+            while True:
+                done, _pending = await asyncio.wait({ready_task}, timeout=_NODE_READY_KEEPALIVE_SECONDS)
+                if done:
+                    break
+                yield _msg(
+                    K3sProgressStep.ROTATE_SERVER,
+                    base + 15,
+                    f"[{i + 1}/{n}] {node_name}: 노드 Ready 대기 중...",
+                )
+        finally:
+            # SSE 소비자가 끊겨 generator가 cancel/close되면 K8s API polling task를 남기지 않는다.
+            if not ready_task.done():
+                ready_task.cancel()
 
         node_ready = await ready_task
         if not node_ready:
