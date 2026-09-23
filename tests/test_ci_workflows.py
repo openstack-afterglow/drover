@@ -147,6 +147,10 @@ def test_suite_runs_once_per_event_and_gates_publication():
     assert set(docker_triggers) == {"push", "workflow_dispatch"}, (
         f"unexpected docker-build.yml triggers: {sorted(docker_triggers)}"
     )
+    # paths/paths-ignore/branches-ignore would skip the suite and publication for matching pushes.
+    assert set(docker_triggers["push"]) == {"branches", "tags"}, (
+        f"unexpected docker-build.yml push filters: {sorted(docker_triggers['push'])}"
+    )
     assert docker_triggers["push"]["branches"] == ["main", "dev"]
     assert docker_triggers["push"]["tags"] == ["v*"]
 
@@ -155,14 +159,35 @@ def test_suite_runs_once_per_event_and_gates_publication():
     assert "test" in _needs(jobs["build-and-push"]), "image publication must wait for the whole test workflow"
 
 
+def _publishes(job: dict) -> bool:
+    """A job that can push to a registry: packages write permission, a registry login, or a pushing build."""
+    permissions = job.get("permissions")
+    if permissions == "write-all" or (isinstance(permissions, dict) and permissions.get("packages") == "write"):
+        return True
+    for step in job.get("steps", []):
+        uses = step.get("uses", "")
+        if "docker/login-action" in uses:
+            return True
+        # Anything but a literal false (including the current `${{ ... }}` expression) may push.
+        if "docker/build-push-action" in uses and step.get("with", {}).get("push", False) is not False:
+            return True
+    return False
+
+
 def test_publication_gate_is_fail_closed():
     """A failed, skipped or cancelled suite never publishes images and never reports success to its caller."""
     docker_jobs = _load_workflow("docker-build.yml")["jobs"]
-    for name in ("test", "build-and-push"):
+    publishing = [name for name, job in docker_jobs.items() if name != "test" and _publishes(job)]
+    assert "build-and-push" in publishing
+    for name in publishing:
+        assert "test" in _needs(docker_jobs[name]), (
+            f"docker-build.yml `{name}` publishes images and must wait for the whole test workflow"
+        )
+    for name in ("test", *publishing):
         job = docker_jobs[name]
         # A job-level if replaces the implicit success() on needs. always(), !cancelled() and
-        # !failure() && !cancelled() (the usual companion of change detection) all run
-        # build-and-push after `test` failed or was skipped.
+        # !failure() && !cancelled() (the usual companion of change detection) all run a
+        # publishing job after `test` failed or was skipped.
         assert "if" not in job, f"docker-build.yml `{name}` must not set a job-level if: {job.get('if')!r}"
         assert not _sets_continue_on_error(job), f"docker-build.yml `{name}` must not set continue-on-error"
 
@@ -192,16 +217,38 @@ def test_every_ci_job_and_step_runs_unconditionally_in_parallel():
         assert not _needs(job), f"ci.yml `{job_name}` must not wait on {_needs(job)}; ci.yml jobs run in parallel"
 
 
+def _string_values(node):
+    """Every string value in a parsed YAML tree (comments are already gone)."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from _string_values(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _string_values(value)
+
+
+# `secrets.X`, `secrets['X']` and `toJSON(secrets)` all expose repository secrets; the read-only
+# GITHUB_TOKEN is the one secret PR code may reference.
+_NON_TOKEN_SECRET = re.compile(r"\bsecrets\b(?!\.GITHUB_TOKEN\b)")
+
+
 def test_pr_code_runs_on_github_hosted_runners_with_read_only_token():
-    """Rule 10: public-repo PR code runs only on GitHub-hosted ubuntu runners with a read-only token."""
+    """Rule 10: public-repo PR code runs only on GitHub-hosted ubuntu runners with a read-only token and no secrets."""
     reachable = _pr_reachable_workflows()
     assert "ci.yml" in reachable
     for name, workflow in reachable.items():
         assert workflow.get("permissions") == {"contents": "read"}, (
             f"{name} runs PR code and must keep top-level permissions: contents: read"
         )
+        leaked = [value for value in _string_values(workflow) if _NON_TOKEN_SECRET.search(value)]
+        assert not leaked, f"{name} runs PR code and must not reference secrets other than GITHUB_TOKEN: {leaked}"
         for job_name, job in workflow["jobs"].items():
             assert "permissions" not in job, f"{name} `{job_name}` job-level permissions override the read-only pin"
+            # Environment secrets and `secrets: inherit`/explicit secrets to a called workflow reach PR code.
+            assert "environment" not in job, f"{name} `{job_name}` runs PR code and must not use an environment"
+            assert "secrets" not in job, f"{name} `{job_name}` must not pass secrets to the workflow it calls"
             if "uses" in job:
                 continue  # the called workflow is itself in `reachable` and checked there
             runs_on = job.get("runs-on")
@@ -261,16 +308,20 @@ def test_scan_job_builds_into_daemon_with_docker_driver():
 
 
 def test_db_service_health_checks_poll_fast_with_enough_retries():
-    """서비스 컨테이너 health-check는 짧은 interval과 충분한 retry window를 쓴다."""
+    """서비스 컨테이너 health-check는 짧은 interval과 충분한 window(start-period + interval×retries)를 쓴다."""
     services = _load_workflow("ci.yml")["jobs"]["db-migration-and-readiness"]["services"]
     for name in ("mariadb", "redis"):
         options = services[name]["options"]
         interval = re.search(r"--health-interval=(\d+)s\b", options)
         retries = re.search(r"--health-retries=(\d+)\b", options)
+        # Docker does not count probe failures during start-period toward retries, so the two windows add.
+        # A start-period in any unit other than whole seconds counts as 0 here.
+        start_period = re.search(r"--health-start-period=(\d+)s\b", options)
         assert interval and retries, f"{name} must set --health-interval and --health-retries"
         interval_s = int(interval.group(1))
         assert interval_s <= 2, f"{name} health interval {interval_s}s delays job start"
-        assert interval_s * int(retries.group(1)) >= 30, f"{name} health window must stay at least 30s"
+        window_s = (int(start_period.group(1)) if start_period else 0) + interval_s * int(retries.group(1))
+        assert window_s >= 30, f"{name} health window (start-period + interval x retries) {window_s}s is under 30s"
 
 
 def test_docker_build_preserves_published_kolla_image_tag():

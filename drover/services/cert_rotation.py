@@ -204,6 +204,7 @@ async def rotate_certificates(
         # stale True일 수 있고(node-monitor-grace-period), restart 사이에 etcd member health는 확인하지
         # 않는다. 이전 루프의 암묵적 10초 하한은 제거됐으므로 최소 간격이 필요하면 이름 있는 settle
         # 상수(테스트는 0으로 patch)나 Job 완료 이후 Ready lastHeartbeatTime·etcd health 확인을 명시적으로 추가한다.
+        # 이 하한 제거는 운영 동작 변경이며 owner 확인 대기다(ARCHITECTURE.md Certificate rotation).
         ready_task = asyncio.create_task(k3s_kube.wait_node_ready(cluster_id, node_name, timeout=node_timeout))
         try:
             while True:

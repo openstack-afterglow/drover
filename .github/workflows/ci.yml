@@ -3,7 +3,7 @@ name: CI
 # Push to main/dev and v* tags runs this suite once through Docker Build & Push
 # (`test: uses: ./.github/workflows/ci.yml`), which gates image publication on the
 # whole result. A standalone push trigger here would run the identical tree twice.
-# Pull requests (including fork and dependabot PRs) always run this workflow.
+# Pull requests targeting main/dev (including fork and dependabot PRs) always run this workflow.
 on:
   workflow_call:
   pull_request:
