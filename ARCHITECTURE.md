@@ -196,9 +196,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "437c29a60e5bd58c171d31f7cd1ea0aa93e55d990c1559b59b2221e702b9e7e6",
-  "reviewed_at": "2026-09-23T22:58:59Z",
-  "summary": "CI review round 3. tests/test_ci_workflows.py: PR-reachable workflows may not use job environment, pass secrets to a called workflow, or reference secrets other than GITHUB_TOKEN (case-insensitive); every docker-build.yml job that can publish (packages write or write-all at job or inherited workflow level, login-action, non-false push) must need test with no job-level if/continue-on-error; docker-build.yml push filters pinned to branches/tags; the health-check window counts start-period + interval x retries. ci.yml comment only. cert_rotation.py comment only (implicit 10s floor removal awaits owner confirmation). ARCHITECTURE Certificate rotation: the generator cancels the Ready task, but the tenant endpoint lock release is cancelled on disconnect during the Job or node-Ready waits (pre-existing defect, 900s TTL, scratch probe only). AGENTS.md CI rules 3/4/7/10/11 aligned with the canonical rules: publication and deploys gated, non-publishing PR builds parallel, release.yml wheel release not gated (pre-existing gap), settings-level runner-group and fork-approval controls with paths. No API, schema, workflow behavior or deploy change; 642 passed/3 skipped."
+  "source_sha256": "c15f491b15991fe4fcd612ec16b2992e508704b8cb13934cc590238076c3198d",
+  "reviewed_at": "2026-09-24T11:07:44Z",
+  "summary": "Rebase of ci-perf onto origin/dev bf6ec22 (admin TLS probe await + cert rotation signature fix). Reviewed merged ARCHITECTURE.md: admin cert route notes from bf6ec22 and ci-perf CI/cert-rotation keepalive notes both present; no structural change beyond the two change sets. Verified: uv run pytest tests 652 passed/3 skipped, ruff clean, actionlint clean."
 }
 ```
 <!-- architecture-review:end -->
