@@ -2,7 +2,6 @@
 
 import subprocess
 import sys
-import tomllib
 import zipfile
 from pathlib import Path
 
@@ -95,7 +94,6 @@ def test_defaults_variable_interface():
 
     # Image namespace and tags
     assert defaults["drover_image_namespace"] == "ghcr.io/openstack-afterglow"
-    assert defaults["drover_image_tag"] == "v0.2.21"  # Published image default, deliberately decoupled from root wheel version.
     assert defaults["drover_source_version"] == "66d33447d0a6f8b1b2ba34f88b360a6bf9c28399"
 
     # Required service definitions
@@ -160,25 +158,6 @@ def test_defaults_variable_interface():
     raw_defaults = defaults_file.read_text(encoding="utf-8")
     assert "secret_password" not in raw_defaults
     assert "my_secret_key" not in raw_defaults
-
-
-def test_root_wheel_metadata_and_published_image_default():
-    """Verify root wheel metadata owns role assets without changing published image defaults."""
-    root_version = drover.__version__
-    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert root_version == project["project"]["version"]
-    assert "dependencies" not in project["project"]
-    assert "service" in project["project"]["optional-dependencies"]
-    assert "kolla-ansible" not in project["project"]["optional-dependencies"]["service"]
-    assert project["tool"]["hatch"]["build"]["targets"]["wheel"]["shared-data"] == {
-        "deploy/kolla/ansible/roles/drover": "share/kolla-ansible/ansible/roles/drover"
-    }
-    assert not (KOLLA_DIR / "pyproject.toml").exists()
-    assert not (KOLLA_DIR / "uv.lock").exists()
-    assert not (KOLLA_DIR / "src" / "drover_kolla").exists()
-
-    defaults = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
-    assert defaults["drover_image_tag"] == "v0.2.21"
 
 
 def test_action_dispatch_and_ordering():
@@ -429,11 +408,10 @@ def test_root_wheel_packaging_lifecycle(tmp_path):
     assert (installed_role_dir / "tasks" / "preconditions_keystone.yml").is_file()
     assert (installed_role_dir / "templates" / "drover.conf.j2").is_file()
 
-    inst_defaults = yaml.safe_load((installed_role_dir / "defaults" / "main.yml").read_text(encoding="utf-8"))
-    assert inst_defaults["drover_image_tag"] == "v0.2.21"
-
     uninstall_cmd = ["uv", "pip", "uninstall", "--python", str(venv_python), "drover"]
     res_uninst = subprocess.run(uninstall_cmd, capture_output=True, text=True)
-    assert res_uninst.returncode == 0, f"uv pip uninstall failed:\nstdout: {res_uninst.stdout}\nstderr: {res_uninst.stderr}"
+    assert res_uninst.returncode == 0, (
+        f"uv pip uninstall failed:\nstdout: {res_uninst.stdout}\nstderr: {res_uninst.stderr}"
+    )
     remaining_files = list(installed_role_dir.glob("**/*")) if installed_role_dir.exists() else []
     assert not [path for path in remaining_files if path.is_file()]

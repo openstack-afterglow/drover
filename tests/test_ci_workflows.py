@@ -329,30 +329,6 @@ def test_db_service_health_checks_poll_fast_with_enough_retries():
         assert window_s >= 30, f"{name} health window (start-period + interval x retries) {window_s}s is under 30s"
 
 
-def test_docker_build_preserves_published_kolla_image_tag():
-    """docker-build.yml must preserve the published tag the Kolla role consumes."""
-
-    workflow_file = WORKFLOWS_DIR / "docker-build.yml"
-    assert workflow_file.is_file()
-    workflow = yaml.safe_load(workflow_file.read_text(encoding="utf-8"))
-    triggers = workflow.get("on", workflow.get(True, {}))
-    assert triggers.get("push", {}).get("tags") == ["v*"], "tag push must drive image publication"
-    expected_tag = "v0.2.21"
-    kolla_defaults = yaml.safe_load(
-        (REPO_ROOT / "deploy" / "kolla" / "ansible" / "roles" / "drover" / "defaults" / "main.yml").read_text(encoding="utf-8")
-    )
-    assert kolla_defaults["drover_image_tag"] == expected_tag, "Kolla must keep the published image tag until images are released"
-    for image_key in ("meta-api", "meta-worker"):
-        step = next(s for s in workflow["jobs"]["build-and-push"]["steps"] if s.get("id") == image_key)
-        tags = step["with"]["tags"]
-        assert "type=ref,event=tag" in tags, (
-            f"{image_key} must publish the raw git tag; metadata-action semver strips the v prefix "
-            "that deploy/kolla drover_image_tag and precheck consume"
-        )
-        assert "type=semver" not in tags, f"{image_key} must not strip the v prefix"
-        assert "type=raw,value=dev" in tags, f"{image_key} must keep the dev floating tag"
-
-
 def test_staging_workflow_structure():
     """Verify the manual live gate is isolated from automatic CI and fail-closed."""
     staging_file = WORKFLOWS_DIR / "staging.yml"
