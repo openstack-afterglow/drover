@@ -7,7 +7,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
 - 패키지: `drover==0.2.22`, `drover-sdk==0.2.21`
-- 주요 런타임: Python `>=3.11`(root package `requires-python`; CI·container image는 3.12), FastAPI `0.125.0`, Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
+- 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
 
@@ -24,7 +24,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 | Afterglow provisioning intent/GPU admission 연동 | partial | source-reviewed, test-defined | 일반 create는 Drover가 직접 Nova/Cinder 등을 호출하고 intent/admission은 특정 Stampede 경로다 | `drover/services/afterglow.py`, `drover/services/stampede.py`, `tests/test_afterglow_admission.py`, `tests/test_afterglow_provisioning.py` |
 | legacy `gpu_quotas` 제거 | partial | source-reviewed, test-defined | 역사적 `001_baseline.sql` 테이블은 아직 물리 삭제하지 않았고 조건부 runbook만 있다 | `drover/migrations/001_baseline.sql`, `drover/migrations/README.md`, `docs/gpu-quota-table-retirement-runbook.md` |
 
-위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-24 로컬 `uv run pytest tests`는 642건 통과·3건 skip이었고 architecture guard 13건도 포함한다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
+위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-24 로컬 FastAPI `0.141.1`/Starlette `1.6.0` 기준 `uv run pytest tests`는 652건 통과·3건 skip이었고(architecture guard 13건 포함) `uv --directory sdk run pytest`는 111건 통과했다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
 
 ## System context
 
@@ -113,6 +113,8 @@ API namespace는 `/v1`이며 health/discovery도 `/v1` 아래에 있다. Keyston
 
 `drover/auth.py:validate_token`은 `X-Project-Id`가 없는 SDK 호출에서 제출된 토큰을 Keystone `/v3/auth/tokens`로 검증하여 원래 project/token/roles를 보존한다. Keystone URL은 root와 `/v3` 형식을 모두 지원한다. 무범위 token 재인증은 사용자의 default project로 바뀌거나 unscoped token을 발급하므로 검증 용도로 사용하지 않는다. 명시적인 project header가 있을 때만 기존 Keystone-authorized rescope를 수행하며, 프로젝트 없는 토큰·검증 실패·기존 admin/owner 정책은 fail-closed로 유지한다. 배포 topology와 schema는 변경하지 않는다.
 
+FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 받는 endpoint는 `Content-Type: application/json` 계열 헤더가 없는 요청을 `422`로 거부한다. cloud-init callback 스크립트(`drover/templates/k3s_server.yaml.j2`, `drover/templates/k3s_server_fcos_callback.sh.j2`, `drover/services/cloudinit.py`의 install script)와 `drover-sdk`의 `json=` 요청은 이 헤더를 보낸다. 헤더 없이 JSON을 보내는 외부 호출자는 헤더를 추가해야 한다. Rate limit은 `@limiter.limit` route decorator(`drover/api/callback.py`, `health.py`, `clusters.py`)에서만 적용된다. FastAPI `>=0.137`의 `app.routes`는 include된 router를 tree로 유지하므로 `SlowAPIMiddleware`는 include된 `/v1` route의 handler를 찾지 못하고 요청을 그대로 통과시킨다. 현재 `drover/rate_limit.py:limiter`에는 코드 인자(`default_limits`/`application_limits`)나 slowapi 환경 설정(`RATELIMIT_DEFAULT`/`RATELIMIT_APPLICATION`, 작업 디렉터리 `.env`)으로 주는 전역 limit이 없어 동작은 이전과 같다. 다만 이런 전역 limit을 추가해도 include된 route에는 적용되지 않는다.
+
 `drover/migrations/manifest.txt`와 migration SQL의 checksum ledger가 schema 선행 조건이다. `001_baseline.sql`은 historical `gpu_quotas`를 포함하고 있으며 source table 은퇴는 Afterglow import·sole-authority rollout·query 부재 감사 뒤에만 가능하다. 현재 코드가 그 table을 물리적으로 삭제했다고 주장하지 않는다.
 
 ## Deployment and operations
@@ -160,7 +162,7 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 - migration: `uv run drover-migrate --apply`
 - architecture snapshot: `python3 scripts/check_architecture.py`
 
-2026-09-24 로컬 `uv run pytest tests`는 642건 통과·3건 skip(약 11-18초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
+2026-09-24 로컬 `uv run pytest tests`는 652건 통과·3건 skip(약 12초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. 같은 날 `uv --directory sdk run pytest`는 111건 통과했다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
 
 GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규정과 기준선은 [`AGENTS.md`](AGENTS.md)의 CI 절에 있다. 계약은 trigger 집합(`docker-build.yml` push 필터는 `branches`·`tags`만), fail-closed 발행 게이트(`docker-build.yml`에서 `test`를 뺀 잡 중 `packages: write`·`write-all` 권한(job 또는 상속한 workflow 수준), `docker/login-action`, literal `false`가 아닌 `push`의 `docker/build-push-action` 중 하나라도 있는 모든 잡의 `needs`에 `test`, 그 잡들과 `test`의 job-level `if`·`continue-on-error` 금지, `ci.yml` 잡·스텝의 `continue-on-error` 금지), `ci.yml` 잡·스텝의 `if`와 잡 간 `needs` 금지, PR 코드를 실행하는 workflow의 `ubuntu-*` runner·`permissions: contents: read`·job-level `permissions`/`environment`/`secrets` 금지·`secrets.GITHUB_TOKEN` 외 secret 참조 금지, `service`의 checkout 다음 첫 스텝인 architecture check와 `uv run pytest tests`, 빌드한 두 이미지의 Trivy 스캔, 서비스 health-check의 2초 이하 interval과 30초 이상 window(start-period + interval×retries)를 포함한다.
 
@@ -196,9 +198,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "c15f491b15991fe4fcd612ec16b2992e508704b8cb13934cc590238076c3198d",
-  "reviewed_at": "2026-09-24T11:07:44Z",
-  "summary": "Rebase of ci-perf onto origin/dev bf6ec22 (admin TLS probe await + cert rotation signature fix). Reviewed merged ARCHITECTURE.md: admin cert route notes from bf6ec22 and ci-perf CI/cert-rotation keepalive notes both present; no structural change beyond the two change sets. Verified: uv run pytest tests 652 passed/3 skipped, ruff clean, actionlint clean."
+  "source_sha256": "8a4d10ae524a91cb522ee9a52290d79ea05ad48b17a87bf578f49af65dca3fea",
+  "reviewed_at": "2026-09-24T11:27:08Z",
+  "summary": "Bump fastapi 0.125.0->0.141.1 and add starlette>=1.3.1 floor (lock 1.6.0) to clear starlette 0.50.0 CVE-2026-48818/CVE-2026-54283; only fastapi/starlette change in uv.lock; FastAPI>=0.132 strict JSON Content-Type (422) and >=0.137 route tree (SlowAPIMiddleware lookup, incl. RATELIMIT_* env limits) documented, test_policy admin-route scan uses iter_route_contexts. Rebased onto origin/dev f9ceea0 (ci-perf CI/cert-rotation + bf6ec22 admin fix): merged runtime line and test-count sentences, kept ci-perf CI section; 652 passed/3 skipped (~12s), SDK 111; no topology/schema/deploy/CI-shape change"
 }
 ```
 <!-- architecture-review:end -->

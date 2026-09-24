@@ -217,11 +217,13 @@ async def test_operation_access_security(monkeypatch):
 
 def test_no_remaining_direct_router_admin_checks():
     """Verify all admin endpoints use policy enforcement dependencies."""
-    from fastapi.routing import APIRoute
+    from fastapi.routing import APIRoute, iter_route_contexts
 
+    # FastAPI >=0.137 keeps included routers as a tree in app.routes; resolve the
+    # effective routes (include prefix + router-level dependencies) instead.
     admin_routes = [
-        r for r in app.routes
-        if isinstance(r, APIRoute) and r.path.startswith("/v1/admin")
+        r for r in iter_route_contexts(app.routes)
+        if isinstance(r.original_route, APIRoute) and r.path.startswith("/v1/admin")
     ]
     assert len(admin_routes) > 0
 
