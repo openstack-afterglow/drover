@@ -1,0 +1,20 @@
+# Drover 0.2.23 release notes
+
+Release source preparation for `v0.2.23`, compared with `v0.2.21`. This document does not certify a published release, built wheel/image, or deployed service.
+
+## Changes since v0.2.21
+
+- Consolidated the former separate Kolla distribution into the root `drover` wheel. The wheel installs the role under `share/kolla-ansible/ansible/roles/drover`; API/Worker processes still need the `service` extra. Root `requires-python` is now `>=3.11` for the Kolla control node; container and CI Python remain 3.12. `drover-sdk` remains a separate package at `0.2.21`.
+- Fixed the admin certificate-expiry TLS probe to await the result and the admin certificate-rotation SSE path to call the rotation service with its real signature, serialize progress messages, and share the Redis rotation lock. Certificate rotation now advances as soon as a node is Ready instead of imposing an additional fixed 10-second wait after each node. The architecture review records the remaining stale-Ready/etcd-health risk and the known SSE-disconnect lock-release risk; this release does not fix those risks.
+- CI runs its suite once per event: PRs via `CI`, dev/main and version-tag pushes via the `Docker Build & Push` reusable `test` job. Image publication waits for that suite. Docker scan builds use the local docker driver, and service/test setup was shortened. This is not a claim of measured post-change CI speedup. The GitHub Release wheel workflow is separately triggered by a tag and does not wait for the suite.
+- Updated FastAPI from `0.125.0` to `0.141.1`, added `starlette>=1.3.1` (resolved to `1.6.0` in the root lock) to move off Starlette `0.50.0` for CVE-2026-48818 and CVE-2026-54283. FastAPI's stricter JSON Content-Type handling and the SlowAPI middleware route-tree limitation are described in `ARCHITECTURE.md` and `docs/drover-api-v1-reference.md`.
+
+## Release metadata and deployment boundary
+
+`pyproject.toml`, `drover/__init__.py`, and the editable root package in `uv.lock` declare `0.2.23`. The release workflow compares the `v*` tag name with `drover.__version__` and requires `dist/drover-0.2.23-py3-none-any.whl` for `v0.2.23`. The packaged Kolla role defaults to `ghcr.io/openstack-afterglow/drover-api:v0.2.23` and `ghcr.io/openstack-afterglow/drover-worker:v0.2.23`; source-build mode retains its independent `drover_source_version` pin. **Do not deploy using the new image default until both images have actually been published and verified.** No tag, image, or GitHub Release is created by this source update.
+
+The `v0.2.23` tag push is configured to publish both image targets after the suite succeeds. The workflow does not declare a `platforms` matrix or Buildx platform list: the GitHub-hosted `ubuntu-latest` runner's default architecture is the only configured build platform (normally `linux/amd64`); `linux/arm64` is not declared or verified. Branch pushes also publish floating `dev` or `latest` (as appropriate) and `sha-<commit>` tags, not a version tag.
+
+## Verification to perform separately
+
+This source-preparation change intentionally does not run tests, lint, builds, image publishing, or deployment. Project entry points when authorized: `uv sync --all-extras --frozen`; `uv run pytest tests`; `uv --directory sdk run pytest`; `uv run ruff check .`; `python3 scripts/check_architecture.py`; `uv build --wheel`. The wheel workflow additionally installs/uninstalls the wheel in a clean Python 3.12 venv and checks the installed role path. `.github/workflows/docker-build.yml` builds Dockerfile targets `drover-api` and `drover-worker` through Buildx; `.github/workflows/ci.yml` builds and scans both targets on PRs. Before using the Kolla default, verify that both `v0.2.23` image manifests exist for the target architecture, then perform a safe staging rollout and readiness/runtime smoke path. This repository has no OpenSpec release artifact convention (`AGENTS.md` expressly says Drover does not use OpenSpec); release notes and the architecture review are the owned documentation for this preparation.

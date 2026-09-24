@@ -368,7 +368,7 @@ wheels = [
 
 [[package]]
 name = "drover"
-version = "0.2.22"
+version = "0.2.23"
 source = { editable = "." }
 
 [package.optional-dependencies]

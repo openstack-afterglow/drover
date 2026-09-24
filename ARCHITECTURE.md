@@ -6,7 +6,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: `drover==0.2.22`, `drover-sdk==0.2.21`
+- 패키지: `drover==0.2.23`, `drover-sdk==0.2.21` (별도 SDK 버전)
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -89,7 +89,7 @@ graph LR
 - 노드 사이에 고정 settle 대기는 없다. 안전 간격은 `systemctl restart k3s`가 k3s READY까지 블록한다는 데 기댄다. 서버 설치 경로는 모두 `INSTALL_K3S_TYPE` 없이 `curl -sfL https://get.k3s.io | ... sh -s - server`를 실행한다(`drover/templates/k3s_server.yaml.j2`의 서버 설치 단계 — Barbican KMS 경로도 KMS sock 준비 뒤 같은 단계를 쓴다 — 와 FCOS `drover/services/cloudinit.py`). upstream `install.sh`는 이때 unit을 `Type=notify`로 쓰고, upstream k3s server는 embedded etcd와 apiserver가 ready가 된 뒤 `READY=1`을 보내므로 restart는 그때까지 블록한다. 이 근거는 upstream master 소스이며 고정한 `k3s_version`이나 이 저장소 테스트로 확인하지 않았다.
 - 남은 위험: `wait_node_ready`의 첫 poll은 Job 완료 직후라 node-monitor-grace-period 동안 stale Ready=True를 볼 수 있고, restart 사이에 etcd member health는 확인하지 않는다. control-plane restart 사이 최소 간격이 필요하면 이름 있는 settle 상수(테스트는 0으로 patch)나 Job 완료 이후 Ready `lastHeartbeatTime`·etcd health 확인을 추가한다. 이전 루프의 암묵적 10초 하한(Job 완료 뒤 최소 10초)을 없앤 것은 운영 동작 변경이며 owner 확인을 아직 받지 않았다.
 - SSE 소비자가 끊겨 `rotate_certificates` generator가 keepalive yield에서 close(`aclose`)되거나 Ready 대기 중 cancel되면 generator의 `finally`가 Ready polling task를 취소한다. close 경로는 `tests/test_k3s_cert_rotation.py::test_rotate_certificates_cancels_node_ready_wait_when_consumer_disconnects`가 정의하고(test-defined), cancel 경로는 아래 lock 결함과 같은 scratch probe로만 확인했다. 이 보장은 generator 수준이며 endpoint의 lock 해제는 포함하지 않는다.
-- admin `GET /v1/admin/clusters/{cluster_id}/certificate-expiry`와 `POST /v1/admin/clusters/{cluster_id}/rotate-certs`(`drover/api/admin.py`)에는 알려진 결함이 있다. 전자는 async `probe_tls_server_cert`를 await하지 않는다. 후자는 `rotate_certificates(cluster_id, project_id, initiated_by)` 자리에 dict·`None`·cluster ID를 넘기고 `K3sProgressMessage`를 `step, pct, msg` tuple로 unpack하며 rotation lock을 잡지 않아 항상 FAILED로 끝난다. 두 경로에는 테스트가 없고 아직 수정하지 않았다.
+- admin `GET /v1/admin/clusters/{cluster_id}/certificate-expiry`와 `POST /v1/admin/clusters/{cluster_id}/rotate-certs`(`drover/api/admin.py`)는 각각 TLS probe를 await하고, tenant 경로와 같은 Redis rotation lock을 획득한 뒤 올바른 인자로 `rotate_certificates`를 호출하여 `K3sProgressMessage`를 SSE로 직렬화한다. admin 경로의 lock release도 generator의 `finally`에 있으므로 disconnect 취소 시에는 아래 tenant 경로와 같은 release 위험이 남는다. `tests/test_admin.py`에 해당 경로의 계약이 정의되어 있다(test-defined).
 - 알려진 결함(이 변경 전부터 있음, `drover/api/certificates.py`는 이 CI 변경에서 바뀌지 않았다): tenant endpoint에서 SSE 소비자가 Job 완료 대기나 node Ready 대기 중에 끊기면 rotation lock이 해제되지 않는다. uvicorn 0.39는 ASGI `spec_version` 2.3을 보고하므로 Starlette 0.50 `StreamingResponse`는 disconnect 시 anyio task group을 cancel한다. anyio는 cancel된 scope 안의 다음 await에 cancel을 다시 전달하므로 `_gen`의 `finally: await release_rotation_lock(cluster_id)`도 Redis DELETE 전에 cancel되고, `release_rotation_lock`의 `except Exception`은 `CancelledError`(BaseException)를 잡지 않는다. 그러면 lock은 `_REDIS_LOCK_TTL`(900초) 만료까지 남고 그동안 재시도는 `409`다. 2026-09-24 scratch probe(실제 `rotate_cluster_certs`·`release_rotation_lock`, fake Redis, `StreamingResponse`를 `spec_version` 2.3으로 직접 구동)에서 두 대기 중 disconnect 모두 lock이 남고 DELETE가 호출되지 않았으며, disconnect 없이 끝난 대조 실행은 lock을 해제했다. 저장소 테스트는 없다. 수정 후보는 lock 해제를 `anyio.CancelScope(shield=True)`로 감싸고 endpoint 수준 disconnect 테스트를 추가하는 별도 변경이다.
 
 ## Data and contracts
@@ -127,7 +127,9 @@ FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 �
 - `drover-sdk`: `sdk/`의 독립 Python package이며 API/Worker process에 import되어야 하는 내부 module이 아니다.
 - `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
 - 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
-- Kolla role의 `drover_image_tag`은 root wheel 버전과 별개로 마지막으로 공개된 runtime image tag를 가리킨다. 새 image를 실제 publish하기 전에는 package patch release가 이 기본값을 변경하지 않는다.
+- Kolla role의 `drover_image_tag`은 이번 release용 `v0.2.23`으로 설정된다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). `v0.2.23` 이미지가 실제 GHCR에 발행되기 전에는 이 기본값으로 배포할 수 없으며, 이미지 발행과 배포 검증은 이 소스 준비 작업에 포함되지 않는다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
+
+릴리스 변경과 검증 경계는 [`docs/release-0.2.23.md`](docs/release-0.2.23.md)에 정리한다. root wheel/런타임/lock은 `0.2.23`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag의 원문 `v0.2.23`으로 발행한다. tag 생성·빌드·발행은 아직 실행하지 않았다.
 
 `GET /v1/health`와 `/v1/health/live`는 process liveness만 의미한다. `/v1/health/ready`는 MariaDB, Redis ping, migration ledger, Keystone service credentials를 모두 확인하고 하나라도 unavailable이면 `503`을 반환한다. 로그는 각 process의 표준 logging과 correlation ID에 남고, operation event 및 reconciliation drift는 MariaDB API 조회로 확인한다. health 결과·Stampede event는 Redis cache이므로 장애 시 최신 값이 없을 수 있다.
 
@@ -198,9 +200,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "8a4d10ae524a91cb522ee9a52290d79ea05ad48b17a87bf578f49af65dca3fea",
-  "reviewed_at": "2026-09-24T11:27:08Z",
-  "summary": "Bump fastapi 0.125.0->0.141.1 and add starlette>=1.3.1 floor (lock 1.6.0) to clear starlette 0.50.0 CVE-2026-48818/CVE-2026-54283; only fastapi/starlette change in uv.lock; FastAPI>=0.132 strict JSON Content-Type (422) and >=0.137 route tree (SlowAPIMiddleware lookup, incl. RATELIMIT_* env limits) documented, test_policy admin-route scan uses iter_route_contexts. Rebased onto origin/dev f9ceea0 (ci-perf CI/cert-rotation + bf6ec22 admin fix): merged runtime line and test-count sentences, kept ci-perf CI section; 652 passed/3 skipped (~12s), SDK 111; no topology/schema/deploy/CI-shape change"
+  "source_sha256": "af96367bdf463119267af93bd70008896104d6a9af2b77e42a413e189b2ebada",
+  "reviewed_at": "2026-09-24T16:32:46Z",
+  "summary": "Reviewed 0.2.23 root/runtime/lock and Kolla release defaults; removed incidental version/source pins while retaining installed-wheel ownership coverage. No service structure change."
 }
 ```
 <!-- architecture-review:end -->
