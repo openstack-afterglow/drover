@@ -282,8 +282,8 @@ Policy `drover:admin` (시스템 관리자 전용) 인증이 요구되는 관리
 * **`DELETE /v1/admin/clusters/{cluster_id}`**: 강제 동기 삭제
 * **`POST /v1/admin/clusters/{cluster_id}/delete-async`**: 강제 비동기 삭제
 * **`GET /v1/admin/clusters/{cluster_id}/ca-certificate`**: CA 다운로드
-* **`GET /v1/admin/clusters/{cluster_id}/certificate-expiry`**: 인증서 만료 조회
-* **`POST /v1/admin/clusters/{cluster_id}/rotate-certs`**: 인증서 강제 순환
+* **`GET /v1/admin/clusters/{cluster_id}/certificate-expiry`**: 인증서 만료 조회 (kubeconfig CA/클라이언트 + `api_address` URL의 host/port, 없으면 `server_ip:6443` TLS 프로브; 프로브 실패 시 `server_via_tls=[]`)
+* **`POST /v1/admin/clusters/{cluster_id}/rotate-certs`**: 인증서 강제 순환 (SSE 스트림). 사용자 경로와 같은 클러스터별 Redis 회전 락을 사용하므로 진행 중인 회전이 있으면 `409`를 반환하며, 사용자 경로의 상태·`master_count≥3` 제한은 적용하지 않음. `last_rotation_initiated_by`는 `system-admin`으로 기록
 * **`GET /v1/admin/cluster-templates`**: 전체 템플릿 관리자 조회
 * **`GET /v1/admin/managed-resources`**:
   - Drover가 생성하고 관리 중인 OpenStack 클라우드 실제 자원(`ManagedOpenStackResource`) 목록 조회.
