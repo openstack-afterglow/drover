@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from drover.services.cert_rotation import _lock_key
+
 pytestmark = pytest.mark.asyncio
+
+_ROTATION_LOCK_KEY = _lock_key("cluster-1")
 
 
 def _cluster(cluster_id: str, status: str = "ACTIVE") -> dict:
@@ -106,6 +111,142 @@ async def test_admin_delete_persists_durable_job(admin_client):
         "DELETING",
         "관리자 삭제 요청",
     )
+
+
+def _cert_info(subject: str) -> dict:
+    return {
+        "not_after": "2027-09-24T00:00:00+00:00",
+        "not_before": "2026-09-24T00:00:00+00:00",
+        "subject": subject,
+        "issuer": "CN=k3s-server-ca",
+        "days_remaining": 365,
+    }
+
+
+@pytest.mark.parametrize(
+    ("api_address", "server_ip", "expected_target"),
+    [
+        ("https://10.0.0.5:6443", "10.0.0.5", ("10.0.0.5", 6443)),
+        ("https://k3s-api.example:7443", "10.0.0.5", ("k3s-api.example", 7443)),
+        ("10.0.0.5:7443", "10.0.0.9", ("10.0.0.5", 7443)),
+        ("https://k3s-api.example:abc", "10.0.0.9", ("10.0.0.9", 6443)),
+        ("https://[fd00::1:6443", "10.0.0.9", ("10.0.0.9", 6443)),
+        ("", "10.0.0.7", ("10.0.0.7", 6443)),
+    ],
+)
+async def test_admin_certificate_expiry_awaits_tls_probe(admin_client, api_address, server_ip, expected_target):
+    cluster = {**_cluster("cluster-1"), "api_address": api_address, "server_ip": server_ip}
+    server_certs = [_cert_info("CN=k3s")]
+    probe = AsyncMock(return_value=server_certs)
+    with (
+        patch("drover.api.admin.k3s_cluster.get_cluster_admin", new=AsyncMock(return_value=cluster)),
+        patch("drover.api.admin.k3s_cluster.get_kubeconfig_admin", new=AsyncMock(return_value="kubeconfig")),
+        patch(
+            "drover.api.admin.certs.parse_kubeconfig_certs",
+            return_value={"ca": _cert_info("CN=k3s-server-ca"), "client": _cert_info("CN=system:admin")},
+        ),
+        patch("drover.api.admin.certs.probe_tls_server_cert", new=probe),
+    ):
+        response = await admin_client.get("/v1/admin/clusters/cluster-1/certificate-expiry")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["server_via_tls"] == server_certs
+    assert body["ca"]["subject"] == "CN=k3s-server-ca"
+    probe.assert_awaited_once_with(*expected_target)
+
+
+async def test_admin_certificate_expiry_without_api_endpoint_skips_probe(admin_client):
+    cluster = {**_cluster("cluster-1"), "api_address": "", "server_ip": ""}
+    probe = AsyncMock(return_value=[_cert_info("CN=k3s")])
+    with (
+        patch("drover.api.admin.k3s_cluster.get_cluster_admin", new=AsyncMock(return_value=cluster)),
+        patch("drover.api.admin.k3s_cluster.get_kubeconfig_admin", new=AsyncMock(return_value="kubeconfig")),
+        patch("drover.api.admin.certs.parse_kubeconfig_certs", return_value={}),
+        patch("drover.api.admin.certs.probe_tls_server_cert", new=probe),
+    ):
+        response = await admin_client.get("/v1/admin/clusters/cluster-1/certificate-expiry")
+
+    assert response.status_code == 200
+    assert response.json()["server_via_tls"] == []
+    probe.assert_not_awaited()
+
+
+def _sse_events(body: str) -> list[dict]:
+    return [json.loads(line.removeprefix("data: ")) for line in body.splitlines() if line.startswith("data: ")]
+
+
+@pytest.fixture
+def rotation_settings(monkeypatch):
+    monkeypatch.setenv("DROVER_CERT_ROTATION_NODE_TIMEOUT_SEC", "42")
+    monkeypatch.setenv("DROVER_CERT_ROTATION_JOB_IMAGE", "registry.example/k3s:test")
+
+
+async def test_admin_rotate_certs_streams_service_messages(admin_client, _fake_redis, rotation_settings):
+    from drover.models.schemas import K3sProgressMessage, K3sProgressStep
+
+    calls: list[tuple[tuple, dict]] = []
+
+    async def fake_rotate(cluster_id, project_id, initiated_by, *, node_timeout=300.0, job_image="default"):
+        calls.append(((cluster_id, project_id, initiated_by), {"node_timeout": node_timeout, "job_image": job_image}))
+        assert await _fake_redis.get(_ROTATION_LOCK_KEY) is not None
+        yield K3sProgressMessage(
+            step=K3sProgressStep.ROTATE_DISCOVER, progress=5, message="검색 중", cluster_id=cluster_id
+        )
+        yield K3sProgressMessage(step=K3sProgressStep.COMPLETED, progress=100, message="완료", cluster_id=cluster_id)
+
+    with (
+        patch("drover.api.admin.k3s_cluster.get_cluster_admin", new=AsyncMock(return_value=_cluster("cluster-1"))),
+        patch("drover.api.admin.cert_rotation.rotate_certificates", new=fake_rotate),
+    ):
+        response = await admin_client.post("/v1/admin/clusters/cluster-1/rotate-certs")
+
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    assert calls == [
+        (("cluster-1", "project-1", "system-admin"), {"node_timeout": 42.0, "job_image": "registry.example/k3s:test"})
+    ]
+    events = _sse_events(response.text)
+    assert [event["step"] for event in events] == ["rotate_discover", "completed"]
+    assert {event["cluster_id"] for event in events} == {"cluster-1"}
+    assert await _fake_redis.get(_ROTATION_LOCK_KEY) is None
+
+
+async def test_admin_rotate_certs_service_error_emits_failed_and_releases_lock(
+    admin_client, _fake_redis, rotation_settings
+):
+    async def failing_rotate(cluster_id, project_id, initiated_by, *, node_timeout=300.0, job_image="default"):
+        assert await _fake_redis.get(_ROTATION_LOCK_KEY) is not None
+        raise RuntimeError("kube api unavailable")
+        yield  # pragma: no cover - makes this an async generator
+
+    with (
+        patch("drover.api.admin.k3s_cluster.get_cluster_admin", new=AsyncMock(return_value=_cluster("cluster-1"))),
+        patch("drover.api.admin.cert_rotation.rotate_certificates", new=failing_rotate),
+    ):
+        response = await admin_client.post("/v1/admin/clusters/cluster-1/rotate-certs")
+
+    assert response.status_code == 200
+    events = _sse_events(response.text)
+    assert events[-1]["step"] == "failed"
+    assert events[-1]["error"] == "kube api unavailable"
+    assert await _fake_redis.get(_ROTATION_LOCK_KEY) is None
+
+
+async def test_admin_rotate_certs_rejects_concurrent_rotation(admin_client, _fake_redis, rotation_settings):
+    await _fake_redis.set(_ROTATION_LOCK_KEY, "1")
+    rotate = AsyncMock()
+    with (
+        patch("drover.api.admin.k3s_cluster.get_cluster_admin", new=AsyncMock(return_value=_cluster("cluster-1"))),
+        patch("drover.api.admin.cert_rotation.rotate_certificates", new=rotate),
+    ):
+        response = await admin_client.post("/v1/admin/clusters/cluster-1/rotate-certs")
+
+    assert response.status_code == 409
+    rotate.assert_not_called()
+    assert await _fake_redis.get(_ROTATION_LOCK_KEY) == "1"
+
+
 async def test_admin_managed_resources_requires_admin(non_admin_client):
     response = await non_admin_client.get("/v1/admin/managed-resources")
     assert response.status_code == 403

@@ -15,6 +15,7 @@ Drover 서비스의 네이티브 REST, SSE(Server-Sent Events) 및 WebSocket API
   생략하면 `GET /v3/auth/tokens`로 제출된 토큰 자체를 검증하고 원래 프로젝트 범위를 보존합니다. 사용자의 default project로 재인증하지 않습니다. 명시하면 Keystone이 승인하는 해당 프로젝트로의 rescope를 수행합니다. Drover는 서비스 자격으로 카탈로그의 `identity` **internal** 인터페이스를 먼저 해석하고, 토큰 검증과 관리자 역할 조회를 그 URL로만 보냅니다. internal identity endpoint가 없거나 조회에 실패하면 external/public URL로 우회하지 않고 인증을 거부합니다. 미스코프·폐기·만료 토큰과 검증 실패도 계속 거부합니다.
 * **`X-Openstack-Request-Id`** *(자동 생성/전달)*: 시스템 전반의 상관관계(Correlation) 추적용 요청 식별자. API 응답 헤더 및 로그/이벤트 페이로드에 포함됨.
 * **`Idempotency-Key`** *(생성 API에서 선택·권장)*: `POST /v1/clusters/async`의 재전송을 같은 오퍼레이션으로 귀속시키는 유니크 키입니다. 현재 스케일·삭제·노드그룹 변경에는 외부 멱동성 계약이 없습니다.
+* **`Content-Type`** *(JSON body 요청에서 필수)*: JSON body를 보내는 요청은 `application/json` 계열 값을 보내야 합니다. FastAPI strict content-type 검사로 헤더 없이 보낸 JSON body도 `422`로 거부됩니다(FastAPI `0.132` 이전에는 허용). JSON 계열이 아닌 값은 이전에도 `422`였습니다.
 
 ### 1.2 표준 HTTP 상태 코드
 * `200 OK` / `201 Created` / `204 No Content`: 성공적인 처리
@@ -282,8 +283,8 @@ Policy `drover:admin` (시스템 관리자 전용) 인증이 요구되는 관리
 * **`DELETE /v1/admin/clusters/{cluster_id}`**: 강제 동기 삭제
 * **`POST /v1/admin/clusters/{cluster_id}/delete-async`**: 강제 비동기 삭제
 * **`GET /v1/admin/clusters/{cluster_id}/ca-certificate`**: CA 다운로드
-* **`GET /v1/admin/clusters/{cluster_id}/certificate-expiry`**: 인증서 만료 조회
-* **`POST /v1/admin/clusters/{cluster_id}/rotate-certs`**: 인증서 강제 순환
+* **`GET /v1/admin/clusters/{cluster_id}/certificate-expiry`**: 인증서 만료 조회 (kubeconfig CA/클라이언트 + `api_address` URL의 host/port, 없으면 `server_ip:6443` TLS 프로브; 프로브 실패 시 `server_via_tls=[]`)
+* **`POST /v1/admin/clusters/{cluster_id}/rotate-certs`**: 인증서 강제 순환 (SSE 스트림). 사용자 경로와 같은 클러스터별 Redis 회전 락을 사용하므로 진행 중인 회전이 있으면 `409`를 반환하며, 사용자 경로의 상태·`master_count≥3` 제한은 적용하지 않음. `last_rotation_initiated_by`는 `system-admin`으로 기록
 * **`GET /v1/admin/cluster-templates`**: 전체 템플릿 관리자 조회
 * **`GET /v1/admin/managed-resources`**:
   - Drover가 생성하고 관리 중인 OpenStack 클라우드 실제 자원(`ManagedOpenStackResource`) 목록 조회.

@@ -7,7 +7,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
 - 패키지: `drover==0.2.22`, `drover-sdk==0.2.21`
-- 주요 런타임: Python `>=3.12`, FastAPI `0.125.0`, Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
+- 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
 
@@ -24,7 +24,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 | Afterglow provisioning intent/GPU admission 연동 | partial | source-reviewed, test-defined | 일반 create는 Drover가 직접 Nova/Cinder 등을 호출하고 intent/admission은 특정 Stampede 경로다 | `drover/services/afterglow.py`, `drover/services/stampede.py`, `tests/test_afterglow_admission.py`, `tests/test_afterglow_provisioning.py` |
 | legacy `gpu_quotas` 제거 | partial | source-reviewed, test-defined | 역사적 `001_baseline.sql` 테이블은 아직 물리 삭제하지 않았고 조건부 runbook만 있다 | `drover/migrations/001_baseline.sql`, `drover/migrations/README.md`, `docs/gpu-quota-table-retirement-runbook.md` |
 
-위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-08 `uv run pytest tests`는 612건 통과·3건 skip이었고 architecture guard focused 13건도 통과했다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
+위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-24 로컬 FastAPI `0.141.1`/Starlette `1.6.0` 기준 `uv run pytest tests`는 652건 통과·3건 skip이었고(architecture guard 13건 포함) `uv --directory sdk run pytest`는 111건 통과했다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
 
 ## System context
 
@@ -82,6 +82,16 @@ graph LR
 
 `drover/services/autoscale.py`는 desired nodegroup count를 durable `nodegroup_reconcile` job으로 맞추고, `stampede.py`는 K3s pod pending/resource pressure를 읽어 `min_size`·`max_size`, selector/taint, cooldown을 적용한다. GPU flavor가 필요한 경우 현재 GPU quota/admission authority인 Afterglow의 내부 admission을 조회하고, 특정 Stampede provisioning만 durable Afterglow intent를 claim/submit한다. Worker의 reconcile loop는 active cluster를 프로젝트별 concurrency로 enqueue하고 `reconcile_cluster`는 recorded resource ID를 다시 조회해 missing/mismatch/orphan을 DB에 기록한다.
 
+### Certificate rotation
+
+`POST /v1/clusters/{cluster_id}/rotate-certs`(`drover/api/certificates.py`)는 `master_count>=3`인 `ACTIVE`/`ERROR` cluster에서만 Redis rotation lock을 얻고 `drover/services/cert_rotation.py:rotate_certificates` SSE를 연다. control-plane 노드마다 `kube-system` Job(`nsenter -t 1 ... systemctl restart k3s`)을 만들고, Job 성공(최대 120초)을 확인한 뒤 `wait_node_ready`(기본 `drover_cert_rotation_node_timeout_sec=300`)가 Ready=True를 처음 관측하면 바로 다음 노드로 넘어간다. 대기 중에는 10초(`_NODE_READY_KEEPALIVE_SECONDS`)마다 SSE keepalive를 보낸다.
+
+- 노드 사이에 고정 settle 대기는 없다. 안전 간격은 `systemctl restart k3s`가 k3s READY까지 블록한다는 데 기댄다. 서버 설치 경로는 모두 `INSTALL_K3S_TYPE` 없이 `curl -sfL https://get.k3s.io | ... sh -s - server`를 실행한다(`drover/templates/k3s_server.yaml.j2`의 서버 설치 단계 — Barbican KMS 경로도 KMS sock 준비 뒤 같은 단계를 쓴다 — 와 FCOS `drover/services/cloudinit.py`). upstream `install.sh`는 이때 unit을 `Type=notify`로 쓰고, upstream k3s server는 embedded etcd와 apiserver가 ready가 된 뒤 `READY=1`을 보내므로 restart는 그때까지 블록한다. 이 근거는 upstream master 소스이며 고정한 `k3s_version`이나 이 저장소 테스트로 확인하지 않았다.
+- 남은 위험: `wait_node_ready`의 첫 poll은 Job 완료 직후라 node-monitor-grace-period 동안 stale Ready=True를 볼 수 있고, restart 사이에 etcd member health는 확인하지 않는다. control-plane restart 사이 최소 간격이 필요하면 이름 있는 settle 상수(테스트는 0으로 patch)나 Job 완료 이후 Ready `lastHeartbeatTime`·etcd health 확인을 추가한다. 이전 루프의 암묵적 10초 하한(Job 완료 뒤 최소 10초)을 없앤 것은 운영 동작 변경이며 owner 확인을 아직 받지 않았다.
+- SSE 소비자가 끊겨 `rotate_certificates` generator가 keepalive yield에서 close(`aclose`)되거나 Ready 대기 중 cancel되면 generator의 `finally`가 Ready polling task를 취소한다. close 경로는 `tests/test_k3s_cert_rotation.py::test_rotate_certificates_cancels_node_ready_wait_when_consumer_disconnects`가 정의하고(test-defined), cancel 경로는 아래 lock 결함과 같은 scratch probe로만 확인했다. 이 보장은 generator 수준이며 endpoint의 lock 해제는 포함하지 않는다.
+- admin `GET /v1/admin/clusters/{cluster_id}/certificate-expiry`와 `POST /v1/admin/clusters/{cluster_id}/rotate-certs`(`drover/api/admin.py`)에는 알려진 결함이 있다. 전자는 async `probe_tls_server_cert`를 await하지 않는다. 후자는 `rotate_certificates(cluster_id, project_id, initiated_by)` 자리에 dict·`None`·cluster ID를 넘기고 `K3sProgressMessage`를 `step, pct, msg` tuple로 unpack하며 rotation lock을 잡지 않아 항상 FAILED로 끝난다. 두 경로에는 테스트가 없고 아직 수정하지 않았다.
+- 알려진 결함(이 변경 전부터 있음, `drover/api/certificates.py`는 이 CI 변경에서 바뀌지 않았다): tenant endpoint에서 SSE 소비자가 Job 완료 대기나 node Ready 대기 중에 끊기면 rotation lock이 해제되지 않는다. uvicorn 0.39는 ASGI `spec_version` 2.3을 보고하므로 Starlette 0.50 `StreamingResponse`는 disconnect 시 anyio task group을 cancel한다. anyio는 cancel된 scope 안의 다음 await에 cancel을 다시 전달하므로 `_gen`의 `finally: await release_rotation_lock(cluster_id)`도 Redis DELETE 전에 cancel되고, `release_rotation_lock`의 `except Exception`은 `CancelledError`(BaseException)를 잡지 않는다. 그러면 lock은 `_REDIS_LOCK_TTL`(900초) 만료까지 남고 그동안 재시도는 `409`다. 2026-09-24 scratch probe(실제 `rotate_cluster_certs`·`release_rotation_lock`, fake Redis, `StreamingResponse`를 `spec_version` 2.3으로 직접 구동)에서 두 대기 중 disconnect 모두 lock이 남고 DELETE가 호출되지 않았으며, disconnect 없이 끝난 대조 실행은 lock을 해제했다. 저장소 테스트는 없다. 수정 후보는 lock 해제를 `anyio.CancelScope(shield=True)`로 감싸고 endpoint 수준 disconnect 테스트를 추가하는 별도 변경이다.
+
 ## Data and contracts
 
 ### Authoritative storage와 cache split
@@ -102,6 +112,8 @@ graph LR
 API namespace는 `/v1`이며 health/discovery도 `/v1` 아래에 있다. Keystone service **name**과 **type**은 모두 `drover`이고, `drover-sdk`가 SDK에서 `drover`를 canonical service로 노출하면서 `container-infra`를 alias로 지원한다. 즉 `container-infra`는 Keystone catalog type이 아니라 SDK 호환 alias다. `drover_sdk.register(conn)` 후 `conn.drover`가 `/v1` endpoint를 사용한다.
 
 `drover/auth.py:validate_token`은 `X-Project-Id`가 없는 SDK 호출에서 제출된 토큰을 Keystone `/v3/auth/tokens`로 검증하여 원래 project/token/roles를 보존한다. Keystone URL은 root와 `/v3` 형식을 모두 지원한다. 무범위 token 재인증은 사용자의 default project로 바뀌거나 unscoped token을 발급하므로 검증 용도로 사용하지 않는다. 명시적인 project header가 있을 때만 기존 Keystone-authorized rescope를 수행하며, 프로젝트 없는 토큰·검증 실패·기존 admin/owner 정책은 fail-closed로 유지한다. 배포 topology와 schema는 변경하지 않는다.
+
+FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 받는 endpoint는 `Content-Type: application/json` 계열 헤더가 없는 요청을 `422`로 거부한다. cloud-init callback 스크립트(`drover/templates/k3s_server.yaml.j2`, `drover/templates/k3s_server_fcos_callback.sh.j2`, `drover/services/cloudinit.py`의 install script)와 `drover-sdk`의 `json=` 요청은 이 헤더를 보낸다. 헤더 없이 JSON을 보내는 외부 호출자는 헤더를 추가해야 한다. Rate limit은 `@limiter.limit` route decorator(`drover/api/callback.py`, `health.py`, `clusters.py`)에서만 적용된다. FastAPI `>=0.137`의 `app.routes`는 include된 router를 tree로 유지하므로 `SlowAPIMiddleware`는 include된 `/v1` route의 handler를 찾지 못하고 요청을 그대로 통과시킨다. 현재 `drover/rate_limit.py:limiter`에는 코드 인자(`default_limits`/`application_limits`)나 slowapi 환경 설정(`RATELIMIT_DEFAULT`/`RATELIMIT_APPLICATION`, 작업 디렉터리 `.env`)으로 주는 전역 limit이 없어 동작은 이전과 같다. 다만 이런 전역 limit을 추가해도 include된 route에는 적용되지 않는다.
 
 `drover/migrations/manifest.txt`와 migration SQL의 checksum ledger가 schema 선행 조건이다. `001_baseline.sql`은 historical `gpu_quotas`를 포함하고 있으며 source table 은퇴는 Afterglow import·sole-authority rollout·query 부재 감사 뒤에만 가능하다. 현재 코드가 그 table을 물리적으로 삭제했다고 주장하지 않는다.
 
@@ -150,7 +162,14 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 - migration: `uv run drover-migrate --apply`
 - architecture snapshot: `python3 scripts/check_architecture.py`
 
-2026-09-08 `uv run pytest tests`는 612건 통과·3건 skip이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
+2026-09-24 로컬 `uv run pytest tests`는 652건 통과·3건 skip(약 12초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. 같은 날 `uv --directory sdk run pytest`는 111건 통과했다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
+
+GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규정과 기준선은 [`AGENTS.md`](AGENTS.md)의 CI 절에 있다. 계약은 trigger 집합(`docker-build.yml` push 필터는 `branches`·`tags`만), fail-closed 발행 게이트(`docker-build.yml`에서 `test`를 뺀 잡 중 `packages: write`·`write-all` 권한(job 또는 상속한 workflow 수준), `docker/login-action`, literal `false`가 아닌 `push`의 `docker/build-push-action` 중 하나라도 있는 모든 잡의 `needs`에 `test`, 그 잡들과 `test`의 job-level `if`·`continue-on-error` 금지, `ci.yml` 잡·스텝의 `continue-on-error` 금지), `ci.yml` 잡·스텝의 `if`와 잡 간 `needs` 금지, PR 코드를 실행하는 workflow의 `ubuntu-*` runner·`permissions: contents: read`·job-level `permissions`/`environment`/`secrets` 금지·`secrets.GITHUB_TOKEN` 외 secret 참조 금지, `service`의 checkout 다음 첫 스텝인 architecture check와 `uv run pytest tests`, 빌드한 두 이미지의 Trivy 스캔, 서비스 health-check의 2초 이하 interval과 30초 이상 window(start-period + interval×retries)를 포함한다.
+
+- main/dev 대상 PR(fork·dependabot 포함)은 `CI`(`.github/workflows/ci.yml`)를 한 번 실행한다. `ci.yml`에는 push trigger가 없고 `workflow_call`과 `workflow_dispatch`가 있다.
+- dev/main push와 `v*` tag의 suite는 `Docker Build & Push`(`.github/workflows/docker-build.yml`)에서만 실행한다(tag는 별도로 `release.yml`의 GitHub Release wheel 발행도 실행하며, 이 발행은 suite 결과를 기다리지 않는다. 이 CI 변경 전부터 있는 공백이며 [`AGENTS.md`](AGENTS.md) CI 3번에 기록했다). 그 `test` job이 `ci.yml`을 reusable workflow로 실행하고 `build-and-push`가 `needs: test`로 전체 결과를 기다린 뒤 GHCR에 발행한다. 이 workflow에는 `pull_request` trigger가 없다.
+- `docker-build-and-scan`은 `setup-buildx-action` 없이 default docker driver로 `drover-api`/`drover-worker` target을 daemon에 직접 빌드(`load: true`)하고 Trivy 두 단계로 스캔한다. 발행용 `build-and-push`는 Buildx를 그대로 쓴다. docker driver 경로는 로컬에서 실행하지 않았으므로 CI 실행으로만 확인된다. PR은 발행용 Buildx 빌드와 metadata/labels 단계를 실행하지 않으므로 그 경로에만 있는 실패는 merge 후 dev/main push에서 드러나며, `needs: test` 뒤 발행 단계라 fail-closed다. 이 post-merge 검출은 [`AGENTS.md`](AGENTS.md) CI 절에서 수용한 검증 공백이다.
+- `db-migration-and-readiness`의 MariaDB/Redis service health-check는 2초 interval에 각각 30회/15회 retry(60초/30초 window)다.
 
 ## Change guide
 
@@ -163,6 +182,7 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 | Stampede/GPU/Afterglow boundary | `drover/services/stampede.py`, `afterglow.py`, `docs/afterglow-service-integration.md` | current intent/admission scope, `tests/test_k3s_stampede.py`, `tests/test_afterglow_*`, feature coverage |
 | schema, migration, durable model | `drover/models/orm.py`, `drover/migrations/`, `drover/scripts/migrate.py` | migration ledger/readiness, `tests/test_durable_create.py`, Deployment and operations |
 | SDK/catalog | `sdk/drover_sdk/service.py`, `sdk/drover_sdk/proxy.py`, `sdk/pyproject.toml` | `/v1` and alias wording, `sdk/tests/test_proxy.py`, docs catalog sections |
+| CI workflow/test runtime | `.github/workflows/*.yml`, [`AGENTS.md`](AGENTS.md) CI 절 | `tests/test_ci_workflows.py`, 20회 이상 전후 실측 기록, Development and verification |
 | bugfix/refactor with no topology change | affected source and tests | explain why topology/data contract is unchanged in the Maintenance review summary and restamp |
 
 ## Maintenance
@@ -178,9 +198,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "3ee8d856ce8b73b229b6668033435c0689a0c028bffdccf30c580c82c5fabcbc",
-  "reviewed_at": "2026-09-18T23:19:35Z",
-  "summary": "Relax requires-python to >=3.11 for Kolla control node compatibility; bump afterglow-crypto service pin to the matching >=3.11 commit"
+  "source_sha256": "8a4d10ae524a91cb522ee9a52290d79ea05ad48b17a87bf578f49af65dca3fea",
+  "reviewed_at": "2026-09-24T11:27:08Z",
+  "summary": "Bump fastapi 0.125.0->0.141.1 and add starlette>=1.3.1 floor (lock 1.6.0) to clear starlette 0.50.0 CVE-2026-48818/CVE-2026-54283; only fastapi/starlette change in uv.lock; FastAPI>=0.132 strict JSON Content-Type (422) and >=0.137 route tree (SlowAPIMiddleware lookup, incl. RATELIMIT_* env limits) documented, test_policy admin-route scan uses iter_route_contexts. Rebased onto origin/dev f9ceea0 (ci-perf CI/cert-rotation + bf6ec22 admin fix): merged runtime line and test-count sentences, kept ci-perf CI section; 652 passed/3 skipped (~12s), SDK 111; no topology/schema/deploy/CI-shape change"
 }
 ```
 <!-- architecture-review:end -->

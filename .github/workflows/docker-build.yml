@@ -1,8 +1,8 @@
 name: Docker Build & Push
 
+# Pull requests are covered by the CI workflow (including its docker-build-and-scan job),
+# so this workflow no longer re-runs the suite and a non-pushing image build for PRs.
 on:
-  pull_request:
-    branches: [main, dev]
   push:
     branches: [main, dev]
     tags: ['v*']
@@ -55,6 +55,9 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: drover-api
+          # Always true for the current triggers (branch/tag push, workflow_dispatch). Kept as a
+          # fail-safe so a re-added pull_request trigger could not publish; the trigger set is
+          # pinned by tests/test_ci_workflows.py, which rejects pull_request here.
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta-api.outputs.tags }}
           labels: ${{ steps.meta-api.outputs.labels }}
@@ -76,6 +79,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: drover-worker
+          # Same fail-safe as the API step above.
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta-worker.outputs.tags }}
           labels: ${{ steps.meta-worker.outputs.labels }}

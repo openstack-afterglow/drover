@@ -109,9 +109,15 @@ def test_parse_kubeconfig_certs_expired_cert_negative():
 
 @pytest.mark.asyncio
 async def test_probe_tls_server_cert_unreachable_returns_empty():
+    from unittest.mock import MagicMock
+
     from drover.services.certs import probe_tls_server_cert
 
-    result = await probe_tls_server_cert("192.0.2.1", 6443, timeout=0.5)
+    # 실제 192.0.2.1:6443에 접속하지 않고 연결 실패 경로만 hermetic하게 실행한다(AGENTS.md CI 규칙 7).
+    connect = MagicMock(side_effect=OSError("unreachable"))
+    with patch("drover.services.certs.socket.create_connection", new=connect):
+        result = await probe_tls_server_cert("192.0.2.1", 6443, timeout=0.5)
+    connect.assert_called_once_with(("192.0.2.1", 6443), timeout=0.5)
     assert result == []
 
 
@@ -187,12 +193,16 @@ async def test_certificate_expiry_structure(client, _fake_kc):
     async def _cached(key, ttl, fn, refresh=False, enabled=True):
         return await fn()
 
+    # endpoint가 함수 내부에서 import하므로 source module을 patch한다. 실제 10.0.0.1:6443 TLS 접속을 막는다.
+    probe = AsyncMock(return_value=[])
     with (
         patch("drover.api.certificates.k3s_db.get_cluster", new=AsyncMock(return_value=cluster_rec)),
         patch("drover.api.certificates.k3s_db.get_kubeconfig", new=AsyncMock(return_value=_fake_kc)),
         patch("drover.api.certificates.cached_call", new=AsyncMock(side_effect=_cached)),
+        patch("drover.services.certs.probe_tls_server_cert", new=probe),
     ):
         resp = await client.get("/v1/clusters/c1/certificate-expiry")
+    probe.assert_awaited_once_with("10.0.0.1", 6443)
     assert resp.status_code == 200
     data = resp.json()
     assert "ca" in data

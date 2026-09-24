@@ -1,11 +1,62 @@
 """Tests for GitHub Actions CI/CD workflows and deployment gate contracts."""
 
+import re
 from pathlib import Path
 
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
+
+
+def _load_workflow(name: str) -> dict:
+    return yaml.safe_load((WORKFLOWS_DIR / name).read_text(encoding="utf-8"))
+
+
+def _triggers(workflow: dict) -> dict:
+    # PyYAML parses the bare `on:` key as boolean True.
+    return workflow.get("on", workflow.get(True, {}))
+
+
+def _trigger_names(workflow: dict) -> set[str]:
+    # `on:` may be a mapping, a list (`on: [push, pull_request]`) or a single string (`on: push`).
+    triggers = _triggers(workflow)
+    if isinstance(triggers, str):
+        return {triggers}
+    return set(triggers or ())
+
+
+def _needs(job: dict) -> list[str]:
+    # `needs: test` and `needs: [test]` are equivalent.
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def _sets_continue_on_error(node: dict) -> bool:
+    # Absent or the literal `false` keep failures failing; `true` or any `${{ }}` expression may not.
+    return node.get("continue-on-error", False) is not False
+
+
+def _pr_reachable_workflows() -> dict[str, dict]:
+    """Workflows that run pull request code: PR-triggered files plus the local reusable workflows they call."""
+    paths = [*WORKFLOWS_DIR.glob("*.yml"), *WORKFLOWS_DIR.glob("*.yaml")]
+    workflows = {path.name: yaml.safe_load(path.read_text(encoding="utf-8")) for path in paths}
+    pending = [name for name, wf in workflows.items() if _trigger_names(wf) & {"pull_request", "pull_request_target"}]
+    reachable: dict[str, dict] = {}
+    while pending:
+        name = pending.pop()
+        if name in reachable:
+            continue
+        reachable[name] = workflows[name]
+        for job_name, job in workflows[name]["jobs"].items():
+            uses = job.get("uses")
+            if uses is None:
+                continue
+            assert uses.startswith("./.github/workflows/"), (
+                f"{name} `{job_name}` runs PR code through a remote reusable workflow whose runners this test cannot check"
+            )
+            pending.append(uses.removeprefix("./.github/workflows/"))
+    return reachable
 
 
 def test_workflow_yaml_syntax():
@@ -73,6 +124,209 @@ def test_ci_workflow_structure():
     assert artifact_step is not None, "Missing upload-artifact step in package-wheel"
     assert artifact_step["with"]["name"] == "drover-wheel"
     assert artifact_step["with"]["path"] == "dist/*.whl"
+
+
+def test_suite_runs_once_per_event_and_gates_publication():
+    """PR는 CI 한 번, push/tag는 Docker Build & Push의 reusable `test` 한 번만 실행한다."""
+    ci_triggers = _triggers(_load_workflow("ci.yml"))
+    # 값 없는 `workflow_call:`은 None으로 파싱되므로 truthiness가 아니라 key 존재로 확인한다.
+    assert "workflow_call" in ci_triggers, "Docker Build & Push reuses ci.yml as its test gate"
+    assert "push" not in ci_triggers, "push is tested once by docker-build.yml `test`; a CI push trigger duplicates it"
+    # 전체 trigger 집합을 고정한다. public 저장소에서 pull_request_target·workflow_run 같은
+    # 권한 있는 trigger나 schedule/push 재추가는 이 계약을 함께 바꾸는 명시적 결정이어야 한다.
+    assert set(ci_triggers) == {"workflow_call", "pull_request", "workflow_dispatch"}, (
+        f"unexpected ci.yml triggers: {sorted(ci_triggers)}"
+    )
+    assert ci_triggers["pull_request"] == {"branches": ["main", "dev"]}, (
+        "every PR (fork and dependabot included) runs CI without path or branch-name skips"
+    )
+
+    docker = _load_workflow("docker-build.yml")
+    docker_triggers = _triggers(docker)
+    assert "pull_request" not in docker_triggers, "PRs are covered by CI; no duplicate suite or non-pushing image build"
+    assert set(docker_triggers) == {"push", "workflow_dispatch"}, (
+        f"unexpected docker-build.yml triggers: {sorted(docker_triggers)}"
+    )
+    # paths/paths-ignore/branches-ignore would skip the suite and publication for matching pushes.
+    assert set(docker_triggers["push"]) == {"branches", "tags"}, (
+        f"unexpected docker-build.yml push filters: {sorted(docker_triggers['push'])}"
+    )
+    assert docker_triggers["push"]["branches"] == ["main", "dev"]
+    assert docker_triggers["push"]["tags"] == ["v*"]
+
+    jobs = docker["jobs"]
+    assert jobs["test"]["uses"] == "./.github/workflows/ci.yml"
+    assert "test" in _needs(jobs["build-and-push"]), "image publication must wait for the whole test workflow"
+
+
+def _publishes(job: dict, workflow_permissions=None) -> bool:
+    """A job that can push to a registry: packages write permission, a registry login, or a pushing build."""
+    # A job without its own permissions block inherits the workflow-level one.
+    permissions = job.get("permissions", workflow_permissions)
+    if permissions == "write-all" or (isinstance(permissions, dict) and permissions.get("packages") == "write"):
+        return True
+    for step in job.get("steps", []):
+        uses = step.get("uses", "")
+        if "docker/login-action" in uses:
+            return True
+        # Anything but a literal false (including the current `${{ ... }}` expression) may push.
+        if "docker/build-push-action" in uses and step.get("with", {}).get("push", False) is not False:
+            return True
+    return False
+
+
+def test_publication_gate_is_fail_closed():
+    """A failed, skipped or cancelled suite never publishes images and never reports success to its caller."""
+    docker = _load_workflow("docker-build.yml")
+    docker_jobs = docker["jobs"]
+    publishing = [
+        name for name, job in docker_jobs.items() if name != "test" and _publishes(job, docker.get("permissions"))
+    ]
+    assert "build-and-push" in publishing
+    for name in publishing:
+        assert "test" in _needs(docker_jobs[name]), (
+            f"docker-build.yml `{name}` publishes images and must wait for the whole test workflow"
+        )
+    for name in ("test", *publishing):
+        job = docker_jobs[name]
+        # A job-level if replaces the implicit success() on needs. always(), !cancelled() and
+        # !failure() && !cancelled() (the usual companion of change detection) all run a
+        # publishing job after `test` failed or was skipped.
+        assert "if" not in job, f"docker-build.yml `{name}` must not set a job-level if: {job.get('if')!r}"
+        assert not _sets_continue_on_error(job), f"docker-build.yml `{name}` must not set continue-on-error"
+
+    for job_name, job in _load_workflow("ci.yml")["jobs"].items():
+        assert not _sets_continue_on_error(job), (
+            f"ci.yml `{job_name}` continue-on-error reports a failing suite as success"
+        )
+        for step in job.get("steps", []):
+            label = step.get("name") or step.get("run") or step.get("uses")
+            assert not _sets_continue_on_error(step), (
+                f"ci.yml `{job_name}` step {label!r} continue-on-error reports a failing check as success"
+            )
+
+
+def test_every_ci_job_and_step_runs_unconditionally_in_parallel():
+    """Every ci.yml job and step runs for every PR and workflow_call, and no job waits on another."""
+    for job_name, job in _load_workflow("ci.yml")["jobs"].items():
+        # Skipped jobs and steps report success. A skip keyed on github.actor, head.repo, event_name
+        # or a branch name is exactly the bypass rule 9 forbids; a skip is allowed only for a
+        # same-repo PR whose merge tree equals an already tested head tree, and it must change
+        # this contract explicitly.
+        assert "if" not in job, f"ci.yml `{job_name}` must not set a job-level if: {job.get('if')!r}"
+        for step in job.get("steps", []):
+            label = step.get("name") or step.get("run") or step.get("uses")
+            assert "if" not in step, f"ci.yml `{job_name}` step {label!r} must not set if: {step.get('if')!r}"
+        # Rule 3: fail-fast checks run inside their job, not as a needs: gate in front of other jobs.
+        assert not _needs(job), f"ci.yml `{job_name}` must not wait on {_needs(job)}; ci.yml jobs run in parallel"
+
+
+def _string_values(node):
+    """Every string value in a parsed YAML tree (comments are already gone)."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from _string_values(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _string_values(value)
+
+
+# `secrets.X`, `secrets['X']` and `toJSON(secrets)` all expose repository secrets; the read-only
+# GITHUB_TOKEN is the one secret PR code may reference. Expression context and property names are
+# case-insensitive, so `Secrets.X` is the same reference.
+_NON_TOKEN_SECRET = re.compile(r"\bsecrets\b(?!\.GITHUB_TOKEN\b)", re.IGNORECASE)
+
+
+def test_pr_code_runs_on_github_hosted_runners_with_read_only_token():
+    """Rule 10: public-repo PR code runs only on GitHub-hosted ubuntu runners with a read-only token and no secrets."""
+    reachable = _pr_reachable_workflows()
+    assert "ci.yml" in reachable
+    for name, workflow in reachable.items():
+        assert workflow.get("permissions") == {"contents": "read"}, (
+            f"{name} runs PR code and must keep top-level permissions: contents: read"
+        )
+        leaked = [value for value in _string_values(workflow) if _NON_TOKEN_SECRET.search(value)]
+        assert not leaked, f"{name} runs PR code and must not reference secrets other than GITHUB_TOKEN: {leaked}"
+        for job_name, job in workflow["jobs"].items():
+            assert "permissions" not in job, f"{name} `{job_name}` job-level permissions override the read-only pin"
+            # Environment secrets and `secrets: inherit`/explicit secrets to a called workflow reach PR code.
+            assert "environment" not in job, f"{name} `{job_name}` runs PR code and must not use an environment"
+            assert "secrets" not in job, f"{name} `{job_name}` must not pass secrets to the workflow it calls"
+            if "uses" in job:
+                continue  # the called workflow is itself in `reachable` and checked there
+            runs_on = job.get("runs-on")
+            assert isinstance(runs_on, str) and runs_on.startswith("ubuntu-"), (
+                f"{name} `{job_name}` runs PR code on {runs_on!r}; only GitHub-hosted ubuntu-* labels are allowed"
+            )
+
+
+def test_service_job_shape_and_every_built_image_is_scanned():
+    """The architecture check leads `service`, the full suite runs unfiltered, and Trivy scans each built image."""
+    jobs = _load_workflow("ci.yml")["jobs"]
+
+    service_steps = jobs["service"]["steps"]
+    assert service_steps[0].get("uses", "").startswith("actions/checkout@")
+    assert service_steps[1].get("run") == "python3 scripts/check_architecture.py", (
+        "rule 3: the fail-fast architecture check is the first step after checkout in `service`"
+    )
+    service_runs = [step["run"] for step in service_steps if "run" in step]
+    assert [run for run in service_runs if "pytest" in run] == ["uv run pytest tests"], (
+        "`service` runs the whole suite exactly once, with no path, -k or deselect filter"
+    )
+    assert "uv run ruff check ." in service_runs
+
+    sdk_job = jobs["sdk"]
+    assert sdk_job["defaults"]["run"]["working-directory"] == "sdk"
+    assert [step["run"] for step in sdk_job["steps"] if "pytest" in step.get("run", "")] == ["uv run pytest"]
+
+    scan_steps = jobs["docker-build-and-scan"]["steps"]
+    built_tag_sets = [
+        {tag.strip() for tag in re.split(r"[,\n]", step["with"]["tags"]) if tag.strip()}
+        for step in scan_steps
+        if "build-push-action" in step.get("uses", "")
+    ]
+    scanned = [step["with"]["image-ref"] for step in scan_steps if "trivy-action" in step.get("uses", "")]
+    for tags in built_tag_sets:
+        assert tags & set(scanned), f"built image {sorted(tags)} is never scanned by Trivy"
+    all_built = set().union(*built_tag_sets)
+    for ref in scanned:
+        assert ref in all_built, f"Trivy scans {ref!r}, which this job does not build"
+
+
+def test_scan_job_builds_into_daemon_with_docker_driver():
+    """스캔용 이미지는 default docker driver로 daemon에 직접 빌드해 BuildKit boot와 tarball load를 피한다."""
+    steps = _load_workflow("ci.yml")["jobs"]["docker-build-and-scan"]["steps"]
+    for step in steps:
+        if "setup-buildx-action" in step.get("uses", ""):
+            assert step.get("with", {}).get("driver") == "docker", (
+                "a docker-container builder re-adds the BuildKit boot and the load:true export/import"
+            )
+
+    build_steps = [s for s in steps if "build-push-action" in s.get("uses", "")]
+    assert {s["with"]["target"] for s in build_steps} == {"drover-api", "drover-worker"}
+    for step in build_steps:
+        assert step["with"].get("load") is True, "Trivy scans the locally loaded image"
+        assert "push" not in step["with"], "the scan job never publishes"
+        assert "cache-to" not in step["with"], "the docker driver cannot export a build cache"
+
+
+def test_db_service_health_checks_poll_fast_with_enough_retries():
+    """서비스 컨테이너 health-check는 짧은 interval과 충분한 window(start-period + interval×retries)를 쓴다."""
+    services = _load_workflow("ci.yml")["jobs"]["db-migration-and-readiness"]["services"]
+    for name in ("mariadb", "redis"):
+        options = services[name]["options"]
+        interval = re.search(r"--health-interval=(\d+)s\b", options)
+        retries = re.search(r"--health-retries=(\d+)\b", options)
+        # Docker does not count probe failures during start-period toward retries, so the two windows add.
+        # A start-period in any unit other than whole seconds counts as 0 here.
+        start_period = re.search(r"--health-start-period=(\d+)s\b", options)
+        assert interval and retries, f"{name} must set --health-interval and --health-retries"
+        interval_s = int(interval.group(1))
+        assert interval_s <= 2, f"{name} health interval {interval_s}s delays job start"
+        window_s = (int(start_period.group(1)) if start_period else 0) + interval_s * int(retries.group(1))
+        assert window_s >= 30, f"{name} health window (start-period + interval x retries) {window_s}s is under 30s"
 
 
 def test_docker_build_preserves_published_kolla_image_tag():

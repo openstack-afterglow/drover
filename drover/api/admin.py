@@ -7,10 +7,12 @@ import logging
 import time
 from collections.abc import AsyncGenerator
 from datetime import datetime
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 
+from drover.config import get_settings
 from drover.models.orm import ManagedOpenStackResource
 from drover.models.schemas import (
     K3sClusterInfo,
@@ -198,6 +200,22 @@ async def download_admin_ca_certificate(cluster_id: str):
     )
 
 
+def _tls_probe_target(cluster: dict) -> tuple[str, int] | None:
+    """K3s API TLS 프로브 대상 (host, port). callback은 api_address를 https://<ip>:6443 URL로 저장한다."""
+    api_address = cluster.get("api_address") or ""
+    if api_address:
+        try:
+            parts = urlsplit(api_address if "//" in api_address else f"//{api_address}")
+            port = parts.port
+        except ValueError:
+            pass
+        else:
+            if parts.hostname:
+                return parts.hostname, port or 6443
+    server_ip = cluster.get("server_ip")
+    return (server_ip, 6443) if server_ip else None
+
+
 @router.get("/clusters/{cluster_id}/certificate-expiry")
 async def get_admin_certificate_expiry(cluster_id: str):
     cluster = await k3s_cluster.get_cluster_admin(cluster_id)
@@ -208,8 +226,8 @@ async def get_admin_certificate_expiry(cluster_id: str):
         raise HTTPException(status_code=404, detail="kubeconfig가 아직 준비되지 않았습니다.")
     raw_str = kubeconfig if isinstance(kubeconfig, str) else kubeconfig.decode()
     parsed = certs.parse_kubeconfig_certs(raw_str)
-    api_addr = cluster.get("api_address") or cluster.get("server_ip")
-    tls_certs = certs.probe_tls_server_cert(api_addr) if api_addr else []
+    target = _tls_probe_target(cluster)
+    tls_certs = await certs.probe_tls_server_cert(*target) if target else []
     return {
         "ca": parsed.get("ca"),
         "client": parsed.get("client"),
@@ -223,30 +241,37 @@ async def rotate_admin_certs(cluster_id: str):
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
     project_id = cluster["project_id"]
+    settings = get_settings()
+
+    # 사용자 경로와 같은 Redis 락 — 동시 회전으로 control-plane 노드가 함께 재시작되는 것을 막는다.
+    if not await cert_rotation.acquire_rotation_lock(cluster_id):
+        raise HTTPException(status_code=409, detail="이미 진행 중인 인증서 회전 작업이 있습니다.")
 
     async def gen() -> AsyncGenerator[str, None]:
-        yield ": " + " " * 2048 + "\n\n"
-        start = time.monotonic()
         try:
-            async for step, pct, msg in cert_rotation.rotate_certificates(
-                {"project_id": project_id, "user_id": "admin"}, None, cluster_id
-            ):
+            yield ": " + " " * 2048 + "\n\n"
+            start = time.monotonic()
+            try:
+                async for msg in cert_rotation.rotate_certificates(
+                    cluster_id,
+                    project_id,
+                    "system-admin",
+                    node_timeout=float(settings.drover_cert_rotation_node_timeout_sec),
+                    job_image=settings.drover_cert_rotation_job_image,
+                ):
+                    yield f"data: {msg.model_dump_json()}\n\n"
+            except Exception as e:
                 m = K3sProgressMessage(
-                    step=K3sProgressStep(step),
-                    progress=pct,
-                    message=msg,
+                    step=K3sProgressStep.FAILED,
+                    progress=0,
+                    message=f"회전 실패: {e}",
+                    cluster_id=cluster_id,
+                    error=str(e),
                     elapsed_seconds=round(time.monotonic() - start, 1),
                 )
                 yield f"data: {m.model_dump_json()}\n\n"
-        except Exception as e:
-            m = K3sProgressMessage(
-                step=K3sProgressStep.FAILED,
-                progress=0,
-                message=f"회전 실패: {e}",
-                error=str(e),
-                elapsed_seconds=round(time.monotonic() - start, 1),
-            )
-            yield f"data: {m.model_dump_json()}\n\n"
+        finally:
+            await cert_rotation.release_rotation_lock(cluster_id)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
