@@ -228,3 +228,34 @@ async def test_get_pod_resource_usage_sums_gpu_and_init_containers(monkeypatch):
             "is_mirror": False,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_list_service_annotations_keys_every_namespace_by_service(monkeypatch):
+    """Cluster deletion reads keep-floatingip from here; a dropped annotation would delete a retained IP."""
+    monkeypatch.setattr("drover.services.kube._make_ssl_context", lambda *a, **k: None)
+    resp = _make_response(200)
+    resp.json.return_value = {
+        "items": [
+            {"metadata": {"namespace": "default", "name": "web", "annotations": {"loadbalancer.openstack.org/keep-floatingip": "true"}}},
+            {"metadata": {"namespace": "kube-system", "name": "traefik"}},
+        ]
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=resp)
+    with patch("drover.services.kube.k3s_db") as mock_db:
+        mock_db.get_kubeconfig_admin = AsyncMock(return_value=_FAKE_KUBECONFIG)
+        with patch("drover.services.kube.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            from drover.services.kube import list_service_annotations
+
+            result = await list_service_annotations("cluster-1")
+
+    assert result == {
+        "default/web": {"loadbalancer.openstack.org/keep-floatingip": "true"},
+        "kube-system/traefik": {},
+    }
+    mock_client.get.assert_called_once_with(
+        "https://10.0.0.1:6443/api/v1/services", headers={"Accept": "application/json"}
+    )

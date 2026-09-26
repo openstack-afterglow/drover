@@ -193,7 +193,8 @@ async def test_validate_resource_ownership():
 
 
 @pytest.mark.asyncio
-async def test_deletion_order_and_ownership_constraints():
+@pytest.mark.parametrize("intent_readable", [True, False], ids=["intent-read", "intent-unreadable"])
+async def test_deletion_order_and_ownership_constraints(intent_readable):
     """Assert deletion executes in strict dependency order:
 
     VMs+members -> pools/listeners -> LBs -> FIPs -> volumes -> ports+SG -> app credentials.
@@ -265,8 +266,18 @@ async def test_deletion_order_and_ownership_constraints():
     def mock_del_lb_safe(*args, **kwargs):
         call_order.append("octavia_lb")
 
-    def mock_del_occm_lbs(*args, **kwargs):
+    captured = {"default/web": {"loadbalancer.openstack.org/keep-floatingip": "true"}}
+    cleanup_services = []
+
+    async def mock_service_annotations(*args, **kwargs):
+        call_order.append("occm_service_intent")
+        if not intent_readable:
+            raise ConnectionError("Kubernetes API unreachable")
+        return captured
+
+    def mock_del_occm_lbs(*args, services, **kwargs):
         call_order.append("occm_service_lbs")
+        cleanup_services.append(services)
         return []
 
     def mock_del_fip_safe(*args, **kwargs):
@@ -303,6 +314,8 @@ async def test_deletion_order_and_ownership_constraints():
         patch("drover.services.octavia.delete_listener", side_effect=mock_del_listener),
         patch("drover.services.octavia.delete_load_balancer_safe", side_effect=mock_del_lb_safe),
         patch("drover.services.octavia.delete_occm_service_load_balancers", side_effect=mock_del_occm_lbs),
+        patch("drover.services.octavia.list_occm_service_load_balancers", return_value=[(MagicMock(), "default/web")]),
+        patch("drover.services.kube.list_service_annotations", AsyncMock(side_effect=mock_service_annotations)),
         patch("drover.services.neutron.delete_floating_ip_safe", side_effect=mock_del_fip_safe),
         patch("drover.services.cinder.delete_volume_safe", side_effect=mock_del_vol_safe),
         patch("drover.services.neutron.wait_port_deleted", return_value=None),
@@ -356,9 +369,34 @@ async def test_deletion_order_and_ownership_constraints():
     assert idx_sg < idx_cred
     # OCCM cannot recreate Service LBs once every cluster VM is gone.
     assert idx_vm < call_order.index("occm_service_lbs")
+    # Service intent is read while Kubernetes still exists. An unreadable cluster still deletes fully and hands the
+    # cleanup None, which keeps every OCCM floating IP.
+    assert call_order.index("occm_service_intent") < idx_vm
+    assert cleanup_services == [captured if intent_readable else None]
 
 
-def test_occm_service_lb_cleanup_deletes_only_this_clusters_controller_resources(monkeypatch):
+_KEEP_FIP = "loadbalancer.openstack.org/keep-floatingip"
+_LB_ID = "loadbalancer.openstack.org/load-balancer-id"
+
+
+@pytest.mark.parametrize(
+    ("services", "deleted_fips"),
+    [
+        (
+            {
+                "default/web": {_LB_ID: "lb-web"},
+                "default/kept": {_KEEP_FIP: "true"},
+                "default/owner": {_LB_ID: "lb-shared"},
+                "default/sharer": {_LB_ID: "lb-shared", _KEEP_FIP: "true"},
+                "kube-system/traefik": {},
+            },
+            ["fip-web"],
+        ),
+        (None, []),
+    ],
+    ids=["intent-read", "intent-unreadable"],
+)
+def test_occm_service_lb_cleanup_keeps_retained_floating_ips_within_this_cluster(monkeypatch, services, deleted_fips):
     from types import SimpleNamespace
 
     from drover.services import octavia
@@ -378,16 +416,30 @@ def test_occm_service_lb_cleanup_deletes_only_this_clusters_controller_resources
             vip_port_id,
         )
 
+    def occm_fip(fip_id, service):
+        description = f"Floating IP for Kubernetes external service {service} from cluster {cluster_id}"
+        return SimpleNamespace(id=fip_id, description=description)
+
     conn = MagicMock()
     conn.load_balancer.load_balancers.return_value = [
         occm_lb("lb-web", cluster_id, "default/web", "vip-web"),
+        occm_lb("lb-kept", cluster_id, "default/kept", "vip-kept"),
+        occm_lb("lb-shared", cluster_id, "default/owner", "vip-shared"),
+        occm_lb("lb-orphan", cluster_id, "default/gone", "vip-orphan"),
         occm_lb("lb-traefik", cluster_id, "kube-system/traefik", "vip-traefik"),
         occm_lb("lb-broken", cluster_id, "default/broken"),
         occm_lb("lb-other-cluster", other_id, "default/web"),
         lb("lb-user", f"kube_service_{cluster_id}_default_manual", "user managed"),
         occm_lb("lb-display-name", "demo", "default/web"),
     ]
-    statuses = {"lb-web": ["ACTIVE"], "lb-traefik": ["PENDING_CREATE", "ERROR"], "lb-broken": ["ACTIVE"]}
+    statuses = {
+        "lb-web": ["ACTIVE"],
+        "lb-kept": ["ACTIVE"],
+        "lb-shared": ["ACTIVE"],
+        "lb-orphan": ["ACTIVE"],
+        "lb-traefik": ["PENDING_CREATE", "ERROR"],
+        "lb-broken": ["ACTIVE"],
+    }
     deleted = {}
 
     def find_load_balancer(lb_id, ignore_missing=True):
@@ -404,15 +456,26 @@ def test_occm_service_lb_cleanup_deletes_only_this_clusters_controller_resources
     conn.load_balancer.find_load_balancer.side_effect = find_load_balancer
     conn.load_balancer.delete_load_balancer.side_effect = delete_load_balancer
     fips = {
-        "vip-web": [SimpleNamespace(id="fip-occm", description=f"Floating IP for Kubernetes external service default/web from cluster {cluster_id}")],
+        "vip-web": [occm_fip("fip-web", "default/web")],
+        "vip-kept": [occm_fip("fip-kept", "default/kept")],
+        "vip-shared": [occm_fip("fip-shared", "default/owner")],
+        "vip-orphan": [occm_fip("fip-orphan", "default/gone")],
         "vip-traefik": [SimpleNamespace(id="fip-user", description="reserved by user")],
     }
     conn.network.ips.side_effect = lambda port_id, project_id: fips[port_id]
     monkeypatch.setattr(octavia, "_OCCM_LB_SETTLE_INTERVAL_SECONDS", 0)
 
     with pytest.raises(RuntimeError, match="lb-broken"):
-        octavia.delete_occm_service_load_balancers(conn, "proj-1", cluster_id)
+        octavia.delete_occm_service_load_balancers(conn, "proj-1", cluster_id, services=services)
 
     # One failed LB does not strand the others; pending LBs are deleted only after Octavia settles them.
-    assert deleted == {"lb-web": ("ACTIVE", True), "lb-traefik": ("ERROR", True)}
-    conn.network.delete_ip.assert_called_once_with("fip-occm", ignore_missing=True)
+    assert deleted == {
+        "lb-web": ("ACTIVE", True),
+        "lb-kept": ("ACTIVE", True),
+        "lb-shared": ("ACTIVE", True),
+        "lb-orphan": ("ACTIVE", True),
+        "lb-traefik": ("ERROR", True),
+    }
+    # Deleting an LB only detaches a kept IP. keep-floatingip on the creator or on a sharer, an LB without a captured
+    # Service, and unreadable Kubernetes all keep OCCM's IP; a user-supplied IP is never deleted.
+    assert [c.args[0] for c in conn.network.delete_ip.call_args_list] == deleted_fips

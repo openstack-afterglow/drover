@@ -851,6 +851,21 @@ async def list_services(cluster_id: str, namespace: str, *, project_id: str) -> 
         return [_svc_from_k8s(item) for item in resp.json().get("items", [])]
 
 
+async def list_service_annotations(cluster_id: str) -> dict[str, dict[str, str]]:
+    """Annotations of every Service in every namespace, keyed by ``namespace/name`` (admin kubeconfig).
+
+    Raises unless the API returned the list, so an unreadable cluster is never mistaken for one without annotations.
+    """
+    async with _kube_client(cluster_id) as (client, server_url):
+        resp = await client.get(f"{server_url}/api/v1/services", headers={"Accept": "application/json"})
+        if resp.status_code != 200:
+            _raise_k8s_error(resp, "list services")
+        return {
+            f"{meta.get('namespace', '')}/{meta.get('name', '')}": meta.get("annotations") or {}
+            for meta in (item.get("metadata", {}) for item in resp.json().get("items", []))
+        }
+
+
 async def list_deployments(cluster_id: str, namespace: str, *, project_id: str) -> list[dict]:
     async with _kube_client(cluster_id, project_id=project_id) as (client, server_url):
         resp = await client.get(f"{server_url}/apis/apps/v1/namespaces/{namespace}/deployments")

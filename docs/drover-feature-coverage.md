@@ -58,7 +58,7 @@ graph TD
 - **OCCM (OpenStack Cloud Controller Manager)**: Kubernetes Ingress / Service Type LoadBalancer 수용 및 Octavia 로드밸런서 자동 동기화 (`drover_occm_enabled: true`).
 - OCCM이 활성화되면 server 설치 인자에 `--disable=servicelb`를 넣어 K3s 내장 ServiceLB와 같은 Service status를 경쟁적으로 갱신하지 않습니다. agent 설치 인자에도 `--kubelet-arg=cloud-provider=external`을 넣어 OCCM이 provider ID와 노드 주소를 초기화합니다.
 - 생성 provider 네트워크는 OCCM의 `internal-network-name`입니다. 같은 이름이 `k3s.occm_public_network`에도 지정돼 있으면 `public-network-name`을 생략합니다. OCCM의 public 분류는 기존 InternalIP를 삭제하므로 두 역할을 겹치게 렌더링하지 않습니다. 서로 다른 public network 정책과 floating-network 선택은 보존합니다.
-- OCCM의 `--cluster-name`은 불변 cluster ID입니다. 클러스터 삭제는 VM 삭제 뒤 `kube_service_<cluster_id>_` 이름과 OCCM 설명(`... from cluster <cluster_id>`)이 모두 일치하는 Service LB를 cascade 삭제하고, OCCM이 만든 설명의 VIP floating IP만 함께 삭제합니다. 사용자 지정 FIP, 다른 cluster·사용자 LB와 octavia-ingress LB는 대상이 아닙니다. pending LB는 Octavia가 ACTIVE/ERROR로 정리한 뒤 삭제합니다.
+- OCCM의 `--cluster-name`은 불변 cluster ID입니다. 클러스터 삭제는 VM 삭제 뒤 `kube_service_<cluster_id>_` 이름과 OCCM 설명(`... from cluster <cluster_id>`)이 모두 일치하는 Service LB를 cascade 삭제하고, OCCM이 만든 설명의 VIP floating IP는 OCCM도 삭제했을 경우에만 함께 삭제합니다. OCCM은 `loadbalancer.openstack.org/keep-floatingip: "true"` Service의 FIP를 남기므로, 삭제는 노드·VM을 건드리기 전에 모든 namespace의 Service annotation을 읽고 LB를 쓰는 Service(생성자 또는 `load-balancer-id` 공유자) 중 하나라도 keep을 요청하면 FIP를 남깁니다. Kubernetes를 읽지 못했거나 LB의 Service가 없으면 의사를 알 수 없으므로 FIP를 남기고 LB 삭제로 연결만 해제합니다. 사용자 지정 FIP, 다른 cluster·사용자 LB와 octavia-ingress LB는 대상이 아닙니다. pending LB는 Octavia가 ACTIVE/ERROR로 정리한 뒤 삭제합니다.
 - HA joiner(server 2·3)는 `cloud.conf`를 다시 만들지 않고 server 1이 생성한 `kube-system/cloud-config` Secret을 공유합니다. application credential secret은 저장하지 않으므로 joiner에서 OCCM 설정을 재생성하면 HA bootstrap이 중단되기 때문입니다.
 
 ### 2.5 Keystone (Identity & Access)
@@ -93,7 +93,7 @@ drover wheel
         └── drover-migrate.json.j2# Pre-start Migration 컨테이너 템플릿
 ```
 
-소스 role은 `deploy/kolla/ansible/roles/drover`에 있으며 root `drover` wheel의 shared data로 설치됩니다. wheel 기본 설치는 Kolla-Ansible 및 API/Worker runtime dependencies를 포함하지 않으며 서비스 process에는 `drover[service]` extra가 필요합니다. `drover_image_tag` 기본값은 `v0.2.24`입니다(`defaults/main.yml`). 실제 GHCR 이미지 발행과 digest 확인 없이 소스 기본값만으로 배포 완료를 판단하지 않습니다. `drover_source_version`은 별도 source-build pin이고 SDK 버전(`0.2.21`)도 독립적입니다. 이전 릴리스 경계는 [0.2.23 릴리스 노트](release-0.2.23.md)에 보존합니다.
+소스 role은 `deploy/kolla/ansible/roles/drover`에 있으며 root `drover` wheel의 shared data로 설치됩니다. wheel 기본 설치는 Kolla-Ansible 및 API/Worker runtime dependencies를 포함하지 않으며 서비스 process에는 `drover[service]` extra가 필요합니다. `drover_image_tag` 기본값은 `v0.2.25`입니다(`defaults/main.yml`). 실제 GHCR 이미지 발행과 digest 확인 없이 소스 기본값만으로 배포 완료를 판단하지 않습니다. `drover_source_version`은 별도 source-build pin이고 SDK 버전(`0.2.21`)도 독립적입니다. 이전 릴리스 경계는 [0.2.24 릴리스 노트](release-0.2.24.md)에 보존합니다.
 
 ### Schema Readiness 및 Pre-start Migration
 - API 및 Worker 프로세스 시작 전, `drover-migrate` 컨테이너가 먼저 실행되어 `drover/migrations/manifest.txt` 및 `001_baseline.sql` 래저 체크섬을 검증하고 DB 마이그레이션을 안전하게 수행합니다.

@@ -18,6 +18,19 @@ from drover.services.activity import rec
 _logger = logging.getLogger("drover.deletion")
 
 
+async def _occm_service_annotations(
+    conn: openstack.connection.Connection, project_id: str, cluster_id: str
+) -> dict[str, dict[str, str]] | None:
+    """Service annotations deciding OCCM floating IPs, or ``None`` (keep them all) when they cannot be read."""
+    try:
+        if not await asyncio.to_thread(octavia.list_occm_service_load_balancers, conn, project_id, cluster_id):
+            return {}  # An LB OCCM creates from now on has no captured Service, so its floating IP is kept.
+        return await k3s_kube.list_service_annotations(cluster_id)
+    except Exception as e:
+        _logger.warning("k3s delete: OCCM Service intent unreadable, keeping OCCM floating IPs: %s", e)
+        return None
+
+
 async def delete_cluster_progress(
     conn: openstack.connection.Connection,
     project_id: str,
@@ -37,6 +50,9 @@ async def delete_cluster_progress(
     yield msg
 
     await k3s_cluster.update_cluster_status(project_id, cluster_id, "DELETING")
+    # OCCM keeps a Service's floating IP on its keep-floatingip annotation, which only Kubernetes holds. Read it while
+    # the API still exists; the OCCM LB cleanup runs after the VMs are gone.
+    occm_services = await _occm_service_annotations(conn, project_id, cluster_id)
 
     # Load all active recorded managed resources for this cluster
     managed_res_list = await inventory.list_managed_resources(None, cluster_id=cluster_id, active_only=True)
@@ -175,7 +191,9 @@ async def delete_cluster_progress(
 
     # OCCM Service LBs are not in Drover inventory; the VMs are gone, so OCCM cannot recreate them.
     try:
-        occm_lb_ids = await asyncio.to_thread(octavia.delete_occm_service_load_balancers, conn, project_id, cluster_id)
+        occm_lb_ids = await asyncio.to_thread(
+            octavia.delete_occm_service_load_balancers, conn, project_id, cluster_id, services=occm_services
+        )
         for lb_id in occm_lb_ids:
             _logger.info("k3s delete: OCCM Service LB %s fully deleted", lb_id)
     except Exception as e:
