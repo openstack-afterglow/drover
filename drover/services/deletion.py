@@ -173,6 +173,14 @@ async def delete_cluster_progress(
         except Exception as e:
             _logger.warning("k3s delete: Octavia LB %s delete failed: %s", lb_id, e)
 
+    # OCCM Service LBs are not in Drover inventory; the VMs are gone, so OCCM cannot recreate them.
+    try:
+        occm_lb_ids = await asyncio.to_thread(octavia.delete_occm_service_load_balancers, conn, project_id, cluster_id)
+        for lb_id in occm_lb_ids:
+            _logger.info("k3s delete: OCCM Service LB %s fully deleted", lb_id)
+    except Exception as e:
+        _logger.warning("k3s delete: OCCM Service LB cleanup failed: %s", e)
+
     # Step 4: Floating IPs
     msg = K3sProgressMessage(
         step=K3sProgressStep.DELETE_SERVER_VM,

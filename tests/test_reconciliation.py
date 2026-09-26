@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 pytest_plugins = ("pytest_asyncio",)
+from unittest.mock import create_autospec
+
 import pytest
+from openstack.exceptions import HttpException, ResourceNotFound
+from openstack.identity.v3._proxy import Proxy as IdentityProxy
+from openstack.identity.v3.application_credential import ApplicationCredential
 
 from drover.models.orm import DroverOperationEvent, ManagedOpenStackResource
 from drover.services import inventory, jobs, operations, reconciliation, store
@@ -243,6 +249,39 @@ async def test_reconcile_all_present(test_store):
     assert "reconcile_start" in phases
     assert "reconcile_inventory" in phases
     assert "reconcile_complete" in phases
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential_state", ["present", "deleted", "unavailable"])
+async def test_reconcile_manager_owned_application_credential(test_store, credential_state):
+    project_id = "project-with-occm"
+    cluster_id = "cluster-with-occm"
+    manager_id = "project-manager"
+    credential_id = "occm-credential"
+    cluster = test_store.add_cluster(project_id, cluster_id, {
+        "status": "ACTIVE", "app_credential_id": credential_id,
+    })
+    identity = create_autospec(IdentityProxy, instance=True)
+
+    def get_credential(user, application_credential):
+        if user != manager_id or application_credential != credential_id or credential_state == "deleted":
+            raise ResourceNotFound("Application credential not found")
+        if credential_state == "unavailable":
+            raise HttpException("Keystone unavailable")
+        return ApplicationCredential(id=credential_id, project_id=project_id)
+
+    identity.get_application_credential.side_effect = get_credential
+    connection = SimpleNamespace(identity=identity, current_user_id=manager_id)
+    if credential_state == "unavailable":
+        with pytest.raises(HttpException, match="Keystone unavailable"):
+            await reconciliation.reconcile_cluster(project_id, cluster_id, conn=connection)
+        assert cluster["status"] == "ACTIVE"
+        assert cluster["drift_status"] is None
+    else:
+        drift = await reconciliation.reconcile_cluster(project_id, cluster_id, conn=connection)
+        assert drift["has_drift"] is (credential_state == "deleted")
+        assert drift["missing_count"] == (1 if credential_state == "deleted" else 0)
+        assert cluster["status"] == ("ERROR" if credential_state == "deleted" else "ACTIVE")
 
 
 @pytest.mark.asyncio

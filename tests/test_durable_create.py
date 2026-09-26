@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -55,6 +56,11 @@ def test_app(store):
     conn._afterglow_project_id = "proj-test-123"
     conn._afterglow_user_id = "user-test-123"
     app.state.caller_conn = conn
+    networks = {
+        "external-net": SimpleNamespace(id="external-net", name="public", is_router_external=True, is_shared=False),
+        "private-net": SimpleNamespace(id="private-net", name="private", is_router_external=False, is_shared=False),
+    }
+    conn.network.get_network.side_effect = networks.get
 
     async def mock_os_conn():
         return conn
@@ -87,10 +93,12 @@ def mock_durable_services(store, monkeypatch):
         "k3s.volume_availability_zone": {"id": "nova", "name": "nova"},
     }
 
-    monkeypatch.setattr(
-        "drover.services.resource_policy_store.resolve_policy_snapshot",
-        AsyncMock(return_value=policy_snapshot),
-    )
+    async def resolve_snapshot(*, conn, keys):
+        if keys == ("k3s.default_network",):
+            return {"k3s.default_network": {"id": "external-net", "name": "public"}}
+        return {key: dict(value) for key, value in policy_snapshot.items()}
+
+    monkeypatch.setattr("drover.services.resource_policy_store.resolve_policy_snapshot", resolve_snapshot)
     monkeypatch.setattr(
         "drover.services.resource_policy_store.get_policy_snapshot",
         AsyncMock(return_value={}),
@@ -98,10 +106,6 @@ def mock_durable_services(store, monkeypatch):
     monkeypatch.setattr(
         "drover.services.resource_policy_store.get_required_runtime_setting",
         AsyncMock(return_value="v1.28.2+k3s1"),
-    )
-    monkeypatch.setattr(
-        "drover.services.instance_orchestration.resolve_default_network",
-        AsyncMock(return_value="net-test-1"),
     )
 
     # Store mocks
@@ -381,7 +385,109 @@ async def test_multiline_keypair_prevents_enqueue(async_client, store, test_app)
         "/v1/clusters/async",
         json={"name": "invalid-key", "key_name": "caller-key"},
     )
+    assert response.status_code == 400
+    assert store.clusters == {}
+    assert store.jobs == {}
+
+
+@pytest.mark.asyncio
+async def test_explicit_private_network_rejected_before_durable_writes(async_client, store):
+    response = await async_client.post(
+        "/v1/clusters/async", json={"name": "private-cluster", "network_id": "private-net"}
+    )
 
     assert response.status_code == 400
     assert store.clusters == {}
     assert store.jobs == {}
+    assert store.operations == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("network_id", [None, "", "external-net"])
+async def test_external_network_is_snapshotted_in_cluster_and_job(async_client, store, network_id):
+    body = {"name": "external-cluster", "agent_count": 1}
+    if network_id is not None:
+        body["network_id"] = network_id
+
+    response = await async_client.post("/v1/clusters/async", json=body)
+
+    assert response.status_code == 200
+    cluster = next(iter(store.clusters.values()))
+    job = next(iter(store.jobs.values())).payload_json
+    for data in (cluster, job):
+        assert data["network_id"] == "external-net"
+        assert data["resource_policy_snapshot"]["k3s.default_network"] == {
+            "id": "external-net", "name": "public"
+        }
+
+
+@pytest.mark.asyncio
+async def test_default_network_policy_failure_prevents_enqueue(async_client, store, monkeypatch):
+    from drover.services import resource_policy_store
+    from drover.services.resource_policies import ResourcePolicyValidationError
+
+    original_resolve = resource_policy_store.resolve_policy_snapshot
+
+    async def resolve_snapshot(*, conn, keys):
+        if keys == ("k3s.default_network",):
+            raise ResourcePolicyValidationError("default network policy is invalid")
+        return await original_resolve(conn=conn, keys=keys)
+
+    monkeypatch.setattr(resource_policy_store, "resolve_policy_snapshot", resolve_snapshot)
+    response = await async_client.post("/v1/clusters/async", json={"name": "no-default"})
+
+    assert response.status_code == 503
+    assert store.clusters == {}
+    assert store.jobs == {}
+
+@pytest.mark.asyncio
+async def test_default_network_lookup_unavailable_prevents_enqueue(async_client, store, monkeypatch):
+    from drover.services import resource_policy_store
+
+    original_resolve = resource_policy_store.resolve_policy_snapshot
+
+    async def resolve_snapshot(*, conn, keys):
+        if keys == ("k3s.default_network",):
+            raise RuntimeError("password=not-for-response")
+        return await original_resolve(conn=conn, keys=keys)
+
+    monkeypatch.setattr(resource_policy_store, "resolve_policy_snapshot", resolve_snapshot)
+    response = await async_client.post("/v1/clusters/async", json={"name": "network-outage"})
+
+    assert response.status_code == 503
+    assert "not-for-response" not in response.text
+    assert store.clusters == {}
+    assert store.jobs == {}
+
+
+@pytest.mark.asyncio
+async def test_network_lookup_failure_is_sanitized(async_client, store, test_app):
+    test_app.state.caller_conn.network.get_network.side_effect = RuntimeError("secret-password=example")
+
+    response = await async_client.post(
+        "/v1/clusters/async", json={"name": "lookup-unavailable", "network_id": "external-net"}
+    )
+
+    assert response.status_code == 503
+    assert "secret-password" not in response.text
+    assert store.clusters == {}
+    assert store.jobs == {}
+
+
+@pytest.mark.asyncio
+async def test_queued_create_without_network_never_reaches_nova():
+    from drover.services.provisioner import create_cluster_job
+
+    with (
+        patch("drover.services.keystone.get_project_manager_connection", new=AsyncMock(return_value=MagicMock())),
+        patch("drover.services.keystone.close_connection", new=AsyncMock()),
+        patch("drover.services.store.update_cluster_status", new=AsyncMock()),
+        patch("drover.services.neutron.create_security_group") as create_security_group,
+        patch("drover.services.nova.create_server") as create_server,
+    ):
+        with pytest.raises(RuntimeError, match="Creation-time network snapshot is missing"):
+            await create_cluster_job("project", "cluster", {"name": "legacy-job"})
+
+    create_security_group.assert_not_called()
+    create_server.assert_not_called()
+

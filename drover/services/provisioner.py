@@ -6,6 +6,7 @@ import asyncio
 import logging
 import random
 import string
+from urllib.parse import urlsplit
 
 from drover.services import store as k3s_cluster
 from drover.utils.ssh_keys import normalize_ssh_public_key
@@ -23,6 +24,41 @@ def _require_ssh_public_key_snapshot(source: dict) -> str | None:
     if source.get("key_name") and not ssh_public_key:
         raise RuntimeError("SSH public key snapshot is missing for the requested keypair")
     return normalize_ssh_public_key(ssh_public_key) if ssh_public_key else None
+
+
+async def _guest_plugin_settings(conn, settings, resource_snapshot: dict):
+    """Use the authenticated public identity URL only in guest plugin rendering."""
+    from drover.services import plugins as k3s_plugins
+
+    if not k3s_plugins.get_active_plugins(settings):
+        return k3s_plugins.with_resource_policy_snapshot(settings, resource_snapshot)
+
+    endpoint = await asyncio.to_thread(
+        conn.session.get_endpoint,
+        service_type="identity",
+        interface="public",
+        region_name=settings.os_region_name,
+    )
+    if not isinstance(endpoint, str) or any(char.isspace() for char in endpoint):
+        raise RuntimeError("Public identity endpoint is missing or invalid for guest plugins")
+    try:
+        parsed = urlsplit(endpoint)
+        valid = (
+            parsed.scheme in ("http", "https")
+            and parsed.hostname is not None
+            and parsed.port != 0
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise RuntimeError("Public identity endpoint is missing or invalid for guest plugins")
+
+    guest_settings = settings.model_copy(update={"os_auth_url": endpoint})
+    return k3s_plugins.with_resource_policy_snapshot(guest_settings, resource_snapshot)
 
 
 async def _resolve_ha_join_endpoint(
@@ -328,7 +364,6 @@ async def bootstrap_ha_servers(
         return
 
     resource_snapshot = cluster.get("resource_policy_snapshot") or {}
-    plugin_settings = k3s_plugins.with_resource_policy_snapshot(s, resource_snapshot)
     cluster_name = cluster.get("name") or cluster_id
     k3s_version = cluster.get("k3s_version") or ""
     os_type = cluster.get("os_type") or "ubuntu"
@@ -350,6 +385,7 @@ async def bootstrap_ha_servers(
         _logger.error("HA bootstrap: cannot get OpenStack connection: %s", e)
         return
     try:
+        plugin_settings = await _guest_plugin_settings(conn, s, resource_snapshot)
         join_url, ha_extra_tls_sans = await _resolve_ha_join_endpoint(
             conn,
             cluster.get("api_lb_id") or "",
@@ -383,8 +419,8 @@ async def bootstrap_ha_servers(
         except Exception as e:
             _logger.warning("HA: failed to add server#1 to LB pool: %s", e)
 
-        # server#2, server#3 생성
-        cloud_conf = k3s_plugins.aggregate_cloud_conf(project_id, plugin_settings)
+        # server#2, server#3 생성. Plugins read the cloud-config Secret that server#1 created once; the
+        # application credential secret is not retained, so joiners must not re-render cloud.conf.
         extra_server_args = k3s_plugins.aggregate_server_args(plugin_settings)
         extra_write_files = k3s_plugins.aggregate_extra_write_files(project_id, cluster_name, plugin_settings)
 
@@ -421,7 +457,7 @@ async def bootstrap_ha_servers(
                     callback_url=callback_url,
                     callback_token=ha_token,
                     primary_network_id=network_id,
-                    cloud_conf=cloud_conf,
+                    cloud_conf=None,
                     extra_server_args=extra_server_args,
                     extra_write_files=extra_write_files,
                     extra_tls_sans=ha_extra_tls_sans,
@@ -517,7 +553,6 @@ async def create_cluster_job(
     network_id = payload.get("network_id") or ""
     k3s_version = payload.get("k3s_version") or ""
     os_type = payload.get("os_type") or "ubuntu"
-    plugin_settings = k3s_plugins.with_resource_policy_snapshot(s, policy_snapshot)
 
     sg_id: str | None = None
     boot_volume_id: str | None = None
@@ -529,6 +564,9 @@ async def create_cluster_job(
     ha_fip_address: str | None = None
 
     try:
+        plugin_settings = await _guest_plugin_settings(conn, s, policy_snapshot)
+        if not network_id:
+            raise RuntimeError("Creation-time network snapshot is missing")
         # Step 1: Security Group
         if operation_id:
             await operations.append_operation_event(
@@ -794,7 +832,7 @@ async def create_cluster_job(
 
             kek_id = await _barbican.ensure_project_kek(project_id)
 
-        manifest_kwargs: dict = {"app_credential": app_cred}
+        manifest_kwargs: dict = {"app_credential": app_cred, "cluster_id": cluster_id}
         if active_plugins.get("octavia_ingress", False):
             subnets = await asyncio.to_thread(lambda: list(conn.network.subnets(network_id=network_id)))
             if not subnets:

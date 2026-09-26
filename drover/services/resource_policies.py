@@ -57,8 +57,8 @@ _POLICY_SPECS = (
         "network",
         "K3s default network",
         "K3s",
-        "Shared fallback network when a cluster request omits network_id.",
-        shared_only=True,
+        "External network used when a cluster request omits network_id.",
+        external_only=True,
     ),
     PolicySpec(
         "k3s.occm_floating_network",
@@ -130,8 +130,13 @@ def _option(resource_id: object, name: object, **extra: Any) -> dict[str, Any]:
     return {"id": str(resource_id), "name": str(name or resource_id), **extra}
 
 
+def _is_external_network(network: object) -> bool:
+    router_external = getattr(network, "is_router_external", None)
+    return bool(router_external) if router_external is not None else bool(getattr(network, "is_external", False))
+
+
 def _is_tenant_network(network: object) -> bool:
-    return bool(getattr(network, "is_shared", False) or getattr(network, "is_router_external", False))
+    return bool(getattr(network, "is_shared", False) or _is_external_network(network))
 
 
 def _zone_option(zone: object) -> dict[str, Any] | None:
@@ -172,7 +177,7 @@ def _discover_sync(conn, spec: PolicySpec) -> list[dict[str, Any]]:
             _option(
                 network.id,
                 network.name,
-                is_external=bool(network.is_external),
+                is_external=_is_external_network(network),
                 is_shared=bool(getattr(network, "is_shared", False)),
             )
             for network in neutron.list_networks(conn)
@@ -246,7 +251,7 @@ def _validate_existing_sync(conn, spec: PolicySpec, resource_id: str) -> dict[st
         if (
             network is None
             or (spec.execution_scope == "tenant" and not _is_tenant_network(network))
-            or (spec.external_only and not bool(getattr(network, "is_router_external", False)))
+            or (spec.external_only and not _is_external_network(network))
             or (spec.shared_only and not bool(getattr(network, "is_shared", False)))
         ):
             raise ResourcePolicyValidationError("selected network is unavailable in the execution scope")

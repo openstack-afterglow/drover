@@ -1,10 +1,11 @@
-"""Agent provisioning persistence and scaling-token contracts."""
+"""Provisioner guest rendering, persistence, and scaling-token contracts."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from drover.config import Settings
 from drover.services import autoscale, provisioner
 
 pytestmark = pytest.mark.asyncio
@@ -143,6 +144,160 @@ async def test_primary_server_uses_snapshot_without_manager_key_name() -> None:
     assert generate_userdata.call_args.kwargs["ssh_public_key"] == "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"
     assert "key_name" not in create_server.call_args.kwargs
     connection.close.assert_called_once_with()
+
+
+async def test_create_cluster_renders_public_identity_url_without_changing_backend_settings() -> None:
+    backend_url = "http://management.example.test:5000/v3"
+    public_url = "https://identity.example.test:5000/v3"
+    settings = Settings(
+        os_auth_url=backend_url,
+        os_region_name="RegionOne",
+        drover_callback_base_url="https://drover.test",
+        drover_occm_enabled=True,
+        drover_cinder_csi_enabled=False,
+        drover_manila_csi_enabled=False,
+        drover_octavia_ingress_enabled=False,
+        drover_keystone_auth_enabled=False,
+        drover_barbican_kms_enabled=False,
+    )
+    snapshot = {
+        "k3s.volume_availability_zone": {"id": "nova"},
+        "k3s.occm_floating_network": {"id": "external-id"},
+    }
+    payload = {
+        "name": "staging-cluster",
+        "network_id": "network-1",
+        "server_image_id": "image-1",
+        "server_flavor_id": "flavor-1",
+        "k3s_version": "v1.34.1+k3s1",
+        "resource_policy_snapshot": snapshot,
+    }
+    connection = MagicMock()
+    connection.session.get_endpoint.return_value = public_url
+    connection.network.get_network.return_value = SimpleNamespace(name="private")
+    userdata = SimpleNamespace(data="cloud-init", config_drive=False)
+
+    with (
+        patch("drover.config.get_settings", return_value=settings),
+        patch("drover.services.keystone.get_project_manager_connection", new=AsyncMock(return_value=connection)),
+        patch(
+            "drover.services.keystone.create_app_credential_for_cluster",
+            new=AsyncMock(return_value={"id": "cred-1", "secret": "secret-1"}),
+        ),
+        patch("drover.services.neutron.create_security_group", return_value={"id": "sg-1"}),
+        patch("drover.services.neutron.create_security_group_rule", return_value={"id": "rule-1"}),
+        patch("drover.services.cinder.create_volume_from_image", return_value=SimpleNamespace(id="volume-1")),
+        patch("drover.services.inventory.record_resource", new=AsyncMock()),
+        patch("drover.services.cloudinit.generate_server_userdata", return_value=userdata) as generate_userdata,
+        patch("drover.services.nova.create_server", return_value=SimpleNamespace(id="server-1")),
+        patch(
+            "drover.services.provisioner.k3s_cluster.create_callback_token",
+            new=AsyncMock(return_value="callback-token"),
+        ),
+        patch("drover.services.provisioner.k3s_cluster.update_cluster_status", new=AsyncMock()),
+    ):
+        await provisioner.create_cluster_job("project-1", "cluster-1", payload)
+
+    connection.session.get_endpoint.assert_called_once_with(
+        service_type="identity", interface="public", region_name="RegionOne"
+    )
+    cloud_conf = generate_userdata.call_args.kwargs["cloud_conf"]
+    assert f"auth-url={public_url}" in cloud_conf
+    assert backend_url not in cloud_conf
+    assert "floating-network-id=external-id" in cloud_conf
+    assert settings.os_auth_url == backend_url
+
+
+async def test_plugin_free_guest_settings_do_not_resolve_catalog_endpoint() -> None:
+    settings = Settings(
+        os_auth_url="http://management.example.test:5000/v3",
+        drover_occm_enabled=False,
+        drover_cinder_csi_enabled=False,
+        drover_manila_csi_enabled=False,
+        drover_octavia_ingress_enabled=False,
+        drover_keystone_auth_enabled=False,
+        drover_barbican_kms_enabled=False,
+    )
+    connection = MagicMock()
+    guest = await provisioner._guest_plugin_settings(connection, settings, {})
+
+    connection.session.get_endpoint.assert_not_called()
+    assert guest.settings is settings
+
+
+@pytest.mark.parametrize("endpoint", [None, "not-a-url", "ftp://identity.example.test/v3"])
+async def test_missing_or_invalid_public_identity_endpoint_fails_before_resource_mutation(endpoint) -> None:
+    settings = Settings(
+        os_auth_url="http://management.example.test:5000/v3",
+        drover_occm_enabled=True,
+        drover_cinder_csi_enabled=False,
+        drover_manila_csi_enabled=False,
+        drover_octavia_ingress_enabled=False,
+        drover_keystone_auth_enabled=False,
+        drover_barbican_kms_enabled=False,
+    )
+    connection = MagicMock()
+    connection.session.get_endpoint.return_value = endpoint
+    payload = {"network_id": "network-1", "resource_policy_snapshot": {}}
+
+    with (
+        patch("drover.config.get_settings", return_value=settings),
+        patch("drover.services.keystone.get_project_manager_connection", new=AsyncMock(return_value=connection)),
+        patch("drover.services.neutron.create_security_group") as create_security_group,
+        patch("drover.services.provisioner.k3s_cluster.update_cluster_status", new=AsyncMock()) as update_status,
+    ):
+        with pytest.raises(RuntimeError, match="Public identity endpoint is missing or invalid"):
+            await provisioner.create_cluster_job("project-1", "cluster-1", payload)
+
+    create_security_group.assert_not_called()
+    assert update_status.await_args.args[2] == "ERROR"
+    connection.close.assert_called_once_with()
+
+
+async def test_occm_ha_joiners_boot_from_cluster_secret_without_app_credential() -> None:
+    settings = Settings(
+        os_auth_url="http://management.example.test:5000/v3",
+        drover_callback_base_url="https://drover.test",
+        drover_occm_enabled=True,
+        drover_cinder_csi_enabled=False,
+        drover_manila_csi_enabled=False,
+        drover_octavia_ingress_enabled=False,
+        drover_keystone_auth_enabled=False,
+        drover_barbican_kms_enabled=False,
+    )
+    cluster = {
+        "name": "ha-cluster",
+        "k3s_version": "v1.34.1+k3s1",
+        "server_image_id": "image-1",
+        "server_flavor_id": "flavor-1",
+        "network_id": "network-1",
+        "resource_policy_snapshot": {"k3s.volume_availability_zone": {"id": "nova"}},
+    }
+    connection = MagicMock()
+    connection.session.get_endpoint.return_value = "https://identity.example.test/v3"
+    userdata = SimpleNamespace(data="cloud-init", config_drive=False)
+
+    with (
+        patch("drover.config.get_settings", return_value=settings),
+        patch("drover.services.provisioner.k3s_cluster.get_cluster", new=AsyncMock(return_value=cluster)),
+        patch("drover.services.keystone.get_project_manager_connection", new=AsyncMock(return_value=connection)),
+        patch("drover.services.octavia.add_member", return_value={"id": "member-1"}),
+        patch("drover.services.inventory.record_resource", new=AsyncMock()),
+        patch("drover.services.provisioner.k3s_cluster.create_ha_callback_token", new=AsyncMock(return_value="t")),
+        patch("drover.services.cinder.create_volume_from_image", return_value=SimpleNamespace(id="volume-1")),
+        patch("drover.services.cloudinit.generate_server_userdata", return_value=userdata) as generate_userdata,
+        patch("drover.services.nova.create_server", return_value=SimpleNamespace(id="server-2")) as create_server,
+    ):
+        await provisioner.bootstrap_ha_servers(
+            "project-1", "cluster-1", "192.0.2.10", "K10node::token", 3, "pool-1", "198.51.100.5"
+        )
+
+    # Rendering OCCM config here would need the unrecoverable app-credential secret and abort HA bootstrap.
+    assert create_server.call_count == 2
+    for call in generate_userdata.call_args_list:
+        assert call.kwargs["cloud_conf"] is None
+        assert "--disable=servicelb" in call.kwargs["extra_server_args"]
+
 
 
 async def test_nodegroup_provisioning_reads_token_from_database_store() -> None:

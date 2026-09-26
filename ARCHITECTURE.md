@@ -6,7 +6,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: `drover==0.2.23`, `drover-sdk==0.2.21` (별도 SDK 버전)
+- 패키지: `drover==0.2.24`, `drover-sdk==0.2.21` (별도 SDK 버전)
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -24,7 +24,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 | Afterglow provisioning intent/GPU admission 연동 | partial | source-reviewed, test-defined | 일반 create는 Drover가 직접 Nova/Cinder 등을 호출하고 intent/admission은 특정 Stampede 경로다 | `drover/services/afterglow.py`, `drover/services/stampede.py`, `tests/test_afterglow_admission.py`, `tests/test_afterglow_provisioning.py` |
 | legacy `gpu_quotas` 제거 | partial | source-reviewed, test-defined | 역사적 `001_baseline.sql` 테이블은 아직 물리 삭제하지 않았고 조건부 runbook만 있다 | `drover/migrations/001_baseline.sql`, `drover/migrations/README.md`, `docs/gpu-quota-table-retirement-runbook.md` |
 
-위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-24 로컬 FastAPI `0.141.1`/Starlette `1.6.0` 기준 `uv run pytest tests`는 652건 통과·3건 skip이었고(architecture guard 13건 포함) `uv --directory sdk run pytest`는 111건 통과했다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
+위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-26 로컬 FastAPI `0.141.1`/Starlette `1.6.0` 기준 `uv run pytest tests`는 655건 통과·3건 skip이었고(architecture guard 13건 포함), 2026-09-24 `uv --directory sdk run pytest`는 111건 통과했다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
 
 ## System context
 
@@ -72,6 +72,20 @@ graph LR
 
 선택한 `key_name`은 API admission에서 요청자 connection으로 공개키를 조회·검증한 뒤 기존 cluster/job `ssh_public_key`에 snapshot으로 저장한다. Worker는 tenant manager 계정으로 Nova를 호출하므로 caller의 keypair 이름을 전달하지 않는다. primary·HA server 및 agent의 Ubuntu cloud-init/FCOS Ignition이 같은 공개키를 설치한다. API/worker가 모두 새 버전이어야 이 계약을 보장하며, named-key job/cluster에 snapshot이 없는 구 데이터는 fail-closed 처리한다. 새 schema나 manager 키페어 리소스는 추가하지 않는다.
 
+신규 클러스터의 기본 NIC는 외부 Neutron provider 네트워크에 직접 연결한다. `drover/api/clusters.py`는 명시적 `network_id`를 `k3s.default_network` 정책과 같은 external-only 검증으로 제한하고 내부망이면 자원·cluster·job 생성 전에 400을 반환한다. 값 생략/빈 값은 저장된 외부망 기본 정책을 사용하며 정책 누락·stale·조회 장애는 503으로 거부한다. 선택한 ID/name은 기존 cluster/job `network_id`와 `resource_policy_snapshot`에 저장되어 primary·HA·agent·nodegroup 경로에서 같은 네트워크를 사용한다. 네트워크 snapshot이 없는 구 create job도 Nova 자동 선택으로 진행하지 않는다. 기존 내부망 클러스터를 자동 이관하지 않으며 DB schema는 바뀌지 않는다.
+
+`cloudinit.py:_build_k3s_network_pin_script`는 생성 네트워크 ID→metadata link→MAC→guest NIC로 `node-ip`, `flannel-iface`, server `advertise-address`를 고정하고 재실행 시 저장된 pin을 보존한다. 추가 내부 NIC는 연결 서브넷 접근에만 사용하며 Ubuntu netplan은 DHCP route/DNS와 IPv6 RA를 거부하고 FCOS NetworkManager는 `never-default`, `ignore-auto-routes`, `ignore-auto-dns`, IPv6 disabled를 적용한다. K3s 내부 Pod 경로는 아래 main-table 예외를 유지한다. 상세 계약은 [`docs/drover-feature-coverage.md`](docs/drover-feature-coverage.md)의 Neutron 절을 따른다.
+
+Ubuntu·FCOS의 udev NIC add rule은 모든 rule 처리 후 평가되는 `RUN`의 `$name`으로 최종 NIC 이름을 전달하고 `systemctl --no-block`으로 별도 systemd handler를 요청한다. 커널 이벤트 이름 `%k`는 hotplug 시 `eth0`일 수 있어 실제 `ens8`용 설정을 만들지 못한다. `SYSTEMD_WANTS` 대안은 실제 Ubuntu hotplug 후 속성과 activation이 남지 않아 사용하지 않는다. 최종 RUN 경로는 운영 진단 guest의 실제 detach/attach와 재부팅에서 provider-only default route, 보조 NIC DHCP 주소·빈 DNS·IPv6 RA 차단 및 K3s Ready를 확인했다.
+
+모든 primary·HA server와 agent userdata(Ubuntu cloud-init, FCOS Ignition)는 `drover/services/cloudinit.py:_k3s_pod_route_files`가 만든 script(`/usr/local/sbin/afterglow-k3s-pod-route.sh`), watcher unit(`afterglow-k3s-pod-route.service`), K3s unit drop-in(`k3s.service.d` 또는 `k3s-agent.service.d/10-afterglow-pod-route.conf`)을 설치한다. image-builder `pbrutil`의 source-address rule(priority 30000)이 가리키는 NIC별 table에는 CNI route가 없어 node 주소에서 Pod(`10.42.0.0/16`)로 가는 응답이 NIC gateway로 빠질 수 있다. drop-in은 K3s가 시작될 때마다 `ExecStartPre`로 priority 29999 `to 10.42.0.0/16 table main` rule을 보장하고 실패 시 시작하지 않는다. Ubuntu는 해당 rule에 `protocol kernel`을 지정해 systemd-networkd의 foreign-rule 수거 대상에서만 제외한다. Ubuntu guest에서 watcher를 멈추고 기존 unmarked rule이 provider NIC `networkctl reconfigure` 뒤 3초 내 삭제되는 반면 동일 rule에 `protocol kernel`을 붙이면 잔존하는 것을 확인했다. 전체 foreign-rule 관리 정책은 바꾸지 않는다. FCOS는 pin된 provider NIC의 활성 NetworkManager connection에 같은 rule을 `ipv4.routing-rules`(main table ID 254)로 저장하고 `nmcli device reapply`로 적용하며, ownership 저장 실패 시 K3s 시작을 거부한다. watcher는 일시적 손실 시 5초 주기로 복구한다. provider NIC pin과 보조 NIC의 default route/DNS 제한은 그대로다. Drover는 `--cluster-cidr`를 바꾸지 않으므로 K3s 기본 Pod CIDR만 대상으로 한다. `tests/test_k3s_pod_route.py`는 네 node 유형의 설치와 manager 소유권·ensure 멱등·fail-closed 계약을 정의한다. 2026-09-26 DMSLab에서 새 userdata로 만든 Ubuntu 2-node provider 클러스터는 watcher를 멈춘 `netplan apply` 중 rule 누락 0회였고, 보조 NIC 연결 뒤와 재부팅 뒤 Pod→API TLS·node 간 Pod HTTP·OCCM Octavia LoadBalancer HTTP를 통과했다(live-verified, [`docs/release-0.2.24.md`](docs/release-0.2.24.md)). 이 배포에는 `k3s.fcos_image` 정책이 없어 FCOS 실 guest 재구성은 검증하지 않았고, NetworkManager 1.42 source의 rule 직렬화가 script 비교 문자열과 같다는 것만 확인했다. [systemd networkd.conf](https://www.freedesktop.org/software/systemd/man/latest/networkd.conf.html#ManageForeignRoutingPolicyRules=), [ip-rule protocol](https://man7.org/linux/man-pages/man8/ip-rule.8.html), [NetworkManager routing-rules](https://networkmanager.pages.freedesktop.org/NetworkManager/NetworkManager/nm-settings-nmcli.html).
+
+게스트 플러그인의 인증 URL은 `provisioner.py:_guest_plugin_settings`가 인증된 manager connection의 region별 `identity` public catalog endpoint로 선택한다. backend의 internal 인증 설정은 바꾸지 않고 guest-only Settings copy와 기존 resource snapshot을 사용한다. 활성 플러그인이 없으면 조회하지 않으며, public endpoint 누락·잘못된 URL은 OpenStack 자원 생성 전에 거부한다. OCCM은 `--disable=servicelb`로 K3s LoadBalancer controller와 경쟁하지 않으며 server뿐 아니라 agent에도 external cloud-provider 인자를 적용한다. provider 네트워크가 public-network 정책과 같으면 OCCM의 public 분류를 생략해 원래 provider 주소를 `InternalIP`로 유지한다. 정책상 floating-network 선택은 그대로다. source: `drover/services/plugins/occm.py`, `drover/services/provisioner.py`; 상세 계약은 feature coverage의 Octavia·Keystone 절에 있다.
+
+OCCM은 표시 이름이 아니라 불변 cluster ID를 `--cluster-name`으로 받는다. 따라서 Service LB 이름은 `kube_service_<cluster_id>_<namespace>_<service>`, 설명은 `Kubernetes external service <namespace>/<service> from cluster <cluster_id>`가 된다. 이 LB는 Drover inventory에 기록되지 않으므로 `deletion.py`는 모든 VM 삭제 후 `octavia.delete_occm_service_load_balancers`로 이 prefix와 설명이 모두 일치하는 LB만 cascade 삭제한다. VM이 없으므로 OCCM이 다시 만들 수 없고, 대기 중인 LB는 Octavia가 ACTIVE/ERROR로 정리할 때까지 기다린다. 같은 VIP port의 floating IP는 OCCM 생성 설명과 일치할 때만 먼저 삭제하며 사용자가 지정한 FIP와 다른 cluster의 LB는 건드리지 않는다. 한 LB의 실패는 나머지 정리를 막지 않으며 기존 삭제 단계처럼 경고로 남는다. octavia-ingress-controller의 LB는 이 cleanup 범위가 아니다.
+
+HA joiner(server 2·3)는 `cloud.conf`를 다시 렌더링하지 않는다(`bootstrap_ha_servers`의 `cloud_conf=None`). Drover는 cluster application credential의 secret을 저장하지 않으므로 OCCM 설정을 다시 만들 수 없고, OCCM·Cinder CSI·Barbican KMS manifest는 server 1이 한 번 만든 `kube-system/cloud-config` Secret을 읽는다. joiner도 같은 plugin server 인자(`--disable=servicelb` 등)와 guest-only public identity Settings를 사용한다. `tests/test_provisioner_agents.py::test_occm_ha_joiners_boot_from_cluster_secret_without_app_credential`가 이 계약을 정의하며 live HA 클러스터로는 검증하지 않았다.
+
 ### Reconnection, idempotency, scale/delete
 
 - create에 같은 idempotency key와 같은 canonical request hash를 재전송하면 기존 operation/cluster를 재사용하고, hash가 다르면 `409`다. 이 계약은 `POST /v1/clusters/async`에 한정된다.
@@ -81,6 +95,8 @@ graph LR
 ### Nodegroups, Stampede, reconciliation
 
 `drover/services/autoscale.py`는 desired nodegroup count를 durable `nodegroup_reconcile` job으로 맞추고, `stampede.py`는 K3s pod pending/resource pressure를 읽어 `min_size`·`max_size`, selector/taint, cooldown을 적용한다. GPU flavor가 필요한 경우 현재 GPU quota/admission authority인 Afterglow의 내부 admission을 조회하고, 특정 Stampede provisioning만 durable Afterglow intent를 claim/submit한다. Worker의 reconcile loop는 active cluster를 프로젝트별 concurrency로 enqueue하고 `reconcile_cluster`는 recorded resource ID를 다시 조회해 missing/mismatch/orphan을 DB에 기록한다.
+
+Keystone application credential inventory는 생성 주체인 project manager의 `current_user_id`와 기록된 credential ID로 `identity.get_application_credential(user, application_credential)`를 호출한다. SDK의 user-scoped 경로를 생략하지 않으며 실제 404만 missing으로 처리하고 인증·통신 오류는 그대로 실패한다(`reconciliation.py:_fetch_keystone_app_cred`, `tests/test_reconciliation.py`). schema·queue·외부 API 계약은 바뀌지 않는다.
 
 ### Certificate rotation
 
@@ -127,9 +143,9 @@ FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 �
 - `drover-sdk`: `sdk/`의 독립 Python package이며 API/Worker process에 import되어야 하는 내부 module이 아니다.
 - `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
 - 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
-- Kolla role의 `drover_image_tag`은 이번 release용 `v0.2.23`으로 설정된다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). `v0.2.23` 이미지가 실제 GHCR에 발행되기 전에는 이 기본값으로 배포할 수 없으며, 이미지 발행과 배포 검증은 이 소스 준비 작업에 포함되지 않는다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
+- Kolla role의 `drover_image_tag`은 `v0.2.24`다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 이미지의 실제 발행과 immutable digest 확인은 이 소스 기본값과 별도로 검증한다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
 
-릴리스 변경과 검증 경계는 [`docs/release-0.2.23.md`](docs/release-0.2.23.md)에 정리한다. root wheel/런타임/lock은 `0.2.23`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag의 원문 `v0.2.23`으로 발행한다. tag 생성·빌드·발행은 아직 실행하지 않았다.
+릴리스 변경과 검증 경계는 [`docs/release-0.2.24.md`](docs/release-0.2.24.md)에 정리한다. 이전 릴리스는 [`docs/release-0.2.23.md`](docs/release-0.2.23.md)에 남아 있다. root wheel/런타임/lock은 `0.2.24`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag 원문으로 발행한다. 이 문구 자체는 발행·배포 완료의 증거가 아니다.
 
 `GET /v1/health`와 `/v1/health/live`는 process liveness만 의미한다. `/v1/health/ready`는 MariaDB, Redis ping, migration ledger, Keystone service credentials를 모두 확인하고 하나라도 unavailable이면 `503`을 반환한다. 로그는 각 process의 표준 logging과 correlation ID에 남고, operation event 및 reconciliation drift는 MariaDB API 조회로 확인한다. health 결과·Stampede event는 Redis cache이므로 장애 시 최신 값이 없을 수 있다.
 
@@ -164,7 +180,7 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 - migration: `uv run drover-migrate --apply`
 - architecture snapshot: `python3 scripts/check_architecture.py`
 
-2026-09-24 로컬 `uv run pytest tests`는 652건 통과·3건 skip(약 12초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. 같은 날 `uv --directory sdk run pytest`는 111건 통과했다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
+2026-09-26 로컬 `uv run pytest tests`는 676건 통과·3건 skip(약 15초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. 같은 날 `uv --directory sdk run pytest`는 111건 통과했다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
 
 GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규정과 기준선은 [`AGENTS.md`](AGENTS.md)의 CI 절에 있다. 계약은 trigger 집합(`docker-build.yml` push 필터는 `branches`·`tags`만), fail-closed 발행 게이트(`docker-build.yml`에서 `test`를 뺀 잡 중 `packages: write`·`write-all` 권한(job 또는 상속한 workflow 수준), `docker/login-action`, literal `false`가 아닌 `push`의 `docker/build-push-action` 중 하나라도 있는 모든 잡의 `needs`에 `test`, 그 잡들과 `test`의 job-level `if`·`continue-on-error` 금지, `ci.yml` 잡·스텝의 `continue-on-error` 금지), `ci.yml` 잡·스텝의 `if`와 잡 간 `needs` 금지, PR 코드를 실행하는 workflow의 `ubuntu-*` runner·`permissions: contents: read`·job-level `permissions`/`environment`/`secrets` 금지·`secrets.GITHUB_TOKEN` 외 secret 참조 금지, `service`의 checkout 다음 첫 스텝인 architecture check와 `uv run pytest tests`, 빌드한 두 이미지의 Trivy 스캔, 서비스 health-check의 2초 이하 interval과 30초 이상 window(start-period + interval×retries)를 포함한다.
 
@@ -180,7 +196,7 @@ GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규
 | API route, auth, response/event | `drover/main.py`, 해당 `drover/api/*.py`, `docs/drover-api-v1-reference.md` | project ownership, `/v1` path, `tests/test_openapi_contract.py`/해당 API test, 이 문서 Code map·Data and contracts |
 | create/scale/delete/nodegroup job | `drover/services/jobs.py`, `operations.py`, `provisioner.py`, `autoscale.py` | transaction/lease/status/idempotency 설명, durable/operation tests, Runtime flows |
 | OpenStack resource or plugin | adapter in `drover/services/`, `provisioner.py`, `drover/models/orm.py` | inventory/reconciliation, migration SQL, security/deployment sections와 관련 tests |
-| callback/cloud-init/token | `drover/api/callback.py`, `drover/services/store.py`, `redis_store.py`, cloud-init templates | CIDR/TTL/one-time contract, `tests/test_k3s_callback.py`, Security boundaries |
+| callback/cloud-init/token | `drover/api/callback.py`, `drover/services/store.py`, `redis_store.py`, cloud-init templates | CIDR/TTL/one-time contract, `tests/test_k3s_callback.py`, node network bootstrap(`tests/test_k3s_network_pinning.py`, `tests/test_k3s_pod_route.py`), Security boundaries |
 | Stampede/GPU/Afterglow boundary | `drover/services/stampede.py`, `afterglow.py`, `docs/afterglow-service-integration.md` | current intent/admission scope, `tests/test_k3s_stampede.py`, `tests/test_afterglow_*`, feature coverage |
 | schema, migration, durable model | `drover/models/orm.py`, `drover/migrations/`, `drover/scripts/migrate.py` | migration ledger/readiness, `tests/test_durable_create.py`, Deployment and operations |
 | SDK/catalog | `sdk/drover_sdk/service.py`, `sdk/drover_sdk/proxy.py`, `sdk/pyproject.toml` | `/v1` and alias wording, `sdk/tests/test_proxy.py`, docs catalog sections |
@@ -200,9 +216,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "af96367bdf463119267af93bd70008896104d6a9af2b77e42a413e189b2ebada",
-  "reviewed_at": "2026-09-24T16:32:46Z",
-  "summary": "Reviewed 0.2.23 root/runtime/lock and Kolla release defaults; removed incidental version/source pins while retaining installed-wheel ownership coverage. No service structure change."
+  "source_sha256": "4e904445d7568c04e0657aaebdffc4bebd3a82f15d3196eafcf22e2fc8e0f702",
+  "reviewed_at": "2026-09-26T14:54:50Z",
+  "summary": "0.2.24 release candidate: live-verified Ubuntu provider routing, OCCM LB lifecycle and deletion; HA joiners reuse the cloud-config Secret; release notes added; no schema/public API change"
 }
 ```
 <!-- architecture-review:end -->

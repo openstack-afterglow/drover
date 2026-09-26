@@ -76,7 +76,10 @@ class CreateK3sClusterRequest(BaseModel):
     name: str = ""
     agent_count: int = Field(default=1, ge=0, le=10)
     agent_flavor_id: str | None = None
-    network_id: str | None = None
+    network_id: str | None = Field(
+        default=None,
+        description="External Neutron network ID for all cluster nodes; omit to use the required k3s.default_network policy.",
+    )
     key_name: str | None = None
     os_type: str = "ubuntu"
     allowed_cidrs: list[str] | None = Field(default=None, max_length=20)

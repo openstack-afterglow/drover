@@ -2,8 +2,10 @@
 
 import base64
 import gzip
+from configparser import ConfigParser
 from unittest.mock import MagicMock
 
+import pytest
 import yaml
 
 
@@ -100,6 +102,28 @@ def test_occm_cloud_conf_sections_contains_global():
     assert "username" not in result
 
 
+@pytest.mark.parametrize("primary_network", ["external", "tenant"])
+def test_occm_preserves_primary_internal_ip_when_public_policy_overlaps(primary_network):
+    from drover.services.plugins.occm import OccmPlugin
+
+    config = ConfigParser()
+    config.read_string(
+        OccmPlugin().cloud_conf_sections(
+            "proj-1",
+            _base_settings(drover_occm_enabled=True),
+            internal_network_name=primary_network,
+            app_credential=_FAKE_APP_CRED,
+        )
+    )
+    networking = config["Networking"]
+    assert networking["internal-network-name"] == primary_network
+    if primary_network == "external":
+        # OCCM removes InternalIP when this network is also classified as public.
+        assert "public-network-name" not in networking
+    else:
+        assert networking["public-network-name"] == "external"
+
+
 def test_occm_cloud_conf_missing_app_cred_raises():
     import pytest
 
@@ -109,16 +133,18 @@ def test_occm_cloud_conf_missing_app_cred_raises():
     with pytest.raises(ValueError, match="app_credential"):
         OccmPlugin().cloud_conf_sections("proj-1", s, app_credential=None)
 
-def test_occm_manifests_valid_yaml():
+def test_occm_manifests_name_octavia_resources_by_cluster_id():
     from drover.services.plugins.occm import OccmPlugin
 
     s = _base_settings(drover_occm_enabled=True)
-    manifests = OccmPlugin().generate_manifests("test-cluster", "proj-1", s)
-    docs = list(yaml.safe_load_all(manifests))
-    assert len(docs) > 0
-    kinds = {d["kind"] for d in docs if d}
-    assert "DaemonSet" in kinds
-    assert "ClusterRole" in kinds
+    with pytest.raises(ValueError, match="cluster_id"):
+        OccmPlugin().generate_manifests("test-cluster", "proj-1", s)
+    manifests = OccmPlugin().generate_manifests("test-cluster", "proj-1", s, cluster_id="cluster-uuid-1")
+    daemonset = next(d for d in yaml.safe_load_all(manifests) if d and d["kind"] == "DaemonSet")
+    args = daemonset["spec"]["template"]["spec"]["containers"][0]["args"]
+    # Cluster deletion selects OCCM LBs by this immutable name, not the reusable display name.
+    assert "--cluster-name=cluster-uuid-1" in args
+    assert not any("test-cluster" in arg for arg in args)
 
 
 def test_occm_needs_external_cloud_provider():
@@ -539,7 +565,9 @@ def test_registry_occm_plus_cinder():
     cloud_conf = drover_plugins.aggregate_cloud_conf("proj-1", s, app_credential=_FAKE_APP_CRED)
     assert "[Global]" in cloud_conf
     assert "[BlockStorage]" in cloud_conf
-    manifests, failures = drover_plugins.aggregate_manifests("test-cluster", "proj-1", s, app_credential=_FAKE_APP_CRED)
+    manifests, failures = drover_plugins.aggregate_manifests(
+        "test-cluster", "proj-1", s, app_credential=_FAKE_APP_CRED, cluster_id="cluster-uuid-1"
+    )
     assert not failures
     assert len(manifests) == 2
     names = [m["name"] for m in manifests]

@@ -40,6 +40,13 @@ write_files:
 {{ wf.content | indent(6, first=True) }}
 
 {% endfor %}
+{% for wf in pod_route_files %}
+  - path: {{ wf.path }}
+    permissions: "{{ wf.permissions }}"
+    content: |
+{{ wf.content | indent(6, first=True) }}
+
+{% endfor %}
   - path: /opt/k3s/pin-primary-network.sh
     permissions: "0750"
     content: |
@@ -85,6 +92,7 @@ write_files:
           ${IFACE}:
             dhcp4: true
             dhcp6: false
+            accept-ra: false
             link-local: []
             optional: true
             dhcp4-overrides:
@@ -124,7 +132,7 @@ write_files:
   - path: /etc/udev/rules.d/99-afterglow-nic.rules
     permissions: "0644"
     content: |
-      SUBSYSTEM=="net", ACTION=="add", KERNEL!="lo", KERNEL!="cni*", KERNEL!="flannel*", KERNEL!="veth*", KERNEL!="kube*", KERNEL!="dummy*", KERNEL!="tunl*", RUN+="/bin/systemctl --no-block start afterglow-nic-up@%k.service"
+      SUBSYSTEM=="net", ACTION=="add", KERNEL!="lo", KERNEL!="cni*", KERNEL!="flannel*", KERNEL!="veth*", KERNEL!="kube*", KERNEL!="dummy*", KERNEL!="tunl*", RUN+="/bin/systemctl --no-block start afterglow-nic-up@$name.service"
 
   - path: /opt/k3s/callback.sh
     permissions: "0750"

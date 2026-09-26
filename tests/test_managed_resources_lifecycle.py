@@ -265,6 +265,10 @@ async def test_deletion_order_and_ownership_constraints():
     def mock_del_lb_safe(*args, **kwargs):
         call_order.append("octavia_lb")
 
+    def mock_del_occm_lbs(*args, **kwargs):
+        call_order.append("occm_service_lbs")
+        return []
+
     def mock_del_fip_safe(*args, **kwargs):
         call_order.append("neutron_fip")
 
@@ -298,6 +302,7 @@ async def test_deletion_order_and_ownership_constraints():
         patch("drover.services.octavia.delete_pool", side_effect=mock_del_pool),
         patch("drover.services.octavia.delete_listener", side_effect=mock_del_listener),
         patch("drover.services.octavia.delete_load_balancer_safe", side_effect=mock_del_lb_safe),
+        patch("drover.services.octavia.delete_occm_service_load_balancers", side_effect=mock_del_occm_lbs),
         patch("drover.services.neutron.delete_floating_ip_safe", side_effect=mock_del_fip_safe),
         patch("drover.services.cinder.delete_volume_safe", side_effect=mock_del_vol_safe),
         patch("drover.services.neutron.wait_port_deleted", return_value=None),
@@ -349,13 +354,65 @@ async def test_deletion_order_and_ownership_constraints():
     assert idx_vol < idx_sg
     # SGs before app creds
     assert idx_sg < idx_cred
+    # OCCM cannot recreate Service LBs once every cluster VM is gone.
+    assert idx_vm < call_order.index("occm_service_lbs")
 
 
-@pytest.mark.asyncio
-async def test_no_legacy_prefix_cleanup_and_no_fixed_sleeps():
-    """Verify that octavia.list_load_balancers with prefix filtering and fixed sleeps are absent from deletion service."""
-    import inspect
-    source = inspect.getsource(deletion)
-    assert "kube_service_" not in source
-    assert "kube_ingress_" not in source
-    assert "asyncio.sleep(5)" not in source
+def test_occm_service_lb_cleanup_deletes_only_this_clusters_controller_resources(monkeypatch):
+    from types import SimpleNamespace
+
+    from drover.services import octavia
+
+    cluster_id = "11111111-2222-3333-4444-555555555555"
+    other_id = "11111111-2222-3333-4444-666666666666"
+
+    def lb(lb_id, name, description, vip_port_id=None):
+        return SimpleNamespace(id=lb_id, name=name, description=description, vip_port_id=vip_port_id)
+
+    def occm_lb(lb_id, owner, service, vip_port_id=None):
+        namespace, name = service.split("/")
+        return lb(
+            lb_id,
+            f"kube_service_{owner}_{namespace}_{name}",
+            f"Kubernetes external service {service} from cluster {owner}",
+            vip_port_id,
+        )
+
+    conn = MagicMock()
+    conn.load_balancer.load_balancers.return_value = [
+        occm_lb("lb-web", cluster_id, "default/web", "vip-web"),
+        occm_lb("lb-traefik", cluster_id, "kube-system/traefik", "vip-traefik"),
+        occm_lb("lb-broken", cluster_id, "default/broken"),
+        occm_lb("lb-other-cluster", other_id, "default/web"),
+        lb("lb-user", f"kube_service_{cluster_id}_default_manual", "user managed"),
+        occm_lb("lb-display-name", "demo", "default/web"),
+    ]
+    statuses = {"lb-web": ["ACTIVE"], "lb-traefik": ["PENDING_CREATE", "ERROR"], "lb-broken": ["ACTIVE"]}
+    deleted = {}
+
+    def find_load_balancer(lb_id, ignore_missing=True):
+        if lb_id in deleted:
+            return None
+        states = statuses[lb_id]
+        return SimpleNamespace(id=lb_id, provisioning_status=states.pop(0) if len(states) > 1 else states[0])
+
+    def delete_load_balancer(lb_id, cascade, ignore_missing):
+        if lb_id == "lb-broken":
+            raise RuntimeError("octavia unavailable")
+        deleted[lb_id] = (statuses[lb_id][0], cascade)
+
+    conn.load_balancer.find_load_balancer.side_effect = find_load_balancer
+    conn.load_balancer.delete_load_balancer.side_effect = delete_load_balancer
+    fips = {
+        "vip-web": [SimpleNamespace(id="fip-occm", description=f"Floating IP for Kubernetes external service default/web from cluster {cluster_id}")],
+        "vip-traefik": [SimpleNamespace(id="fip-user", description="reserved by user")],
+    }
+    conn.network.ips.side_effect = lambda port_id, project_id: fips[port_id]
+    monkeypatch.setattr(octavia, "_OCCM_LB_SETTLE_INTERVAL_SECONDS", 0)
+
+    with pytest.raises(RuntimeError, match="lb-broken"):
+        octavia.delete_occm_service_load_balancers(conn, "proj-1", cluster_id)
+
+    # One failed LB does not strand the others; pending LBs are deleted only after Octavia settles them.
+    assert deleted == {"lb-web": ("ACTIVE", True), "lb-traefik": ("ERROR", True)}
+    conn.network.delete_ip.assert_called_once_with("fip-occm", ignore_missing=True)

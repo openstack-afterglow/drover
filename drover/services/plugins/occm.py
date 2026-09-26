@@ -39,6 +39,10 @@ class OccmPlugin:
         """OCCM의 cloud.conf 전체 내용 반환 (Global + LoadBalancer + Networking)."""
         if not app_credential or not app_credential.get("id") or not app_credential.get("secret"):
             raise ValueError("app_credential containing id and secret is required for OCCM plugin")
+        public_network_name = settings.resource_name("k3s.occm_public_network")
+        # OCCM's public classification removes InternalIP, even on a pinned provider network.
+        if public_network_name == internal_network_name:
+            public_network_name = ""
         tmpl = _jinja.get_template("occm/cloud_config.conf.j2")
         return tmpl.render(
             auth_url=settings.os_auth_url,
@@ -48,27 +52,32 @@ class OccmPlugin:
             project_id=project_id,
             ca_file="" if settings.os_insecure else (settings.os_cacert or ""),
             floating_network_id=settings.resource_id("k3s.occm_floating_network"),
-            public_network_name=settings.resource_name("k3s.occm_public_network"),
+            public_network_name=public_network_name,
             lb_subnet_id=settings.resource_id("k3s.lb_subnet"),
             internal_network_name=internal_network_name,
         )
 
 
-    def generate_manifests(self, cluster_name: str, project_id: str, settings: Settings, **kwargs) -> str:
+    def generate_manifests(
+        self, cluster_name: str, project_id: str, settings: Settings, *, cluster_id: str = "", **kwargs
+    ) -> str:
+        # OCCM names Octavia resources from --cluster-name; the immutable ID makes delete ownership exact.
+        if not cluster_id:
+            raise ValueError("cluster_id is required for OCCM resource ownership")
         tmpl = _jinja.get_template("occm/manifests.yaml.j2")
         return tmpl.render(
             occm_image=settings.drover_occm_image,
-            cluster_name=cluster_name,
+            cluster_name=cluster_id,
         )
 
     def extra_write_files(self, project_id: str, cluster_name: str, settings: Settings) -> list[dict]:
         return []
 
     def server_install_args(self, settings: Settings) -> list[str]:
-        return []  # cloud-provider=external은 레지스트리가 needs_external_cloud_provider()로 처리
+        return ["--disable=servicelb"]  # OCCM owns LoadBalancer Services; do not run the K3s controller.
 
     def agent_install_args(self, settings: Settings) -> list[str]:
-        return []
+        return ["--kubelet-arg=cloud-provider=external"]
 
     def needs_external_cloud_provider(self, settings: Settings) -> bool:
         return True
