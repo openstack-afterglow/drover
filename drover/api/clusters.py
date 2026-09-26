@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
+from openstack.exceptions import ResourceNotFound
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy.exc import InterfaceError, OperationalError
@@ -37,9 +38,8 @@ from drover.models.schemas import (
     ScaleK3sClusterRequest,
 )
 from drover.policy import authorize
-from drover.services import instance_orchestration as _instance_orch
 from drover.services import jobs as _jobs
-from drover.services import nova, operations
+from drover.services import nova, operations, resource_policies
 from drover.services import store as k3s_cluster
 from drover.services.activity import rec
 from drover.services.cache import cached_call, invalidate, ttl_normal, ttl_slow
@@ -277,7 +277,6 @@ async def create_k3s_cluster_async(
     """k3s 클러스터 생성 — SSE 스트리밍 진행률 반환."""
     project_id = conn._afterglow_project_id
     authorize("drover:clusters:create", {"project_id": project_id}, token_info)
-    s = get_settings()
 
     idempotency_key = request.headers.get("idempotency-key") or request.headers.get("Idempotency-Key")
     req_hash = compute_request_hash(req)
@@ -375,7 +374,28 @@ async def create_k3s_cluster_async(
             selection = await validate_existing_selection(conn, optional_key, stored_selection["id"])
             policy_snapshot[optional_key] = {"id": selection["id"], "name": selection["name"]}
 
-        network_id = req.network_id or await _instance_orch.resolve_default_network(conn, s)
+        if req.network_id:
+            if not req.network_id.strip():
+                raise HTTPException(status_code=400, detail="Requested network is unavailable or is not external")
+            try:
+                selected_network = await validate_existing_selection(conn, "k3s.default_network", req.network_id)
+            except (resource_policies.ResourcePolicyValidationError, ResourceNotFound) as exc:
+                raise HTTPException(status_code=400, detail="Requested network is unavailable or is not external") from exc
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="OpenStack network lookup is unavailable") from exc
+        else:
+            try:
+                selected_network = (
+                    await resolve_policy_snapshot(conn=conn, keys=("k3s.default_network",))
+                )["k3s.default_network"]
+            except ResourcePolicyStorageUnavailable as exc:
+                raise HTTPException(status_code=503, detail="resource policy storage is unavailable") from exc
+            except (resource_policies.ResourcePolicyValidationError, ResourceNotFound) as exc:
+                raise HTTPException(status_code=503, detail="Default network policy is missing or stale") from exc
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="OpenStack network lookup is unavailable") from exc
+        network_id = selected_network["id"]
+        policy_snapshot["k3s.default_network"] = {"id": network_id, "name": selected_network["name"]}
         ssh_public_key = None
         if req.key_name:
             try:

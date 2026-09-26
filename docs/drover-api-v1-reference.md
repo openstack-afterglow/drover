@@ -116,6 +116,7 @@ Drover 서비스의 네이티브 REST, SSE(Server-Sent Events) 및 WebSocket API
     "stampede_enabled": false
   }
   ```
+- **클러스터 네트워크**: `network_id`는 Neutron 외부 네트워크의 ID만 받습니다. 생략하면 관리자 `k3s.default_network` 정책의 외부 네트워크 ID를 조회·재검증합니다. 공유 네트워크라도 외부가 아니면 명시 요청과 기본 정책 모두 사용할 수 없습니다. 명시한 네트워크가 없거나 내부이면 기록 전에 `400`, 기본 정책이 누락·만료되면 `503`, 네트워크 조회 서비스가 불가하면 `503`으로 거부하며 Nova 자동 네트워크 선택으로 우회하지 않습니다. 선택한 ID와 이름은 cluster/job의 `resource_policy_snapshot["k3s.default_network"]`에, ID는 `network_id`에도 저장되고 primary·HA·agent·nodegroup 프로비저닝과 후속 scale에 사용됩니다. [요청 처리](../drover/api/clusters.py), [정책 제약과 조회](../drover/services/resource_policies.py), [정책 스냅샷](../drover/services/resource_policy_store.py), [직접 VM 생성](../drover/services/provisioner.py), [노드그룹 VM 생성](../drover/services/autoscale.py).
 - **응답 (200 OK)**: `text/event-stream` (SSE 스트림)
   - 이벤트 라인 형식 (`K3sProgressMessage`):
     `data: {"step": "security_group", "progress": 10, "message": "...", "cluster_id": "...", "operation_id": "op-123"}`
@@ -292,6 +293,7 @@ Policy `drover:admin` (시스템 관리자 전용) 인증이 요구되는 관리
 * **Resource Policies & Runtime Settings**:
   - `GET /v1/admin/resource-policies`: 자원 정책 규격 조회
   - `GET /v1/admin/resource-policies/catalog/{policy_key}`: 카탈로그 옵션 디스커버리
+  - `k3s.default_network` 카탈로그에는 외부 Neutron 네트워크만 표시됩니다. 정책 변경 시에도 ID와 외부 속성을 확인하며 공유 전용 네트워크는 선택할 수 없습니다. [정책 정의](../drover/services/resource_policies.py).
   - `PUT /v1/admin/resource-policies/{policy_key}`: 자원 정책 동적 업데이트
   - `GET /v1/admin/runtime-settings`: 런타임 설정 조회
   - `PUT /v1/admin/runtime-settings/{setting_key}`: 런타임 설정 동적 업데이트

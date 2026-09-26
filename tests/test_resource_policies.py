@@ -69,13 +69,27 @@ async def test_external_and_shared_network_policies_filter_exact_catalog(monkeyp
     monkeypatch.setattr(resource_policies.neutron, "list_networks", lambda _conn: networks)
 
     assert [option["id"] for option in await resource_policies.discover_options(conn, "k3s.default_network")] == [
-        "shared"
+        "public"
     ]
     assert [
         option["id"] for option in await resource_policies.discover_options(conn, "k3s.occm_floating_network")
     ] == ["public"]
     with pytest.raises(resource_policies.ResourcePolicyValidationError):
         await resource_policies.validate_selection(conn, "k3s.default_network", "private")
+    with pytest.raises(resource_policies.ResourcePolicyValidationError):
+        await resource_policies.validate_selection(conn, "k3s.default_network", "shared")
+    assert (await resource_policies.validate_selection(conn, "k3s.default_network", "public"))["id"] == "public"
+
+@pytest.mark.asyncio
+async def test_default_network_catalog_accepts_neutron_external_dto(monkeypatch):
+    network = SimpleNamespace(id="external", name="external", is_external=True, is_shared=False)
+    conn = _NetworkConnection([network])
+    monkeypatch.setattr(resource_policies.neutron, "list_networks", lambda _conn: [network])
+
+    options = await resource_policies.discover_options(conn, "k3s.default_network")
+
+    assert [option["id"] for option in options] == ["external"]
+    assert (await resource_policies.validate_selection(conn, "k3s.default_network", "external"))["id"] == "external"
 
 
 @pytest.mark.parametrize("value", ["", "   ", True, 1, None])

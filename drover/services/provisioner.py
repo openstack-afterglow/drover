@@ -529,6 +529,8 @@ async def create_cluster_job(
     ha_fip_address: str | None = None
 
     try:
+        if not network_id:
+            raise RuntimeError("Creation-time network snapshot is missing")
         # Step 1: Security Group
         if operation_id:
             await operations.append_operation_event(
