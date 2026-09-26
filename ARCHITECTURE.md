@@ -76,6 +76,8 @@ graph LR
 
 `cloudinit.py:_build_k3s_network_pin_script`는 생성 네트워크 ID→metadata link→MAC→guest NIC로 `node-ip`, `flannel-iface`, server `advertise-address`를 고정하고 재실행 시 저장된 pin을 보존한다. 추가 내부 NIC는 연결 서브넷 접근에만 사용하며 Ubuntu netplan은 DHCP route/DNS와 IPv6 RA를 거부하고 FCOS NetworkManager는 `never-default`, `ignore-auto-routes`, `ignore-auto-dns`, IPv6 disabled를 적용한다. K3s 내부 Pod 경로는 아래 main-table 예외를 유지한다. 상세 계약은 [`docs/drover-feature-coverage.md`](docs/drover-feature-coverage.md)의 Neutron 절을 따른다.
 
+Ubuntu·FCOS의 udev NIC add rule은 `SYSTEMD_WANTS`로 rename 완료 후 systemd device activation에서 handler를 실행하고 `$name`으로 최종 NIC 이름을 전달한다. 커널 이벤트 이름 `%k`는 hotplug 시 `eth0`일 수 있어 실제 `ens8`용 설정을 만들지 못한다. 운영 재현에서 잘못된 `90-afterglow-eth0.yaml`과 pbrutil fallback의 내부 default route가 관찰되어 이 경로를 수정했다.
+
 모든 primary·HA server와 agent userdata(Ubuntu cloud-init, FCOS Ignition)는 `drover/services/cloudinit.py:_k3s_pod_route_files`가 만든 script(`/usr/local/sbin/afterglow-k3s-pod-route.sh`), watcher unit(`afterglow-k3s-pod-route.service`), K3s unit drop-in(`k3s.service.d` 또는 `k3s-agent.service.d/10-afterglow-pod-route.conf`)을 설치한다. image-builder `pbrutil`의 source-address rule(priority 30000)이 가리키는 NIC별 table에는 CNI route가 없어서, node 주소에서 Pod(`10.42.0.0/16`)로 가는 응답이 cni0/flannel 대신 NIC gateway로 나가고 Pod→`kubernetes` Service/API 연결이 timeout된다. drop-in은 K3s가 시작될 때마다 `ExecStartPre`로 priority 29999 `to 10.42.0.0/16 table main` rule을 보장하고 보장하지 못하면 K3s를 시작하지 않는다. watcher는 network manager가 foreign policy rule을 지우면 5초 안에 복원한다. Drover는 `--cluster-cidr`를 바꾸지 않으므로 K3s 기본 Pod CIDR만 대상으로 한다. `tests/test_k3s_pod_route.py`가 네 node 유형의 설치와 ensure의 멱등·fail-closed 계약을 정의한다.
 
 ### Reconnection, idempotency, scale/delete
@@ -206,9 +208,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "beaef611240c363d05d5608763c1c84c115a2c27d8422cb6c3c4a78d9046465a",
-  "reviewed_at": "2026-09-26T09:05:26Z",
-  "summary": "Reviewed external-only create admission and default-network policy, durable provider snapshot and missing-network worker guard, plus Ubuntu secondary-NIC IPv6 RA suppression. New nodes attach directly to provider and retain existing K3s IP/flannel pin; schema unchanged."
+  "source_sha256": "e1df75bf7b08e2c3cd8579ed0f6af0703e9f10b452f62aaa5c551e29ea9e2717",
+  "reviewed_at": "2026-09-26T09:37:41Z",
+  "summary": "Reviewed Ubuntu and FCOS hotplug rules: systemd device activation uses final udev name instead of pre-rename kernel name, fixing secondary NIC route suppression. Live guest diagnosis showed eth0 configuration while actual NIC was ens8; no schema or topology impact."
 }
 ```
 <!-- architecture-review:end -->

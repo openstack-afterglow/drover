@@ -394,7 +394,7 @@ WantedBy=multi-user.target
 
 
 def _fcos_nic_rule() -> str:
-    return """SUBSYSTEM=="net", ACTION=="add", KERNEL!="lo", KERNEL!="cni*", KERNEL!="flannel*", KERNEL!="veth*", KERNEL!="kube*", KERNEL!="dummy*", KERNEL!="tunl*", RUN+="/bin/systemctl --no-block start afterglow-nic-up@%k.service"
+    return """SUBSYSTEM=="net", ACTION=="add", KERNEL!="lo", KERNEL!="cni*", KERNEL!="flannel*", KERNEL!="veth*", KERNEL!="kube*", KERNEL!="dummy*", KERNEL!="tunl*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="afterglow-nic-up@$name.service"
 """
 
 
