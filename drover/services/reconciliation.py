@@ -160,15 +160,9 @@ def _fetch_octavia_member(
 
 def _fetch_keystone_app_cred(conn: openstack.connection.Connection, app_cred_id: str) -> Any | None:
     try:
-        if hasattr(conn, "identity") and hasattr(conn.identity, "find_application_credential"):
-            return conn.identity.find_application_credential(app_cred_id, ignore_missing=True)
-        if hasattr(conn, "identity") and hasattr(conn.identity, "get_application_credential"):
-            return conn.identity.get_application_credential(app_cred_id)
+        return conn.identity.get_application_credential(conn.current_user_id, app_cred_id)
+    except (ResourceNotFound, NotFoundException):
         return None
-    except Exception as e:
-        if _is_not_found(e):
-            return None
-        raise
 
 
 def fetch_recorded_resource(

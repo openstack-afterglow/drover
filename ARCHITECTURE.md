@@ -6,7 +6,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: `drover==0.2.23`, `drover-sdk==0.2.21` (별도 SDK 버전)
+- 패키지: `drover==0.2.24`, `drover-sdk==0.2.21` (별도 SDK 버전)
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -78,7 +78,9 @@ graph LR
 
 Ubuntu·FCOS의 udev NIC add rule은 모든 rule 처리 후 평가되는 `RUN`의 `$name`으로 최종 NIC 이름을 전달하고 `systemctl --no-block`으로 별도 systemd handler를 요청한다. 커널 이벤트 이름 `%k`는 hotplug 시 `eth0`일 수 있어 실제 `ens8`용 설정을 만들지 못한다. `SYSTEMD_WANTS` 대안은 실제 Ubuntu hotplug 후 속성과 activation이 남지 않아 사용하지 않는다. 최종 RUN 경로는 운영 진단 guest의 실제 detach/attach와 재부팅에서 provider-only default route, 보조 NIC DHCP 주소·빈 DNS·IPv6 RA 차단 및 K3s Ready를 확인했다.
 
-모든 primary·HA server와 agent userdata(Ubuntu cloud-init, FCOS Ignition)는 `drover/services/cloudinit.py:_k3s_pod_route_files`가 만든 script(`/usr/local/sbin/afterglow-k3s-pod-route.sh`), watcher unit(`afterglow-k3s-pod-route.service`), K3s unit drop-in(`k3s.service.d` 또는 `k3s-agent.service.d/10-afterglow-pod-route.conf`)을 설치한다. image-builder `pbrutil`의 source-address rule(priority 30000)이 가리키는 NIC별 table에는 CNI route가 없어서, node 주소에서 Pod(`10.42.0.0/16`)로 가는 응답이 cni0/flannel 대신 NIC gateway로 나가고 Pod→`kubernetes` Service/API 연결이 timeout된다. drop-in은 K3s가 시작될 때마다 `ExecStartPre`로 priority 29999 `to 10.42.0.0/16 table main` rule을 보장하고 보장하지 못하면 K3s를 시작하지 않는다. watcher는 network manager가 foreign policy rule을 지우면 5초 안에 복원한다. Drover는 `--cluster-cidr`를 바꾸지 않으므로 K3s 기본 Pod CIDR만 대상으로 한다. `tests/test_k3s_pod_route.py`가 네 node 유형의 설치와 ensure의 멱등·fail-closed 계약을 정의한다.
+모든 primary·HA server와 agent userdata(Ubuntu cloud-init, FCOS Ignition)는 `drover/services/cloudinit.py:_k3s_pod_route_files`가 만든 script(`/usr/local/sbin/afterglow-k3s-pod-route.sh`), watcher unit(`afterglow-k3s-pod-route.service`), K3s unit drop-in(`k3s.service.d` 또는 `k3s-agent.service.d/10-afterglow-pod-route.conf`)을 설치한다. image-builder `pbrutil`의 source-address rule(priority 30000)이 가리키는 NIC별 table에는 CNI route가 없어 node 주소에서 Pod(`10.42.0.0/16`)로 가는 응답이 NIC gateway로 빠질 수 있다. drop-in은 K3s가 시작될 때마다 `ExecStartPre`로 priority 29999 `to 10.42.0.0/16 table main` rule을 보장하고 실패 시 시작하지 않는다. Ubuntu는 해당 rule에 `protocol kernel`을 지정해 systemd-networkd의 foreign-rule 수거 대상에서만 제외한다. Ubuntu guest에서 watcher를 멈추고 기존 unmarked rule이 provider NIC `networkctl reconfigure` 뒤 3초 내 삭제되는 반면 동일 rule에 `protocol kernel`을 붙이면 잔존하는 것을 확인했다. 전체 foreign-rule 관리 정책은 바꾸지 않는다. FCOS는 pin된 provider NIC의 활성 NetworkManager connection에 같은 rule을 `ipv4.routing-rules`(main table ID 254)로 저장하고 `nmcli device reapply`로 적용하며, ownership 저장 실패 시 K3s 시작을 거부한다. watcher는 일시적 손실 시 5초 주기로 복구한다. provider NIC pin과 보조 NIC의 default route/DNS 제한은 그대로다. Drover는 `--cluster-cidr`를 바꾸지 않으므로 K3s 기본 Pod CIDR만 대상으로 한다. `tests/test_k3s_pod_route.py`는 네 node 유형의 설치와 manager 소유권·ensure 멱등·fail-closed 계약을 정의한다. 새 userdata의 전체 클러스터 부팅, FCOS 실 guest 재구성 및 Pod→API 연결은 아직 검증하지 않았다. [systemd networkd.conf](https://www.freedesktop.org/software/systemd/man/latest/networkd.conf.html#ManageForeignRoutingPolicyRules=), [ip-rule protocol](https://man7.org/linux/man-pages/man8/ip-rule.8.html), [NetworkManager routing-rules](https://networkmanager.pages.freedesktop.org/NetworkManager/NetworkManager/nm-settings-nmcli.html).
+
+게스트 플러그인의 인증 URL은 `provisioner.py:_guest_plugin_settings`가 인증된 manager connection의 region별 `identity` public catalog endpoint로 선택한다. backend의 internal 인증 설정은 바꾸지 않고 guest-only Settings copy와 기존 resource snapshot을 사용한다. 활성 플러그인이 없으면 조회하지 않으며, public endpoint 누락·잘못된 URL은 OpenStack 자원 생성 전에 거부한다. OCCM은 `--disable=servicelb`로 K3s LoadBalancer controller와 경쟁하지 않으며 server뿐 아니라 agent에도 external cloud-provider 인자를 적용한다. provider 네트워크가 public-network 정책과 같으면 OCCM의 public 분류를 생략해 원래 provider 주소를 `InternalIP`로 유지한다. 정책상 floating-network 선택은 그대로다. source: `drover/services/plugins/occm.py`, `drover/services/provisioner.py`; 상세 계약은 feature coverage의 Octavia·Keystone 절에 있다.
 
 ### Reconnection, idempotency, scale/delete
 
@@ -89,6 +91,8 @@ Ubuntu·FCOS의 udev NIC add rule은 모든 rule 처리 후 평가되는 `RUN`�
 ### Nodegroups, Stampede, reconciliation
 
 `drover/services/autoscale.py`는 desired nodegroup count를 durable `nodegroup_reconcile` job으로 맞추고, `stampede.py`는 K3s pod pending/resource pressure를 읽어 `min_size`·`max_size`, selector/taint, cooldown을 적용한다. GPU flavor가 필요한 경우 현재 GPU quota/admission authority인 Afterglow의 내부 admission을 조회하고, 특정 Stampede provisioning만 durable Afterglow intent를 claim/submit한다. Worker의 reconcile loop는 active cluster를 프로젝트별 concurrency로 enqueue하고 `reconcile_cluster`는 recorded resource ID를 다시 조회해 missing/mismatch/orphan을 DB에 기록한다.
+
+Keystone application credential inventory는 생성 주체인 project manager의 `current_user_id`와 기록된 credential ID로 `identity.get_application_credential(user, application_credential)`를 호출한다. SDK의 user-scoped 경로를 생략하지 않으며 실제 404만 missing으로 처리하고 인증·통신 오류는 그대로 실패한다(`reconciliation.py:_fetch_keystone_app_cred`, `tests/test_reconciliation.py`). schema·queue·외부 API 계약은 바뀌지 않는다.
 
 ### Certificate rotation
 
@@ -135,9 +139,9 @@ FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 �
 - `drover-sdk`: `sdk/`의 독립 Python package이며 API/Worker process에 import되어야 하는 내부 module이 아니다.
 - `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
 - 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
-- Kolla role의 `drover_image_tag`은 이번 release용 `v0.2.23`으로 설정된다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). `v0.2.23` 이미지가 실제 GHCR에 발행되기 전에는 이 기본값으로 배포할 수 없으며, 이미지 발행과 배포 검증은 이 소스 준비 작업에 포함되지 않는다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
+- Kolla role의 `drover_image_tag`은 `v0.2.24`다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 이미지의 실제 발행과 immutable digest 확인은 이 소스 기본값과 별도로 검증한다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
 
-릴리스 변경과 검증 경계는 [`docs/release-0.2.23.md`](docs/release-0.2.23.md)에 정리한다. root wheel/런타임/lock은 `0.2.23`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag의 원문 `v0.2.23`으로 발행한다. tag 생성·빌드·발행은 아직 실행하지 않았다.
+이전 릴리스 경계는 [`docs/release-0.2.23.md`](docs/release-0.2.23.md)에 남아 있다. 이번 root wheel/런타임/lock은 `0.2.24`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag 원문으로 발행한다. 이 문구 자체는 발행·배포 완료의 증거가 아니다.
 
 `GET /v1/health`와 `/v1/health/live`는 process liveness만 의미한다. `/v1/health/ready`는 MariaDB, Redis ping, migration ledger, Keystone service credentials를 모두 확인하고 하나라도 unavailable이면 `503`을 반환한다. 로그는 각 process의 표준 logging과 correlation ID에 남고, operation event 및 reconciliation drift는 MariaDB API 조회로 확인한다. health 결과·Stampede event는 Redis cache이므로 장애 시 최신 값이 없을 수 있다.
 
@@ -208,9 +212,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1c4dfbd6f551f637ecfab0dfc32f61208b7d0e32c26a66e7a07eb1ff1886dbd8",
-  "reviewed_at": "2026-09-26T10:03:24Z",
-  "summary": "Reviewed live-proven hotplug activation using final udev name in deferred RUN. Retained Ubuntu guest passed real detach/attach and reboot with provider-only default routing and K3s Ready; static SYSTEMD_WANTS alternative removed. No schema changes."
+  "source_sha256": "db8eb1151c2fb932c5fda58173c558bcbc17fbef7323e7f6e5816ba12dcb76ae",
+  "reviewed_at": "2026-09-26T13:08:00Z",
+  "summary": "0.2.24 provider routing and guest OCCM corrections reviewed; no schema/public API structure change; credential failure test includes public catalog prerequisite"
 }
 ```
 <!-- architecture-review:end -->

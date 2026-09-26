@@ -270,23 +270,61 @@ fi
     )
 
 
-def _k3s_pod_route_files(k3s_unit: str) -> list[dict]:
-    """Files that keep Pod-bound traffic on the main table for every K3s start.
+def _k3s_pod_route_files(k3s_unit: str, os_type: str) -> list[dict]:
+    """Keep Pod-bound traffic on the main table across network reconfiguration.
 
-    The K3s unit drop-in fails closed (ExecStartPre) and starts a watcher that
-    restores the rule when a network manager drops foreign policy rules.
+    K3s still fails closed on a missing rule; the watcher repairs transient loss.
     """
+    nm_rule = f"priority {K3S_POD_ROUTE_RULE_PRIORITY} to {K3S_CLUSTER_CIDR} table 254"
+    nm_ownership = """
+NM_RULE="__NM_RULE__"
+own_rule() {
+  local profile rules
+  . /etc/rancher/k3s/afterglow-primary-network.env || return 1
+  [ -n "${AFTERGLOW_K3S_PRIMARY_IFACE:-}" ] || return 1
+  profile="$(nmcli -g GENERAL.CON-UUID device show "${AFTERGLOW_K3S_PRIMARY_IFACE}")" || return 1
+  [ -n "${profile}" ] && [ "${profile}" != "--" ] || return 1
+  rules="$(nmcli -g ipv4.routing-rules connection show uuid "${profile}")" || return 1
+  rules="${rules//, /,}"
+  if [[ ",${rules}," != *",${NM_RULE},"* ]]; then
+    nmcli connection modify uuid "${profile}" +ipv4.routing-rules "${NM_RULE}" >/dev/null || return 1
+    nmcli device reapply "${AFTERGLOW_K3S_PRIMARY_IFACE}" >/dev/null || return 1
+  fi
+}
+""".replace("__NM_RULE__", nm_rule) if os_type == OS_TYPE_FCOS else ""
+    ownership_check = (
+        "own_rule || { echo '[afterglow-k3s-pod-route] "
+        "NetworkManager rule ownership failed' >&2; return 1; }"
+        if os_type == OS_TYPE_FCOS
+        else ""
+    )
+    if os_type == OS_TYPE_UBUNTU:
+        present = f"""present() {{
+  ip -4 -details rule show "${{RULE[@]}}" | grep -Fxq -- \
+    "$(printf '%s:\\tfrom all to %s lookup main proto kernel' {K3S_POD_ROUTE_RULE_PRIORITY} {K3S_CLUSTER_CIDR})"
+}}
+legacy() {{
+  ip -4 -details rule show "${{RULE[@]}}" | grep -Fxq -- \
+    "$(printf '%s:\\tfrom all to %s lookup main proto unspec' {K3S_POD_ROUTE_RULE_PRIORITY} {K3S_CLUSTER_CIDR})"
+}}
+"""
+        migrate = 'if legacy; then ip -4 rule del "${RULE[@]}" protocol unspec || return 1; fi'
+        protocol = "protocol kernel"
+    else:
+        present = 'present() { [ -n "$(ip -4 rule show "${RULE[@]}")" ]; }'
+        migrate = ""
+        protocol = ""
     script = f"""#!/bin/bash
 set -euo pipefail
 RULE=(priority {K3S_POD_ROUTE_RULE_PRIORITY} to {K3S_CLUSTER_CIDR} table main)
-
-present() {{
-  [ -n "$(ip -4 rule show "${{RULE[@]}}")" ]
-}}
+{nm_ownership}
+{present}
 
 ensure() {{
+  {ownership_check}
   if ! present; then
-    ip -4 rule add "${{RULE[@]}}" || true
+    {migrate}
+    ip -4 rule add "${{RULE[@]}}" {protocol} || true
   fi
   present || {{ echo "[afterglow-k3s-pod-route] Pod route rule is missing" >&2; return 1; }}
 }}
@@ -319,7 +357,7 @@ After={_K3S_POD_ROUTE_UNIT}
 [Service]
 ExecStartPre={_K3S_POD_ROUTE_SCRIPT} ensure
 """
-    return [
+    files = [
         {"path": _K3S_POD_ROUTE_SCRIPT, "content": script, "permissions": "0755"},
         {"path": f"/etc/systemd/system/{_K3S_POD_ROUTE_UNIT}", "content": unit, "permissions": "0644"},
         {
@@ -328,6 +366,7 @@ ExecStartPre={_K3S_POD_ROUTE_SCRIPT} ensure
             "permissions": "0644",
         },
     ]
+    return files
 
 
 def _build_fcos_nic_script() -> str:
@@ -516,7 +555,7 @@ WantedBy=multi-user.target
     for wf in extra_write_files:
         mode = int(wf.get("permissions", "0644"), 8)
         files.append(_ignition_file(wf["path"], wf["content"], mode=mode))
-    for wf in _k3s_pod_route_files("k3s.service"):
+    for wf in _k3s_pod_route_files("k3s.service", OS_TYPE_FCOS):
         files.append(_ignition_file(wf["path"], wf["content"], mode=int(wf["permissions"], 8)))
 
     files.extend(
@@ -603,7 +642,7 @@ WantedBy=multi-user.target
         _ignition_file("/etc/systemd/system/k3s-agent-join.service", join_unit, mode=0o644),
         *(
             _ignition_file(wf["path"], wf["content"], mode=int(wf["permissions"], 8))
-            for wf in _k3s_pod_route_files("k3s-agent.service")
+            for wf in _k3s_pod_route_files("k3s-agent.service", OS_TYPE_FCOS)
         ),
     ]
 
@@ -714,7 +753,7 @@ def generate_server_userdata(
         cluster_init=cluster_init,
         join_url=join_url or "",
         ha_node_token=ha_node_token or "",
-        pod_route_files=_k3s_pod_route_files("k3s.service"),
+        pod_route_files=_k3s_pod_route_files("k3s.service", OS_TYPE_UBUNTU),
     )
     yaml_str = _jinja.get_template("k3s_server.yaml.j2").render(**template_vars)
     verify_no_service_password(yaml_str)
@@ -773,7 +812,7 @@ def generate_agent_userdata(
         node_token=node_token,
         ssh_public_key=ssh_public_key or "",
         extra_agent_args=agent_args,
-        pod_route_files=_k3s_pod_route_files("k3s-agent.service"),
+        pod_route_files=_k3s_pod_route_files("k3s-agent.service", OS_TYPE_UBUNTU),
     )
     yaml_str = _jinja.get_template("k3s_agent.yaml.j2").render(**template_vars)
     verify_no_service_password(yaml_str)

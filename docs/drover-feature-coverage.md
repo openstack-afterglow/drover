@@ -46,7 +46,7 @@ graph TD
 - K3s API Server용 Floating IP (FIP) 및 Port 바인딩.
 - `allowed_cidrs` 지정을 통한 K3s API 접근 IP 제어.
 - 클러스터 생성의 `network_id`는 외부 Neutron 네트워크에 한정됩니다. 명시 값은 `k3s.default_network`와 같은 검증을 거치고, 생략 시 저장된 필수 정책을 조회·재검증합니다. 내부/공유 전용 네트워크나 누락·만료된 기본 정책은 DB 기록 전에 거부하며 Nova의 자동 네트워크 할당으로 넘어가지 않습니다. 유효한 ID는 cluster/job `network_id` 및 `resource_policy_snapshot["k3s.default_network"]`에 함께 기록되어 초기 서버, HA joiner, agent 및 nodegroup scale에 전달됩니다. [API admission](../drover/api/clusters.py), [카탈로그/검증](../drover/services/resource_policies.py), [policy store](../drover/services/resource_policy_store.py), [직접 VM 경로](../drover/services/provisioner.py), [nodegroup 경로](../drover/services/autoscale.py).
-- provider NIC의 `node-ip`·`flannel-iface`·server `advertise-address`는 생성 네트워크 metadata의 MAC을 기준으로 고정되며, 저장된 pin을 재사용하므로 내부 NIC 추가 후 재시작해도 바뀌지 않습니다. 추가 NIC는 Ubuntu에서 DHCP route/DNS 및 IPv6 RA를, FCOS에서 자동 route/DNS 및 IPv6를 차단합니다. Pod 응답은 priority 29999 `to 10.42.0.0/16 table main` 규칙과 watcher로 image-builder source-policy table을 우회합니다. [pin 및 FCOS 생성](../drover/services/cloudinit.py), [Ubuntu server](../drover/templates/k3s_server.yaml.j2), [Ubuntu agent](../drover/templates/k3s_agent.yaml.j2). 이 userdata 변경은 신규 노드에 적용하며 기존 노드를 자동 재작성하지 않습니다.
+- provider NIC의 `node-ip`·`flannel-iface`·server `advertise-address`는 생성 네트워크 metadata의 MAC을 기준으로 고정되며, 저장된 pin을 재사용하므로 내부 NIC 추가 후 재시작해도 바뀌지 않습니다. 추가 NIC는 Ubuntu에서 DHCP route/DNS 및 IPv6 RA를, FCOS에서 자동 route/DNS 및 IPv6를 차단합니다. Pod 응답용 priority 29999 `to 10.42.0.0/16 table main` 규칙은 K3s `ExecStartPre`가 보장하고 실패 시 시작하지 않으며 watcher가 일시적 손실을 복구합니다. Ubuntu는 해당 규칙만 `protocol kernel`로 지정해 networkd foreign-rule 정리에서 제외합니다(guest에서 watcher 중지 후 provider reconfigure 시 unmarked 삭제·kernel-marked 잔존을 확인); 다른 외부 규칙 수거 정책은 유지합니다. FCOS는 pin된 provider NIC NetworkManager 연결의 영속 `ipv4.routing-rules`(table 254)에 규칙을 등록·reapply합니다. 새 userdata를 통한 전체 cluster 재부팅, FCOS 실제 guest 재구성 및 Pod→API 연결은 아직 확인하지 않았습니다. [pin 및 FCOS 생성](../drover/services/cloudinit.py), [Ubuntu server](../drover/templates/k3s_server.yaml.j2), [Ubuntu agent](../drover/templates/k3s_agent.yaml.j2). 이 userdata 변경은 신규 노드에 적용하며 기존 노드를 자동 재작성하지 않습니다.
 - NIC hotplug handler는 모든 udev rule 처리 후 `RUN`에서 최종 `$name`을 사용해 `systemctl --no-block`으로 실행을 요청합니다. rename 전 커널 이름(`eth0`)에 설정을 쓰지 않으며, `ens8` 등 실제 보조 NIC에 route/DNS 차단이 적용됩니다. 정적인 udev rule 검사만으로 완료하지 않고 실제 hotplug·재부팅에서 확인합니다.
 
 ### 2.3 Cinder (Block Storage)
@@ -56,10 +56,13 @@ graph TD
 ### 2.4 Octavia (Load Balancing)
 - **K3s HA API Load Balancer**: Multi-master (`master_count=3`) 설정 시 K3s Control Plane API (Port 6443) HA 로드밸런서, Listener, Pool 및 Member 생성.
 - **OCCM (OpenStack Cloud Controller Manager)**: Kubernetes Ingress / Service Type LoadBalancer 수용 및 Octavia 로드밸런서 자동 동기화 (`drover_occm_enabled: true`).
+- OCCM이 활성화되면 server 설치 인자에 `--disable=servicelb`를 넣어 K3s 내장 ServiceLB와 같은 Service status를 경쟁적으로 갱신하지 않습니다. agent 설치 인자에도 `--kubelet-arg=cloud-provider=external`을 넣어 OCCM이 provider ID와 노드 주소를 초기화합니다.
+- 생성 provider 네트워크는 OCCM의 `internal-network-name`입니다. 같은 이름이 `k3s.occm_public_network`에도 지정돼 있으면 `public-network-name`을 생략합니다. OCCM의 public 분류는 기존 InternalIP를 삭제하므로 두 역할을 겹치게 렌더링하지 않습니다. 서로 다른 public network 정책과 floating-network 선택은 보존합니다.
 
 ### 2.5 Keystone (Identity & Access)
 - 사용자 요청 시 호출자의 `X-Auth-Token`을 검증하고 프로젝트 스코프를 확인합니다. 프로젝트 헤더가 없으면 제출된 토큰 범위를 보존합니다.
 - 서비스 자격으로 catalog의 `identity` internal endpoint를 해석하여 토큰 introspection, 명시적 rescope 및 관리자 역할 조회를 보냅니다. internal endpoint가 없거나 연결할 수 없으면 external/public endpoint로 fallback하지 않고 fail closed 합니다.
+- VM 내부 플러그인 렌더링은 별도 경계입니다. `provisioner._guest_plugin_settings`가 인증된 manager session에서 region별 `identity` public endpoint를 조회하고 guest-only Settings copy에 적용합니다. backend의 internal 설정과 resource snapshot은 보존하며, 플러그인 없는 생성은 catalog 조회를 하지 않습니다. 필요한 public endpoint가 없거나 URL이 잘못되면 자원 생성 전에 실패합니다.
 - 서비스 카탈로그 자동 등록 (`deploy/kolla/ansible/roles/drover/tasks/preconditions_keystone.yml`의 `name: drover`, `type: drover`).
 
 ### 2.6 Barbican & Manila (선택적 커스텀 연동)
@@ -88,7 +91,7 @@ drover wheel
         └── drover-migrate.json.j2# Pre-start Migration 컨테이너 템플릿
 ```
 
-소스 role은 `deploy/kolla/ansible/roles/drover`에 있으며 root `drover` wheel의 shared data로 설치됩니다. wheel 기본 설치는 Kolla-Ansible 및 API/Worker runtime dependencies를 포함하지 않으며 서비스 process에는 `drover[service]` extra가 필요합니다. `drover_image_tag` 기본값은 이번 릴리스 대상인 `v0.2.23`입니다(`defaults/main.yml`). 두 runtime 이미지가 GHCR에 실제로 발행되기 전에는 이 기본값으로 Kolla 배포를 진행하지 마십시오. `drover_source_version`은 별도 source-build pin으로 유지되며 SDK 버전(`0.2.21`)도 독립적입니다. 릴리스 경계는 [0.2.23 릴리스 노트](release-0.2.23.md)를 참조하십시오.
+소스 role은 `deploy/kolla/ansible/roles/drover`에 있으며 root `drover` wheel의 shared data로 설치됩니다. wheel 기본 설치는 Kolla-Ansible 및 API/Worker runtime dependencies를 포함하지 않으며 서비스 process에는 `drover[service]` extra가 필요합니다. `drover_image_tag` 기본값은 `v0.2.24`입니다(`defaults/main.yml`). 실제 GHCR 이미지 발행과 digest 확인 없이 소스 기본값만으로 배포 완료를 판단하지 않습니다. `drover_source_version`은 별도 source-build pin이고 SDK 버전(`0.2.21`)도 독립적입니다. 이전 릴리스 경계는 [0.2.23 릴리스 노트](release-0.2.23.md)에 보존합니다.
 
 ### Schema Readiness 및 Pre-start Migration
 - API 및 Worker 프로세스 시작 전, `drover-migrate` 컨테이너가 먼저 실행되어 `drover/migrations/manifest.txt` 및 `001_baseline.sql` 래저 체크섬을 검증하고 DB 마이그레이션을 안전하게 수행합니다.
@@ -106,6 +109,7 @@ drover wheel
 ### 4.2 인프라 동기화 (Reconciliation Loop)
 - **Worker Periodic Scan**: `drover-worker` 엔진은 설정된 주기(`drover_reconcile_interval`)마다 오픈스택 실제 자원(`ManagedOpenStackResource`) 상태와 DB의 원하는 클러스터 상태를 교차 검증합니다.
 - **Orphan & Drift Detection**: OpenStack 자원이 임의 삭제되었거나 갱신된 경우 `drift_status` 및 `last_reconciled_at` 필드를 업데이트하고 클러스터를 경고/ERROR 상태로 전환합니다.
+- **Application Credential 소유자**: worker가 사용하는 project manager의 `current_user_id`와 기록된 credential ID를 함께 SDK에 전달합니다. Keystone 404는 missing drift이고 인증·연결 장애는 missing으로 숨기지 않습니다. 이 변경은 DB schema나 외부 API를 바꾸지 않습니다.
 
 ### 4.3 Stampede 오토스케일링 (Autoscaling)
 - **메트릭 기반 스케일링**: Stampede 엔진이 K3s 에이전트 노드그룹의 부하를 감지하여 자동으로 `Scale Out` 또는 `Scale In`을 트리거합니다.

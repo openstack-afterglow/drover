@@ -74,18 +74,107 @@ def test_k3s_unit_cannot_start_without_pod_route_rule(role: str, k3s_unit: str, 
 
 
 _FAKE_IP = """#!/bin/bash
-# Stateful `ip -4 rule show|add SELECTOR` emulation backed by $RULES.
-[ "$1" = -4 ] && [ "$2" = rule ] || exit 2
-op="$3"; shift 3
+# Stateful ip-rule emulation: show, add and exact delete use $RULES.
+[ "$1" = -4 ] || exit 2
+shift
+if [ "$1" = -details ]; then
+  shift
+  [ "$1" = rule ] && [ "$2" = show ] || exit 2
+  while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    case "$rule" in
+      'priority 29999 to 10.42.0.0/16 table main protocol kernel')
+        printf '29999:\\tfrom all to 10.42.0.0/16 lookup main proto kernel\\n' ;;
+      'priority 29999 to 10.42.0.0/16 table main protocol unspec')
+        printf '29999:\\tfrom all to 10.42.0.0/16 lookup main proto unspec\\n' ;;
+    esac
+  done < "$RULES"
+  exit 0
+fi
+[ "$1" = rule ] || exit 2
+op="$2"; shift 2
 case "$op" in
   show) grep -Fx -- "$*" "$RULES" || true ;;
   add)
     [ -z "${FAIL_ADD:-}" ] || exit 1
     grep -Fxq -- "$*" "$RULES" && exit 2
     printf '%s\\n' "$*" >> "$RULES" ;;
+  del)
+    grep -Fxq -- "$*" "$RULES" || exit 1
+    grep -Fxv -- "$*" "$RULES" > "${RULES}.tmp" || true
+    mv "${RULES}.tmp" "$RULES" ;;
   *) exit 2 ;;
 esac
 """
+
+_FAKE_NMCLI = """#!/bin/bash
+case "$*" in
+  "-g GENERAL.CON-UUID device show ens3") printf '%s\\n' "$PROFILE_UUID" ;;
+  "-g ipv4.routing-rules connection show uuid $PROFILE_UUID") cat "$NM_RULES" ;;
+  "connection modify uuid $PROFILE_UUID +ipv4.routing-rules priority 29999 to 10.42.0.0/16 table 254")
+    [ -z "${FAIL_NM:-}" ] || exit 1
+    printf '%s\\n' 'priority 29999 to 10.42.0.0/16 table 254' >> "$NM_RULES" ;;
+  "device reapply ens3")
+    [ -s "$NM_RULES" ] || exit 1
+    printf '%s\\n' 'priority 29999 to 10.42.0.0/16 table main' > "$RULES" ;;
+  *) exit 2 ;;
+esac
+"""
+
+
+def test_fcos_provider_profile_owns_pod_rule_across_reconfigure(tmp_path: Path) -> None:
+    files = _render("agent", "fcos")
+    pin_state = tmp_path / "afterglow-primary-network.env"
+    pin_state.write_text("AFTERGLOW_K3S_PRIMARY_IFACE=ens3\n")
+    script = tmp_path / "pod-route.sh"
+    script.write_text(files[_SCRIPT][0].replace("/etc/rancher/k3s/afterglow-primary-network.env", str(pin_state)))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name, content in (("ip", _FAKE_IP), ("nmcli", _FAKE_NMCLI)):
+        binary = fake_bin / name
+        binary.write_text(content)
+        binary.chmod(0o755)
+    rules = tmp_path / "rules"
+    rules.write_text("")
+    nm_rules = tmp_path / "nm-rules"
+    nm_rules.write_text("")
+    profile_uuid = "12345678-1234-1234-1234-123456789abc"
+    env = os.environ | {
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "RULES": str(rules),
+        "NM_RULES": str(nm_rules),
+        "PROFILE_UUID": profile_uuid,
+    }
+
+    def ensure(**extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["bash", str(script), "ensure"], env=env | extra, capture_output=True, text=True)
+
+    assert ensure().returncode == 0
+    assert ensure().returncode == 0
+    assert nm_rules.read_text().splitlines() == ["priority 29999 to 10.42.0.0/16 table 254"]
+    assert rules.read_text().splitlines() == ["priority 29999 to 10.42.0.0/16 table main"]
+
+    retained_rules = (
+        "priority 30000 from 192.0.2.10/32 table 100, "
+        "priority 29999 to 10.42.0.0/16 table 254\n"
+    )
+    nm_rules.write_text(retained_rules)
+    assert ensure().returncode == 0
+    assert nm_rules.read_text() == retained_rules
+
+    rules.write_text("")  # Kernel state lost on reboot; persistent provider profile survives.
+    reapplied = subprocess.run(["nmcli", "device", "reapply", "ens3"], env=env, capture_output=True)
+    assert reapplied.returncode == 0
+    assert rules.read_text().splitlines() == ["priority 29999 to 10.42.0.0/16 table main"]
+
+    nm_rules.write_text("")
+    failed = ensure(FAIL_NM="1")
+    assert failed.returncode != 0  # An orphaned kernel rule cannot permit K3s start.
+    assert "NetworkManager rule ownership failed" in failed.stderr
+
+    nm_rules.write_text("priority 29999 to 10.42.0.0/16 table 254\n")
+    pin_state.write_text("AFTERGLOW_K3S_PRIMARY_IFACE=ens8\n")
+    assert ensure().returncode != 0  # Never attach the rule to a secondary NIC profile.
 
 
 def test_pod_route_ensure_is_idempotent_and_fails_closed(tmp_path: Path) -> None:
@@ -104,7 +193,16 @@ def test_pod_route_ensure_is_idempotent_and_fails_closed(tmp_path: Path) -> None
 
     assert ensure().returncode == 0
     assert ensure().returncode == 0
-    assert rules.read_text().splitlines() == ["priority 29999 to 10.42.0.0/16 table main"]
+    marked = "priority 29999 to 10.42.0.0/16 table main protocol kernel"
+    assert rules.read_text().splitlines() == [marked]
+
+    # Only the original unmarked Pod rule is replaced; other policy rules survive.
+    other = "priority 30000 from 192.0.2.10/32 table 100"
+    rules.write_text(f"{other}\npriority 29999 to 10.42.0.0/16 table main protocol unspec\n")
+    assert ensure().returncode == 0
+    assert rules.read_text().splitlines() == [other, marked]
+    assert ensure().returncode == 0
+    assert rules.read_text().splitlines() == [other, marked]
 
     rules.write_text("")
     failed = ensure(FAIL_ADD="1")

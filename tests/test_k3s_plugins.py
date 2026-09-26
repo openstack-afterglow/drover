@@ -2,8 +2,10 @@
 
 import base64
 import gzip
+from configparser import ConfigParser
 from unittest.mock import MagicMock
 
+import pytest
 import yaml
 
 
@@ -98,6 +100,28 @@ def test_occm_cloud_conf_sections_contains_global():
     assert "tenant-id=proj-1" in result
     assert "password" not in result
     assert "username" not in result
+
+
+@pytest.mark.parametrize("primary_network", ["external", "tenant"])
+def test_occm_preserves_primary_internal_ip_when_public_policy_overlaps(primary_network):
+    from drover.services.plugins.occm import OccmPlugin
+
+    config = ConfigParser()
+    config.read_string(
+        OccmPlugin().cloud_conf_sections(
+            "proj-1",
+            _base_settings(drover_occm_enabled=True),
+            internal_network_name=primary_network,
+            app_credential=_FAKE_APP_CRED,
+        )
+    )
+    networking = config["Networking"]
+    assert networking["internal-network-name"] == primary_network
+    if primary_network == "external":
+        # OCCM removes InternalIP when this network is also classified as public.
+        assert "public-network-name" not in networking
+    else:
+        assert networking["public-network-name"] == "external"
 
 
 def test_occm_cloud_conf_missing_app_cred_raises():

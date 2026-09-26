@@ -146,6 +146,7 @@ async def test_3_create_failure_before_provision_call():
     conn_mock = MagicMock()
     conn_mock.compute.create_server = MagicMock()
     conn_mock.network.subnets = MagicMock(return_value=[MagicMock(id="sub-1")])
+    conn_mock.session.get_endpoint.return_value = "https://keystone.example.com/v3"
 
     mock_s = _mock_settings()
     payload = {
