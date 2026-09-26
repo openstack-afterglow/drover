@@ -6,7 +6,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: `drover==0.2.24`, `drover-sdk==0.2.21` (별도 SDK 버전)
+- 패키지: `drover==0.2.25`, `drover-sdk==0.2.21` (별도 SDK 버전)
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -82,7 +82,7 @@ Ubuntu·FCOS의 udev NIC add rule은 모든 rule 처리 후 평가되는 `RUN`�
 
 게스트 플러그인의 인증 URL은 `provisioner.py:_guest_plugin_settings`가 인증된 manager connection의 region별 `identity` public catalog endpoint로 선택한다. backend의 internal 인증 설정은 바꾸지 않고 guest-only Settings copy와 기존 resource snapshot을 사용한다. 활성 플러그인이 없으면 조회하지 않으며, public endpoint 누락·잘못된 URL은 OpenStack 자원 생성 전에 거부한다. OCCM은 `--disable=servicelb`로 K3s LoadBalancer controller와 경쟁하지 않으며 server뿐 아니라 agent에도 external cloud-provider 인자를 적용한다. provider 네트워크가 public-network 정책과 같으면 OCCM의 public 분류를 생략해 원래 provider 주소를 `InternalIP`로 유지한다. 정책상 floating-network 선택은 그대로다. source: `drover/services/plugins/occm.py`, `drover/services/provisioner.py`; 상세 계약은 feature coverage의 Octavia·Keystone 절에 있다.
 
-OCCM은 표시 이름이 아니라 불변 cluster ID를 `--cluster-name`으로 받는다. 따라서 Service LB 이름은 `kube_service_<cluster_id>_<namespace>_<service>`, 설명은 `Kubernetes external service <namespace>/<service> from cluster <cluster_id>`가 된다. 이 LB는 Drover inventory에 기록되지 않으므로 `deletion.py`는 모든 VM 삭제 후 `octavia.delete_occm_service_load_balancers`로 이 prefix와 설명이 모두 일치하는 LB만 cascade 삭제한다. VM이 없으므로 OCCM이 다시 만들 수 없고, 대기 중인 LB는 Octavia가 ACTIVE/ERROR로 정리할 때까지 기다린다. 같은 VIP port의 floating IP는 OCCM 생성 설명과 일치할 때만 먼저 삭제하며 사용자가 지정한 FIP와 다른 cluster의 LB는 건드리지 않는다. 한 LB의 실패는 나머지 정리를 막지 않으며 기존 삭제 단계처럼 경고로 남는다. octavia-ingress-controller의 LB는 이 cleanup 범위가 아니다.
+OCCM은 표시 이름이 아니라 불변 cluster ID를 `--cluster-name`으로 받는다. 따라서 Service LB 이름은 `kube_service_<cluster_id>_<namespace>_<service>`, 설명은 `Kubernetes external service <namespace>/<service> from cluster <cluster_id>`가 된다. 이 LB는 Drover inventory에 기록되지 않으므로 `deletion.py`는 모든 VM 삭제 후 `octavia.delete_occm_service_load_balancers`로 이 prefix와 설명이 모두 일치하는 LB만 cascade 삭제한다. VM이 없으므로 OCCM이 다시 만들 수 없고, 대기 중인 LB는 Octavia가 ACTIVE/ERROR로 정리할 때까지 기다린다. 같은 VIP port의 floating IP는 OCCM 생성 설명과 일치하고 OCCM도 그 LB와 함께 삭제했을 경우에만 먼저 삭제한다. OCCM은 Service에 `loadbalancer.openstack.org/keep-floatingip: "true"`가 있으면 FIP를 남기고 이 의사는 Kubernetes에만 있으므로, `deletion.py`는 노드·VM을 건드리기 전에 이 cluster의 OCCM LB가 있으면 admin kubeconfig로 모든 namespace의 Service annotation을 읽는다(`kube.list_service_annotations`). LB를 쓰는 Service(이름이 가리키는 생성자, `load-balancer-id` annotation의 공유자) 중 하나라도 keep을 요청하면 FIP를 남긴다. Kubernetes를 읽지 못했거나 LB의 Service가 스냅샷에 없으면 의사를 알 수 없으므로 역시 남기며, LB 삭제는 연결만 해제한다. 사용자가 지정한 FIP와 다른 cluster의 LB는 건드리지 않는다. 한 LB의 실패는 나머지 정리를 막지 않으며 기존 삭제 단계처럼 경고로 남는다. octavia-ingress-controller의 LB는 이 cleanup 범위가 아니다.
 
 HA joiner(server 2·3)는 `cloud.conf`를 다시 렌더링하지 않는다(`bootstrap_ha_servers`의 `cloud_conf=None`). Drover는 cluster application credential의 secret을 저장하지 않으므로 OCCM 설정을 다시 만들 수 없고, OCCM·Cinder CSI·Barbican KMS manifest는 server 1이 한 번 만든 `kube-system/cloud-config` Secret을 읽는다. joiner도 같은 plugin server 인자(`--disable=servicelb` 등)와 guest-only public identity Settings를 사용한다. `tests/test_provisioner_agents.py::test_occm_ha_joiners_boot_from_cluster_secret_without_app_credential`가 이 계약을 정의하며 live HA 클러스터로는 검증하지 않았다.
 
@@ -143,9 +143,9 @@ FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 �
 - `drover-sdk`: `sdk/`의 독립 Python package이며 API/Worker process에 import되어야 하는 내부 module이 아니다.
 - `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
 - 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
-- Kolla role의 `drover_image_tag`은 `v0.2.24`다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 이미지의 실제 발행과 immutable digest 확인은 이 소스 기본값과 별도로 검증한다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
+- Kolla role의 `drover_image_tag`은 `v0.2.25`다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 이미지의 실제 발행과 immutable digest 확인은 이 소스 기본값과 별도로 검증한다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
 
-릴리스 변경과 검증 경계는 [`docs/release-0.2.24.md`](docs/release-0.2.24.md)에 정리한다. 이전 릴리스는 [`docs/release-0.2.23.md`](docs/release-0.2.23.md)에 남아 있다. root wheel/런타임/lock은 `0.2.24`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag 원문으로 발행한다. 이 문구 자체는 발행·배포 완료의 증거가 아니다.
+릴리스 변경과 검증 경계는 [`docs/release-0.2.25.md`](docs/release-0.2.25.md)에 정리한다. 이전 릴리스는 [`docs/release-0.2.24.md`](docs/release-0.2.24.md)에 남아 있다. root wheel/런타임/lock은 `0.2.25`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag 원문으로 발행한다. 이 문구 자체는 발행·배포 완료의 증거가 아니다.
 
 `GET /v1/health`와 `/v1/health/live`는 process liveness만 의미한다. `/v1/health/ready`는 MariaDB, Redis ping, migration ledger, Keystone service credentials를 모두 확인하고 하나라도 unavailable이면 `503`을 반환한다. 로그는 각 process의 표준 logging과 correlation ID에 남고, operation event 및 reconciliation drift는 MariaDB API 조회로 확인한다. health 결과·Stampede event는 Redis cache이므로 장애 시 최신 값이 없을 수 있다.
 
@@ -180,7 +180,7 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 - migration: `uv run drover-migrate --apply`
 - architecture snapshot: `python3 scripts/check_architecture.py`
 
-2026-09-26 로컬 `uv run pytest tests`는 676건 통과·3건 skip(약 15초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. 같은 날 `uv --directory sdk run pytest`는 111건 통과했다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
+2026-09-27 로컬 `uv run pytest tests`는 679건 통과·3건 skip(약 13초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. 같은 날 `uv --directory sdk run pytest`는 111건 통과했다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
 
 GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규정과 기준선은 [`AGENTS.md`](AGENTS.md)의 CI 절에 있다. 계약은 trigger 집합(`docker-build.yml` push 필터는 `branches`·`tags`만), fail-closed 발행 게이트(`docker-build.yml`에서 `test`를 뺀 잡 중 `packages: write`·`write-all` 권한(job 또는 상속한 workflow 수준), `docker/login-action`, literal `false`가 아닌 `push`의 `docker/build-push-action` 중 하나라도 있는 모든 잡의 `needs`에 `test`, 그 잡들과 `test`의 job-level `if`·`continue-on-error` 금지, `ci.yml` 잡·스텝의 `continue-on-error` 금지), `ci.yml` 잡·스텝의 `if`와 잡 간 `needs` 금지, PR 코드를 실행하는 workflow의 `ubuntu-*` runner·`permissions: contents: read`·job-level `permissions`/`environment`/`secrets` 금지·`secrets.GITHUB_TOKEN` 외 secret 참조 금지, `service`의 checkout 다음 첫 스텝인 architecture check와 `uv run pytest tests`, 빌드한 두 이미지의 Trivy 스캔, 서비스 health-check의 2초 이하 interval과 30초 이상 window(start-period + interval×retries)를 포함한다.
 
@@ -216,9 +216,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "4e904445d7568c04e0657aaebdffc4bebd3a82f15d3196eafcf22e2fc8e0f702",
-  "reviewed_at": "2026-09-26T14:54:50Z",
-  "summary": "0.2.24 release candidate: live-verified Ubuntu provider routing, OCCM LB lifecycle and deletion; HA joiners reuse the cloud-config Secret; release notes added; no schema/public API change"
+  "source_sha256": "325e70a5501cfbe6656b9a098a5652b4f62be2f08f3bf9a4fab2b1442cd0df7c",
+  "reviewed_at": "2026-09-26T18:00:26Z",
+  "summary": "0.2.25: cluster deletion reads every Service's annotations before touching nodes/VMs (kube.list_service_annotations) and the OCCM LB cleanup keeps floating IPs whose creator or load-balancer-id sharer set keep-floatingip, or whose intent is unknown; release notes and versions; no schema/public API change"
 }
 ```
 <!-- architecture-review:end -->

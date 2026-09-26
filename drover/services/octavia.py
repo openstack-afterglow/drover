@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 from openstack import exceptions as openstack_exceptions
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     import openstack
 
 _logger = logging.getLogger(__name__)
@@ -19,6 +21,10 @@ _logger = logging.getLogger(__name__)
 _OCCM_LB_SETTLE_TIMEOUT_SECONDS = 900
 _OCCM_LB_SETTLE_INTERVAL_SECONDS = 5
 _K8S_SERVICE = r"[a-z0-9-]+/[a-z0-9-]+"
+# OCCM keeps a Service LB's floating IP only when this annotation is exactly "true"; any other value means false.
+_OCCM_KEEP_FLOATING_IP = "loadbalancer.openstack.org/keep-floatingip"
+# OCCM records its LB on every Service it serves, including the Service whose name the LB carries.
+_OCCM_LOAD_BALANCER_ID = "loadbalancer.openstack.org/load-balancer-id"
 
 def _lb_to_dict(lb) -> dict:
     prov = getattr(lb, "provisioning_status", "") or ""
@@ -178,32 +184,66 @@ def _wait_load_balancer_mutable(conn: openstack.connection.Connection, lb_id: st
         time.sleep(_OCCM_LB_SETTLE_INTERVAL_SECONDS)
 
 
-def delete_occm_service_load_balancers(
+def list_occm_service_load_balancers(
     conn: openstack.connection.Connection, project_id: str, cluster_id: str
-) -> list[str]:
-    """Delete one cluster's OCCM Service LBs and the floating IPs OCCM allocated for them.
+) -> list[tuple[object, str]]:
+    """Return ``(lb, "namespace/service")`` for each of one cluster's OCCM Service LBs.
 
-    OCCM runs with ``--cluster-name=<cluster ID>``, so the name prefix and exact description select only this
-    cluster. Call after the cluster VMs are gone so OCCM cannot recreate a deleted LB. User-supplied floating IPs
-    and LBs without the OCCM description are left untouched.
+    OCCM runs with ``--cluster-name=<cluster ID>``, so the name prefix and exact description select only this cluster.
     """
-    suffix = f" from cluster {re.escape(cluster_id)}"
-    lb_description = re.compile(rf"Kubernetes external service {_K8S_SERVICE}{suffix}")
-    fip_description = re.compile(rf"Floating IP for Kubernetes external service {_K8S_SERVICE}{suffix}")
+    description = re.compile(
+        rf"Kubernetes external service (?P<service>{_K8S_SERVICE}) from cluster {re.escape(cluster_id)}"
+    )
     name_prefix = f"kube_service_{cluster_id}_"
-    owned = [
-        lb
-        for lb in conn.load_balancer.load_balancers(project_id=project_id)
-        if (lb.name or "").startswith(name_prefix) and lb_description.fullmatch(lb.description or "")
-    ]
+    owned = []
+    for lb in conn.load_balancer.load_balancers(project_id=project_id):
+        match = description.fullmatch(lb.description or "")
+        if match and (lb.name or "").startswith(name_prefix):
+            owned.append((lb, match["service"]))
+    return owned
+
+
+def _occm_keeps_floating_ip(lb_id: str, service: str, services: Mapping[str, Mapping[str, str]] | None) -> bool:
+    """Decide as OCCM would for an LB that loses every Service at once; unknown intent keeps the floating IP.
+
+    OCCM keeps the floating IP when the Service whose deletion removes the LB asks for it. With the cluster gone, the
+    creator (by name) and every sharer (by load-balancer-id) go together, so any of them asking wins. ``services`` is
+    ``None`` when Kubernetes could not be read; an LB without a captured Service is equally unknown.
+    """
+    owners = [a for key, a in (services or {}).items() if key == service or a.get(_OCCM_LOAD_BALANCER_ID) == lb_id]
+    return not owners or any(a.get(_OCCM_KEEP_FLOATING_IP) == "true" for a in owners)
+
+
+def delete_occm_service_load_balancers(
+    conn: openstack.connection.Connection,
+    project_id: str,
+    cluster_id: str,
+    *,
+    services: Mapping[str, Mapping[str, str]] | None,
+) -> list[str]:
+    """Delete one cluster's OCCM Service LBs and the floating IPs OCCM would have deleted with them.
+
+    Call after the cluster VMs are gone so OCCM cannot recreate a deleted LB. ``services`` maps ``namespace/name`` to
+    the annotations read before the cluster was destroyed. A floating IP its Services asked OCCM to keep, or whose
+    intent is unknown, stays allocated; deleting the LB only detaches it. User-supplied floating IPs and LBs without
+    the OCCM description are left untouched.
+    """
+    fip_description = re.compile(
+        rf"Floating IP for Kubernetes external service {_K8S_SERVICE} from cluster {re.escape(cluster_id)}"
+    )
     deleted: list[str] = []
     failures: list[str] = []
-    for lb in owned:
+    for lb, service in list_occm_service_load_balancers(conn, project_id, cluster_id):
         try:
             _wait_load_balancer_mutable(conn, lb.id)
             if lb.vip_port_id:
+                keep = _occm_keeps_floating_ip(lb.id, service, services)
                 for fip in list(conn.network.ips(port_id=lb.vip_port_id, project_id=project_id)):
-                    if fip_description.fullmatch(fip.description or ""):
+                    if not fip_description.fullmatch(fip.description or ""):
+                        continue
+                    if keep:
+                        _logger.info("OCCM Service LB %s: keeping floating IP %s of %s", lb.id, fip.id, service)
+                    else:
                         conn.network.delete_ip(fip.id, ignore_missing=True)
             delete_load_balancer(conn, lb.id, cascade=True)
             wait_load_balancer_deleted(conn, lb.id)
