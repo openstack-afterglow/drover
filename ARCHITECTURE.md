@@ -24,7 +24,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 | Afterglow provisioning intent/GPU admission 연동 | partial | source-reviewed, test-defined | 일반 create는 Drover가 직접 Nova/Cinder 등을 호출하고 intent/admission은 특정 Stampede 경로다 | `drover/services/afterglow.py`, `drover/services/stampede.py`, `tests/test_afterglow_admission.py`, `tests/test_afterglow_provisioning.py` |
 | legacy `gpu_quotas` 제거 | partial | source-reviewed, test-defined | 역사적 `001_baseline.sql` 테이블은 아직 물리 삭제하지 않았고 조건부 runbook만 있다 | `drover/migrations/001_baseline.sql`, `drover/migrations/README.md`, `docs/gpu-quota-table-retirement-runbook.md` |
 
-위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-24 로컬 FastAPI `0.141.1`/Starlette `1.6.0` 기준 `uv run pytest tests`는 652건 통과·3건 skip이었고(architecture guard 13건 포함) `uv --directory sdk run pytest`는 111건 통과했다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
+위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-26 로컬 FastAPI `0.141.1`/Starlette `1.6.0` 기준 `uv run pytest tests`는 655건 통과·3건 skip이었고(architecture guard 13건 포함), 2026-09-24 `uv --directory sdk run pytest`는 111건 통과했다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
 
 ## System context
 
@@ -71,6 +71,8 @@ graph LR
 5. agent job이 완료되면 cluster가 `ACTIVE`가 되고 create operation이 `SUCCEEDED`가 된다. callback 실패·누락·30분 timeout은 operation/cluster를 실패 처리한다.
 
 선택한 `key_name`은 API admission에서 요청자 connection으로 공개키를 조회·검증한 뒤 기존 cluster/job `ssh_public_key`에 snapshot으로 저장한다. Worker는 tenant manager 계정으로 Nova를 호출하므로 caller의 keypair 이름을 전달하지 않는다. primary·HA server 및 agent의 Ubuntu cloud-init/FCOS Ignition이 같은 공개키를 설치한다. API/worker가 모두 새 버전이어야 이 계약을 보장하며, named-key job/cluster에 snapshot이 없는 구 데이터는 fail-closed 처리한다. 새 schema나 manager 키페어 리소스는 추가하지 않는다.
+
+모든 primary·HA server와 agent userdata(Ubuntu cloud-init, FCOS Ignition)는 `drover/services/cloudinit.py:_k3s_pod_route_files`가 만든 script(`/usr/local/sbin/afterglow-k3s-pod-route.sh`), watcher unit(`afterglow-k3s-pod-route.service`), K3s unit drop-in(`k3s.service.d` 또는 `k3s-agent.service.d/10-afterglow-pod-route.conf`)을 설치한다. image-builder `pbrutil`의 source-address rule(priority 30000)이 가리키는 NIC별 table에는 CNI route가 없어서, node 주소에서 Pod(`10.42.0.0/16`)로 가는 응답이 cni0/flannel 대신 NIC gateway로 나가고 Pod→`kubernetes` Service/API 연결이 timeout된다. drop-in은 K3s가 시작될 때마다 `ExecStartPre`로 priority 29999 `to 10.42.0.0/16 table main` rule을 보장하고 보장하지 못하면 K3s를 시작하지 않는다. watcher는 network manager가 foreign policy rule을 지우면 5초 안에 복원한다. Drover는 `--cluster-cidr`를 바꾸지 않으므로 K3s 기본 Pod CIDR만 대상으로 한다. `tests/test_k3s_pod_route.py`가 네 node 유형의 설치와 ensure의 멱등·fail-closed 계약을 정의한다.
 
 ### Reconnection, idempotency, scale/delete
 
@@ -164,7 +166,7 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 - migration: `uv run drover-migrate --apply`
 - architecture snapshot: `python3 scripts/check_architecture.py`
 
-2026-09-24 로컬 `uv run pytest tests`는 652건 통과·3건 skip(약 12초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. 같은 날 `uv --directory sdk run pytest`는 111건 통과했다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
+2026-09-26 로컬 `uv run pytest tests`는 655건 통과·3건 skip(약 12초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. 2026-09-24 `uv --directory sdk run pytest`는 111건 통과했다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
 
 GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규정과 기준선은 [`AGENTS.md`](AGENTS.md)의 CI 절에 있다. 계약은 trigger 집합(`docker-build.yml` push 필터는 `branches`·`tags`만), fail-closed 발행 게이트(`docker-build.yml`에서 `test`를 뺀 잡 중 `packages: write`·`write-all` 권한(job 또는 상속한 workflow 수준), `docker/login-action`, literal `false`가 아닌 `push`의 `docker/build-push-action` 중 하나라도 있는 모든 잡의 `needs`에 `test`, 그 잡들과 `test`의 job-level `if`·`continue-on-error` 금지, `ci.yml` 잡·스텝의 `continue-on-error` 금지), `ci.yml` 잡·스텝의 `if`와 잡 간 `needs` 금지, PR 코드를 실행하는 workflow의 `ubuntu-*` runner·`permissions: contents: read`·job-level `permissions`/`environment`/`secrets` 금지·`secrets.GITHUB_TOKEN` 외 secret 참조 금지, `service`의 checkout 다음 첫 스텝인 architecture check와 `uv run pytest tests`, 빌드한 두 이미지의 Trivy 스캔, 서비스 health-check의 2초 이하 interval과 30초 이상 window(start-period + interval×retries)를 포함한다.
 
@@ -180,7 +182,7 @@ GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규
 | API route, auth, response/event | `drover/main.py`, 해당 `drover/api/*.py`, `docs/drover-api-v1-reference.md` | project ownership, `/v1` path, `tests/test_openapi_contract.py`/해당 API test, 이 문서 Code map·Data and contracts |
 | create/scale/delete/nodegroup job | `drover/services/jobs.py`, `operations.py`, `provisioner.py`, `autoscale.py` | transaction/lease/status/idempotency 설명, durable/operation tests, Runtime flows |
 | OpenStack resource or plugin | adapter in `drover/services/`, `provisioner.py`, `drover/models/orm.py` | inventory/reconciliation, migration SQL, security/deployment sections와 관련 tests |
-| callback/cloud-init/token | `drover/api/callback.py`, `drover/services/store.py`, `redis_store.py`, cloud-init templates | CIDR/TTL/one-time contract, `tests/test_k3s_callback.py`, Security boundaries |
+| callback/cloud-init/token | `drover/api/callback.py`, `drover/services/store.py`, `redis_store.py`, cloud-init templates | CIDR/TTL/one-time contract, `tests/test_k3s_callback.py`, node network bootstrap(`tests/test_k3s_network_pinning.py`, `tests/test_k3s_pod_route.py`), Security boundaries |
 | Stampede/GPU/Afterglow boundary | `drover/services/stampede.py`, `afterglow.py`, `docs/afterglow-service-integration.md` | current intent/admission scope, `tests/test_k3s_stampede.py`, `tests/test_afterglow_*`, feature coverage |
 | schema, migration, durable model | `drover/models/orm.py`, `drover/migrations/`, `drover/scripts/migrate.py` | migration ledger/readiness, `tests/test_durable_create.py`, Deployment and operations |
 | SDK/catalog | `sdk/drover_sdk/service.py`, `sdk/drover_sdk/proxy.py`, `sdk/pyproject.toml` | `/v1` and alias wording, `sdk/tests/test_proxy.py`, docs catalog sections |
@@ -200,9 +202,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "af96367bdf463119267af93bd70008896104d6a9af2b77e42a413e189b2ebada",
-  "reviewed_at": "2026-09-24T16:32:46Z",
-  "summary": "Reviewed 0.2.23 root/runtime/lock and Kolla release defaults; removed incidental version/source pins while retaining installed-wheel ownership coverage. No service structure change."
+  "source_sha256": "6d970fba4f0ff33ab4dc3d740104bcaa9779c231863e349958c4e0960e3d6a8c",
+  "reviewed_at": "2026-09-26T08:09:30Z",
+  "summary": "Reviewed cloudinit.py and K3s server/agent templates: every Ubuntu/FCOS node now installs a Pod reply-route script, watcher unit, and K3s unit drop-in that keeps 10.42.0.0/16 on the main table ahead of image pbrutil source rules (priority 30000). No API, schema, or deployment topology change."
 }
 ```
 <!-- architecture-review:end -->

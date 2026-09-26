@@ -11,6 +11,13 @@ packages:
   - jq
 
 write_files:
+{% for wf in pod_route_files %}
+  - path: {{ wf.path }}
+    permissions: "{{ wf.permissions }}"
+    content: |
+{{ wf.content | indent(6, first=True) }}
+
+{% endfor %}
   - path: /opt/k3s/pin-primary-network.sh
     permissions: "0750"
     content: |

@@ -26,6 +26,16 @@ OS_TYPE_UBUNTU = "ubuntu"
 OS_TYPE_FCOS = "fcos"
 VALID_OS_TYPES = {OS_TYPE_UBUNTU, OS_TYPE_FCOS}
 
+# K3s default Pod CIDR (Drover does not override --cluster-cidr).
+K3S_CLUSTER_CIDR = "10.42.0.0/16"
+# Guest images may install source-address policy rules for multi-NIC routing
+# (image-builder pbrutil: priority 30000). Their per-NIC tables omit CNI routes, so
+# Pod-bound replies from a node address leave through the NIC gateway instead of
+# cni0/flannel. This rule must be evaluated before those source rules.
+K3S_POD_ROUTE_RULE_PRIORITY = 29999
+_K3S_POD_ROUTE_SCRIPT = "/usr/local/sbin/afterglow-k3s-pod-route.sh"
+_K3S_POD_ROUTE_UNIT = "afterglow-k3s-pod-route.service"
+
 
 class UserdataResult(NamedTuple):
     """cloud-init 또는 Ignition userdata 렌더링 결과."""
@@ -260,6 +270,66 @@ fi
     )
 
 
+def _k3s_pod_route_files(k3s_unit: str) -> list[dict]:
+    """Files that keep Pod-bound traffic on the main table for every K3s start.
+
+    The K3s unit drop-in fails closed (ExecStartPre) and starts a watcher that
+    restores the rule when a network manager drops foreign policy rules.
+    """
+    script = f"""#!/bin/bash
+set -euo pipefail
+RULE=(priority {K3S_POD_ROUTE_RULE_PRIORITY} to {K3S_CLUSTER_CIDR} table main)
+
+present() {{
+  [ -n "$(ip -4 rule show "${{RULE[@]}}")" ]
+}}
+
+ensure() {{
+  if ! present; then
+    ip -4 rule add "${{RULE[@]}}" || true
+  fi
+  present || {{ echo "[afterglow-k3s-pod-route] Pod route rule is missing" >&2; return 1; }}
+}}
+
+case "${{1:-}}" in
+  ensure) ensure ;;
+  watch)
+    while :; do
+      ensure || true
+      sleep 5
+    done
+    ;;
+  *) echo "usage: $0 ensure|watch" >&2; exit 2 ;;
+esac
+"""
+    unit = f"""[Unit]
+Description=Afterglow K3s Pod reply routing rule
+
+[Service]
+Type=exec
+ExecStartPre={_K3S_POD_ROUTE_SCRIPT} ensure
+ExecStart={_K3S_POD_ROUTE_SCRIPT} watch
+Restart=always
+RestartSec=5
+"""
+    dropin = f"""[Unit]
+Wants={_K3S_POD_ROUTE_UNIT}
+After={_K3S_POD_ROUTE_UNIT}
+
+[Service]
+ExecStartPre={_K3S_POD_ROUTE_SCRIPT} ensure
+"""
+    return [
+        {"path": _K3S_POD_ROUTE_SCRIPT, "content": script, "permissions": "0755"},
+        {"path": f"/etc/systemd/system/{_K3S_POD_ROUTE_UNIT}", "content": unit, "permissions": "0644"},
+        {
+            "path": f"/etc/systemd/system/{k3s_unit}.d/10-afterglow-pod-route.conf",
+            "content": dropin,
+            "permissions": "0644",
+        },
+    ]
+
+
 def _build_fcos_nic_script() -> str:
     return """#!/bin/bash
 set -euo pipefail
@@ -446,6 +516,8 @@ WantedBy=multi-user.target
     for wf in extra_write_files:
         mode = int(wf.get("permissions", "0644"), 8)
         files.append(_ignition_file(wf["path"], wf["content"], mode=mode))
+    for wf in _k3s_pod_route_files("k3s.service"):
+        files.append(_ignition_file(wf["path"], wf["content"], mode=int(wf["permissions"], 8)))
 
     files.extend(
         [
@@ -529,6 +601,10 @@ WantedBy=multi-user.target
         ),
         _ignition_file("/etc/udev/rules.d/99-afterglow-nic.rules", _fcos_nic_rule(), mode=0o644),
         _ignition_file("/etc/systemd/system/k3s-agent-join.service", join_unit, mode=0o644),
+        *(
+            _ignition_file(wf["path"], wf["content"], mode=int(wf["permissions"], 8))
+            for wf in _k3s_pod_route_files("k3s-agent.service")
+        ),
     ]
 
     passwd: dict = {}
@@ -638,6 +714,7 @@ def generate_server_userdata(
         cluster_init=cluster_init,
         join_url=join_url or "",
         ha_node_token=ha_node_token or "",
+        pod_route_files=_k3s_pod_route_files("k3s.service"),
     )
     yaml_str = _jinja.get_template("k3s_server.yaml.j2").render(**template_vars)
     verify_no_service_password(yaml_str)
@@ -696,6 +773,7 @@ def generate_agent_userdata(
         node_token=node_token,
         ssh_public_key=ssh_public_key or "",
         extra_agent_args=agent_args,
+        pod_route_files=_k3s_pod_route_files("k3s-agent.service"),
     )
     yaml_str = _jinja.get_template("k3s_agent.yaml.j2").render(**template_vars)
     verify_no_service_password(yaml_str)
