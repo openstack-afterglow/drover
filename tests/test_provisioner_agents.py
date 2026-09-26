@@ -254,6 +254,52 @@ async def test_missing_or_invalid_public_identity_endpoint_fails_before_resource
     connection.close.assert_called_once_with()
 
 
+async def test_occm_ha_joiners_boot_from_cluster_secret_without_app_credential() -> None:
+    settings = Settings(
+        os_auth_url="http://management.example.test:5000/v3",
+        drover_callback_base_url="https://drover.test",
+        drover_occm_enabled=True,
+        drover_cinder_csi_enabled=False,
+        drover_manila_csi_enabled=False,
+        drover_octavia_ingress_enabled=False,
+        drover_keystone_auth_enabled=False,
+        drover_barbican_kms_enabled=False,
+    )
+    cluster = {
+        "name": "ha-cluster",
+        "k3s_version": "v1.34.1+k3s1",
+        "server_image_id": "image-1",
+        "server_flavor_id": "flavor-1",
+        "network_id": "network-1",
+        "resource_policy_snapshot": {"k3s.volume_availability_zone": {"id": "nova"}},
+    }
+    connection = MagicMock()
+    connection.session.get_endpoint.return_value = "https://identity.example.test/v3"
+    userdata = SimpleNamespace(data="cloud-init", config_drive=False)
+
+    with (
+        patch("drover.config.get_settings", return_value=settings),
+        patch("drover.services.provisioner.k3s_cluster.get_cluster", new=AsyncMock(return_value=cluster)),
+        patch("drover.services.keystone.get_project_manager_connection", new=AsyncMock(return_value=connection)),
+        patch("drover.services.octavia.add_member", return_value={"id": "member-1"}),
+        patch("drover.services.inventory.record_resource", new=AsyncMock()),
+        patch("drover.services.provisioner.k3s_cluster.create_ha_callback_token", new=AsyncMock(return_value="t")),
+        patch("drover.services.cinder.create_volume_from_image", return_value=SimpleNamespace(id="volume-1")),
+        patch("drover.services.cloudinit.generate_server_userdata", return_value=userdata) as generate_userdata,
+        patch("drover.services.nova.create_server", return_value=SimpleNamespace(id="server-2")) as create_server,
+    ):
+        await provisioner.bootstrap_ha_servers(
+            "project-1", "cluster-1", "192.0.2.10", "K10node::token", 3, "pool-1", "198.51.100.5"
+        )
+
+    # Rendering OCCM config here would need the unrecoverable app-credential secret and abort HA bootstrap.
+    assert create_server.call_count == 2
+    for call in generate_userdata.call_args_list:
+        assert call.kwargs["cloud_conf"] is None
+        assert "--disable=servicelb" in call.kwargs["extra_server_args"]
+
+
+
 async def test_nodegroup_provisioning_reads_token_from_database_store() -> None:
     cluster = _cluster()
     get_token = AsyncMock(return_value="node-token")

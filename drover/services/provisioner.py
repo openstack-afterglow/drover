@@ -419,8 +419,8 @@ async def bootstrap_ha_servers(
         except Exception as e:
             _logger.warning("HA: failed to add server#1 to LB pool: %s", e)
 
-        # server#2, server#3 생성
-        cloud_conf = k3s_plugins.aggregate_cloud_conf(project_id, plugin_settings)
+        # server#2, server#3 생성. Plugins read the cloud-config Secret that server#1 created once; the
+        # application credential secret is not retained, so joiners must not re-render cloud.conf.
         extra_server_args = k3s_plugins.aggregate_server_args(plugin_settings)
         extra_write_files = k3s_plugins.aggregate_extra_write_files(project_id, cluster_name, plugin_settings)
 
@@ -457,7 +457,7 @@ async def bootstrap_ha_servers(
                     callback_url=callback_url,
                     callback_token=ha_token,
                     primary_network_id=network_id,
-                    cloud_conf=cloud_conf,
+                    cloud_conf=None,
                     extra_server_args=extra_server_args,
                     extra_write_files=extra_write_files,
                     extra_tls_sans=ha_extra_tls_sans,
