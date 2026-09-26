@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from threading import Lock
 from typing import TYPE_CHECKING
@@ -13,6 +14,11 @@ if TYPE_CHECKING:
     import openstack
 
 _logger = logging.getLogger(__name__)
+
+# Octavia rejects deletes while an OCCM create/update is still pending.
+_OCCM_LB_SETTLE_TIMEOUT_SECONDS = 900
+_OCCM_LB_SETTLE_INTERVAL_SECONDS = 5
+_K8S_SERVICE = r"[a-z0-9-]+/[a-z0-9-]+"
 
 def _lb_to_dict(lb) -> dict:
     prov = getattr(lb, "provisioning_status", "") or ""
@@ -160,6 +166,54 @@ def delete_load_balancer_safe(
         raise ValueError(f"Load balancer {lb_id} ownership validation failed for project {expected_project_id}")
     delete_load_balancer(conn, lb_id, cascade=cascade)
     wait_load_balancer_deleted(conn, lb_id)
+
+def _wait_load_balancer_mutable(conn: openstack.connection.Connection, lb_id: str) -> None:
+    deadline = time.monotonic() + _OCCM_LB_SETTLE_TIMEOUT_SECONDS
+    while True:
+        lb = conn.load_balancer.find_load_balancer(lb_id, ignore_missing=True)
+        if lb is None or getattr(lb, "provisioning_status", "") in {"ACTIVE", "ERROR", "DELETED"}:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"LB {lb_id} stayed {lb.provisioning_status} for {_OCCM_LB_SETTLE_TIMEOUT_SECONDS}s")
+        time.sleep(_OCCM_LB_SETTLE_INTERVAL_SECONDS)
+
+
+def delete_occm_service_load_balancers(
+    conn: openstack.connection.Connection, project_id: str, cluster_id: str
+) -> list[str]:
+    """Delete one cluster's OCCM Service LBs and the floating IPs OCCM allocated for them.
+
+    OCCM runs with ``--cluster-name=<cluster ID>``, so the name prefix and exact description select only this
+    cluster. Call after the cluster VMs are gone so OCCM cannot recreate a deleted LB. User-supplied floating IPs
+    and LBs without the OCCM description are left untouched.
+    """
+    suffix = f" from cluster {re.escape(cluster_id)}"
+    lb_description = re.compile(rf"Kubernetes external service {_K8S_SERVICE}{suffix}")
+    fip_description = re.compile(rf"Floating IP for Kubernetes external service {_K8S_SERVICE}{suffix}")
+    name_prefix = f"kube_service_{cluster_id}_"
+    owned = [
+        lb
+        for lb in conn.load_balancer.load_balancers(project_id=project_id)
+        if (lb.name or "").startswith(name_prefix) and lb_description.fullmatch(lb.description or "")
+    ]
+    deleted: list[str] = []
+    failures: list[str] = []
+    for lb in owned:
+        try:
+            _wait_load_balancer_mutable(conn, lb.id)
+            if lb.vip_port_id:
+                for fip in list(conn.network.ips(port_id=lb.vip_port_id, project_id=project_id)):
+                    if fip_description.fullmatch(fip.description or ""):
+                        conn.network.delete_ip(fip.id, ignore_missing=True)
+            delete_load_balancer(conn, lb.id, cascade=True)
+            wait_load_balancer_deleted(conn, lb.id)
+            deleted.append(lb.id)
+        except Exception as exc:
+            failures.append(f"{lb.id}: {exc}")
+    if failures:
+        raise RuntimeError("OCCM Service load balancer cleanup failed: " + "; ".join(failures))
+    return deleted
+
 
 def wait_for_load_balancer(
     conn: openstack.connection.Connection,

@@ -82,6 +82,8 @@ Ubuntu·FCOS의 udev NIC add rule은 모든 rule 처리 후 평가되는 `RUN`�
 
 게스트 플러그인의 인증 URL은 `provisioner.py:_guest_plugin_settings`가 인증된 manager connection의 region별 `identity` public catalog endpoint로 선택한다. backend의 internal 인증 설정은 바꾸지 않고 guest-only Settings copy와 기존 resource snapshot을 사용한다. 활성 플러그인이 없으면 조회하지 않으며, public endpoint 누락·잘못된 URL은 OpenStack 자원 생성 전에 거부한다. OCCM은 `--disable=servicelb`로 K3s LoadBalancer controller와 경쟁하지 않으며 server뿐 아니라 agent에도 external cloud-provider 인자를 적용한다. provider 네트워크가 public-network 정책과 같으면 OCCM의 public 분류를 생략해 원래 provider 주소를 `InternalIP`로 유지한다. 정책상 floating-network 선택은 그대로다. source: `drover/services/plugins/occm.py`, `drover/services/provisioner.py`; 상세 계약은 feature coverage의 Octavia·Keystone 절에 있다.
 
+OCCM은 표시 이름이 아니라 불변 cluster ID를 `--cluster-name`으로 받는다. 따라서 Service LB 이름은 `kube_service_<cluster_id>_<namespace>_<service>`, 설명은 `Kubernetes external service <namespace>/<service> from cluster <cluster_id>`가 된다. 이 LB는 Drover inventory에 기록되지 않으므로 `deletion.py`는 모든 VM 삭제 후 `octavia.delete_occm_service_load_balancers`로 이 prefix와 설명이 모두 일치하는 LB만 cascade 삭제한다. VM이 없으므로 OCCM이 다시 만들 수 없고, 대기 중인 LB는 Octavia가 ACTIVE/ERROR로 정리할 때까지 기다린다. 같은 VIP port의 floating IP는 OCCM 생성 설명과 일치할 때만 먼저 삭제하며 사용자가 지정한 FIP와 다른 cluster의 LB는 건드리지 않는다. 한 LB의 실패는 나머지 정리를 막지 않으며 기존 삭제 단계처럼 경고로 남는다. octavia-ingress-controller의 LB는 이 cleanup 범위가 아니다.
+
 ### Reconnection, idempotency, scale/delete
 
 - create에 같은 idempotency key와 같은 canonical request hash를 재전송하면 기존 operation/cluster를 재사용하고, hash가 다르면 `409`다. 이 계약은 `POST /v1/clusters/async`에 한정된다.
@@ -212,9 +214,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "db8eb1151c2fb932c5fda58173c558bcbc17fbef7323e7f6e5816ba12dcb76ae",
-  "reviewed_at": "2026-09-26T13:08:00Z",
-  "summary": "0.2.24 provider routing and guest OCCM corrections reviewed; no schema/public API structure change; credential failure test includes public catalog prerequisite"
+  "source_sha256": "1885dba0e95eb4a98dbcd7f903a371e620b32ac55578b5860b491d0d6a89fba8",
+  "reviewed_at": "2026-09-26T13:38:55Z",
+  "summary": "0.2.24 adds OCCM cluster-ID resource naming and exact Service LB/FIP cleanup after VM deletion; deletion remains best-effort; no schema/public API change"
 }
 ```
 <!-- architecture-review:end -->

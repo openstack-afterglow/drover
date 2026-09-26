@@ -58,11 +58,16 @@ class OccmPlugin:
         )
 
 
-    def generate_manifests(self, cluster_name: str, project_id: str, settings: Settings, **kwargs) -> str:
+    def generate_manifests(
+        self, cluster_name: str, project_id: str, settings: Settings, *, cluster_id: str = "", **kwargs
+    ) -> str:
+        # OCCM names Octavia resources from --cluster-name; the immutable ID makes delete ownership exact.
+        if not cluster_id:
+            raise ValueError("cluster_id is required for OCCM resource ownership")
         tmpl = _jinja.get_template("occm/manifests.yaml.j2")
         return tmpl.render(
             occm_image=settings.drover_occm_image,
-            cluster_name=cluster_name,
+            cluster_name=cluster_id,
         )
 
     def extra_write_files(self, project_id: str, cluster_name: str, settings: Settings) -> list[dict]:

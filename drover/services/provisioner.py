@@ -832,7 +832,7 @@ async def create_cluster_job(
 
             kek_id = await _barbican.ensure_project_kek(project_id)
 
-        manifest_kwargs: dict = {"app_credential": app_cred}
+        manifest_kwargs: dict = {"app_credential": app_cred, "cluster_id": cluster_id}
         if active_plugins.get("octavia_ingress", False):
             subnets = await asyncio.to_thread(lambda: list(conn.network.subnets(network_id=network_id)))
             if not subnets:
