@@ -62,21 +62,12 @@ async def k3s_callback(request: Request, req: K3sCallbackRequest):
     project_id = token_data["project_id"]
     cluster_id = token_data["cluster_id"]
     server_index: int | None = token_data.get("server_index")
-    _logger.info(
-        "k3s callback consumed: cluster=%s project=%s source_ip=%s server_ip=%s server_index=%s",
-        cluster_id,
-        project_id,
-        source_ip,
-        req.server_ip,
-        server_index,
-    )
+    _logger.info("k3s callback consumed: cluster=%s project=%s server_index=%s", cluster_id, project_id, server_index)
 
     active_op = await operations.get_active_operation(None, cluster_id, kind="create")
     if not req.success:
         error_msg = req.error or "서버 VM에서 알 수 없는 오류 발생"
-        _logger.error(
-            "k3s cluster %s server%s init failed: %s", cluster_id, f"#{server_index}" if server_index else "", error_msg
-        )
+        _logger.error("k3s cluster %s server%s init failed", cluster_id, f"#{server_index}" if server_index else "")
         await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"서버 초기화 실패: {error_msg}")
         if active_op:
             req_id = get_request_id() or ""
@@ -113,7 +104,7 @@ async def k3s_callback(request: Request, req: K3sCallbackRequest):
     try:
         await k3s_cluster.store_kubeconfig(project_id, cluster_id, req.kubeconfig)
     except Exception as e:
-        _logger.error("k3s cluster %s kubeconfig encryption failed: %s", cluster_id, e)
+        _logger.error("k3s cluster %s kubeconfig encryption failed", cluster_id)
         await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"kubeconfig 저장 실패: {e}")
         if active_op:
             req_id = get_request_id() or ""
@@ -140,17 +131,16 @@ async def k3s_callback(request: Request, req: K3sCallbackRequest):
     )
 
     if req.occm_status:
-        _logger.info("k3s cluster %s OCCM status (deprecated): %s", cluster_id, req.occm_status)
+        _logger.info("k3s cluster %s OCCM status reported (deprecated)", cluster_id)
     if req.secret_cloud_config_status and req.secret_cloud_config_status != "ok":
-        _logger.warning("k3s cluster %s cloud-config secret 생성 실패: %s", cluster_id, req.secret_cloud_config_status)
+        _logger.warning("k3s cluster %s cloud-config secret creation failed", cluster_id)
     if req.plugin_status:
-        for name, info in req.plugin_status.items():
+        for info in req.plugin_status.values():
             st = info.get("status", info) if isinstance(info, dict) else info
-            err = info.get("error", "") if isinstance(info, dict) else ""
             if st == "deployed":
-                _logger.info("k3s cluster %s plugin %s: deployed", cluster_id, name)
+                _logger.info("k3s cluster %s plugin deployed", cluster_id)
             else:
-                _logger.error("k3s cluster %s plugin %s: %s — %s", cluster_id, name, st, err)
+                _logger.error("k3s cluster %s plugin deployment failed", cluster_id)
 
     if active_op:
         req_id = get_request_id() or ""

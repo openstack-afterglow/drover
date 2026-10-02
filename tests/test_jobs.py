@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,6 +13,7 @@ from drover.models.orm import DroverJob, K3sCluster
 from drover.services import jobs
 
 pytestmark = pytest.mark.asyncio
+_JOB_ID = "123e4567-e89b-42d3-a456-426614174000"
 
 
 class _Result:
@@ -273,3 +275,89 @@ async def test_process_defers_existing_afterglow_intent_without_failure_retry(mo
     assert await jobs.process_one_job() is True
     defer.assert_awaited_once_with("job-1", attempt=2)
     retry.assert_not_awaited()
+
+
+async def test_worker_claim_and_success_log_committed_safe_metadata(monkeypatch, caplog):
+    job = SimpleNamespace(
+        id=_JOB_ID, kind="scale", cluster_id="secret-cluster", project_id="secret-project",
+        status="queued", attempts=0, claimed_at=None, last_error=None, updated_at=None,
+        payload_json={"password": "secret-payload"}, operation_id=None,
+    )
+    cluster = SimpleNamespace(project_id="secret-project")
+    session = _Session(execute_values=[job], objects={(DroverJob, _JOB_ID): job, (K3sCluster, job.cluster_id): cluster})
+    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+    monkeypatch.setattr(jobs, "_execute_job_direct", AsyncMock())
+
+    with caplog.at_level(logging.DEBUG, logger="drover.jobs"):
+        assert await jobs.process_one_job() is True
+
+    assert job.status == "completed"
+    messages = [record.getMessage() for record in caplog.records if record.name == "drover.jobs"]
+    assert any(f"kind=scale job_id={_JOB_ID} attempt=1 outcome=success" in message for message in messages)
+    assert "Drover job query=mapping(count=2,keys=cluster_id,status)" in messages
+    assert "Drover job claimed state=mapping(count=4,keys=attempt,cluster_id,kind,status)" in messages
+    assert "Drover job result=mapping(count=2,keys=attempt,status)" in messages
+    assert not any("secret" in message or "password" in message for message in messages)
+
+
+@pytest.mark.parametrize("attempt,expected_status,outcome", [(2, "queued", "retry"), (3, "failed", "error")])
+async def test_worker_failure_logs_only_committed_outcome(monkeypatch, caplog, attempt, expected_status, outcome):
+    job = SimpleNamespace(
+        id=_JOB_ID, kind="scale", cluster_id="secret-cluster", project_id="secret-project",
+        status="running", attempts=attempt, claimed_at=object(), last_error=None,
+        updated_at=None, operation_id=None,
+    )
+    cluster = SimpleNamespace(project_id="secret-project", deleted_at=None, status="SCALING", status_reason=None, updated_at=None)
+    session = _Session(objects={(DroverJob, _JOB_ID): job, (K3sCluster, job.cluster_id): cluster})
+    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+    monkeypatch.setattr(
+        jobs, "_claim_one", AsyncMock(return_value=(_JOB_ID, attempt, "scale", job.cluster_id, job.project_id, {"token": "secret-payload"})),
+    )
+    monkeypatch.setattr(jobs, "_execute_job_direct", AsyncMock(side_effect=RuntimeError("secret-exception")))
+
+    with caplog.at_level(logging.DEBUG, logger="drover.jobs"):
+        assert await jobs.process_one_job() is True
+
+    assert job.status == expected_status
+    assert job.last_error == "secret-exception"
+    messages = [record.getMessage() for record in caplog.records if record.name == "drover.jobs"]
+    assert any(f"kind=scale job_id={_JOB_ID} attempt={attempt} outcome={outcome}" in message for message in messages)
+    assert "Drover job result=mapping(count=2,keys=attempt,status)" in messages
+    assert not any("secret" in message or "token" in message for message in messages)
+    assert all(record.exc_info is None for record in caplog.records if record.name == "drover.jobs")
+
+
+async def test_worker_deferred_logs_only_after_lease_is_retained(monkeypatch, caplog):
+    from drover.services.autoscale import ProvisioningInProgress
+
+    job = SimpleNamespace(status="running", attempts=2, claimed_at=object(), last_error=None,
+                          updated_at=None, operation_id=None)
+    session = _Session(objects={(DroverJob, "job-1"): job})
+    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+    monkeypatch.setattr(jobs, "_claim_one", AsyncMock(return_value=("job-1", 2, "stampede_provision", "secret-cluster", "secret-project", {})))
+    monkeypatch.setattr(jobs, "_execute_job_direct", AsyncMock(side_effect=ProvisioningInProgress("secret-intent")))
+
+    with caplog.at_level(logging.INFO, logger="drover.jobs"):
+        assert await jobs.process_one_job() is True
+
+    assert job.status == "running"
+    assert job.attempts == 1
+    assert any("kind=stampede_provision job_id=untrusted attempt=2 outcome=deferred" in record.getMessage()
+               for record in caplog.records if record.name == "drover.jobs")
+    assert not any("secret" in record.getMessage() or "job-1" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_worker_lost_fence_does_not_log_completion(monkeypatch, caplog, failure):
+    job = SimpleNamespace(status="running", attempts=2, claimed_at=object(), last_error=None, updated_at=None)
+    session = _Session(objects={(DroverJob, _JOB_ID): job})
+    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+    monkeypatch.setattr(jobs, "_claim_one", AsyncMock(return_value=(_JOB_ID, 1, "scale", "cluster-1", "project-1", {})))
+    execute = AsyncMock(side_effect=RuntimeError("secret-error")) if failure else AsyncMock()
+    monkeypatch.setattr(jobs, "_execute_job_direct", execute)
+
+    with caplog.at_level(logging.INFO, logger="drover.jobs"):
+        assert await jobs.process_one_job() is True
+
+    assert job.status == "running"
+    assert not any("Drover job completion" in record.getMessage() for record in caplog.records)

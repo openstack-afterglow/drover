@@ -4,10 +4,11 @@ import logging
 import re
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
+from drover.logging import configure_logging, safe_metadata
 from drover.main import app as main_app
 from drover.middleware import (
     CorrelationMiddleware,
@@ -165,3 +166,96 @@ async def test_logger_adapter_and_request_id_filter():
         assert data["ctx_id"] == "req-logging-spec-007"
         assert logged_extra.get("request_id_attr") == "req-logging-spec-007"
         assert logged_extra.get("extra_dict", {}).get("request_id") == "req-logging-spec-007"
+
+
+@pytest.mark.asyncio
+async def test_api_completion_logs_outcomes_without_secret_query_path_or_response(caplog):
+    test_app = FastAPI()
+    test_app.add_middleware(CorrelationMiddleware)
+
+    @test_app.get("/items/{item_id}")
+    async def item(item_id: str, request: Request):
+        request.state.kubeconfig = "KUBECONFIG_PRIVATE"
+        if item_id == "denied":
+            return JSONResponse(status_code=403, content={"password": "RESPONSE_SECRET"})
+        if item_id == "crash":
+            raise RuntimeError("KEYSTONE_PRIVATE")
+        return {"token": "RESPONSE_SECRET"}
+
+    logger = logging.getLogger("drover.api")
+    with caplog.at_level(logging.DEBUG, logger="drover.api"):
+        async with AsyncClient(transport=ASGITransport(app=test_app), base_url="http://test") as client:
+            for item_id, status in (("PATH_SECRET", 200), ("denied", 403), ("crash", 500)):
+                res = await client.get(
+                    f"/items/{item_id}?limit=2&token=QUERY_SECRET&password=OTHER_SECRET",
+                    headers={"X-Openstack-Request-Id": "req-safe-log"},
+                )
+                assert res.status_code == status
+
+    records = [record.getMessage() for record in caplog.records if record.name == logger.name]
+    assert len([message for message in records if message.startswith("API completed")]) == 3
+    assert all("route=/items/{item_id}" in message for message in records if message.startswith("API completed"))
+    assert any("status=200 outcome=success" in message for message in records)
+    assert any("status=403 outcome=error" in message for message in records)
+    assert any("status=500 outcome=error" in message for message in records)
+    assert all("query=mapping(count=1,keys=limit)" in message for message in records if message.startswith("API metadata"))
+    text = "\n".join(records)
+    for secret in ("QUERY_SECRET", "OTHER_SECRET", "RESPONSE_SECRET", "KUBECONFIG_PRIVATE", "KEYSTONE_PRIVATE", "PATH_SECRET", "password", "token"):
+        assert secret not in text
+
+
+@pytest.mark.asyncio
+async def test_api_completion_logs_prefixed_template_for_included_routers(caplog):
+    # FastAPI included routers expose the router-local route (path "" or "/{item_id}") in scope.
+    router = APIRouter()
+
+    @router.get("")
+    async def list_items():
+        return []
+
+    @router.get("/{item_id}")
+    async def get_item(item_id: str):
+        return {}
+
+    test_app = FastAPI()
+    test_app.add_middleware(CorrelationMiddleware)
+    test_app.include_router(router, prefix="/v1/items")
+    test_app.include_router(router, prefix="/v1/admin/items")
+
+    with caplog.at_level(logging.INFO, logger="drover.api"):
+        async with AsyncClient(transport=ASGITransport(app=test_app), base_url="http://test") as client:
+            for path in ("/v1/items", "/v1/items/PATH_SECRET", "/v1/admin/items/PATH_SECRET"):
+                assert (await client.get(path)).status_code == 200
+
+    routes = [
+        record.getMessage().split(" route=", 1)[1].split(" ", 1)[0]
+        for record in caplog.records
+        if record.name == "drover.api" and record.getMessage().startswith("API completed")
+    ]
+    assert routes == ["/v1/items", "/v1/items/{item_id}", "/v1/admin/items/{item_id}"]
+
+
+
+def test_metadata_does_not_render_credential_bearing_objects():
+    class Credential:
+        def __str__(self):
+            raise AssertionError("credential value must not be stringified")
+
+    summary = safe_metadata({"status": "ok", "token": Credential(), "kubeconfig": Credential(), "identity": Credential()})
+    assert summary == "mapping(count=4,keys=status)"
+    assert safe_metadata([Credential()] * 10001) == "list(count=9999)"
+
+
+def test_debug_opt_in_does_not_enable_dependency_debug(monkeypatch):
+    drover_logger = logging.getLogger("drover")
+    original_level = drover_logger.level
+    try:
+        monkeypatch.delenv("LOG_LEVEL", raising=False)
+        configure_logging()
+        assert drover_logger.level == logging.INFO
+        monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+        configure_logging()
+        assert drover_logger.level == logging.DEBUG
+        assert not logging.getLogger("httpx").isEnabledFor(logging.DEBUG)
+    finally:
+        drover_logger.setLevel(original_level)

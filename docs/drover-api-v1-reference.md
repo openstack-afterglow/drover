@@ -17,6 +17,18 @@ Drover 서비스의 네이티브 REST, SSE(Server-Sent Events) 및 WebSocket API
 * **`Idempotency-Key`** *(생성 API에서 선택·권장)*: `POST /v1/clusters/async`의 재전송을 같은 오퍼레이션으로 귀속시키는 유니크 키입니다. 현재 스케일·삭제·노드그룹 변경에는 외부 멱동성 계약이 없습니다.
 * **`Content-Type`** *(JSON body 요청에서 필수)*: JSON body를 보내는 요청은 `application/json` 계열 값을 보내야 합니다. FastAPI strict content-type 검사로 헤더 없이 보낸 JSON body도 `422`로 거부됩니다(FastAPI `0.132` 이전에는 허용). JSON 계열이 아닌 값은 이전에도 `422`였습니다.
 
+### 1.1.1 요청 및 작업 로그
+API는 정상(2xx/3xx) 및 오류(4xx/5xx) HTTP 응답 완료 시 INFO로 method, 라우트 템플릿, status, success/error, 경과 시간과 검증된 request ID를 남깁니다. SSE는 스트림 종료까지 완료가 지연될 수 있습니다. Worker의 내구성 job도 완료·재시도·실패·보류를 INFO로 남깁니다. `LOG_LEVEL=DEBUG`를 **API 및 Worker 각 프로세스**에 지정하면 query/state/result의 제한된 구조 요약(허용된 키 이름과 개수, 값 없음)을 DEBUG로 추가합니다. 쿼리 값, 요청/응답 바디, 동적 URL 경로, 인증 헤더, kubeconfig, node token, Keystone credential, 예외 문자열/traceback은 이 공통 로그에 넣지 않습니다.
+
+```bash
+LOG_LEVEL=DEBUG drover-api
+LOG_LEVEL=DEBUG drover-worker
+```
+
+기본값은 INFO이며 `LOG_LEVEL=DEBUG`는 Drover logger에만 적용되어 HTTP/DB/OpenStack 라이브러리 전체의 DEBUG를 켜지 않습니다. 라우트 템플릿은 router prefix를 포함한 경로입니다(예: `/v1/clusters/{cluster_id}`, 일치하는 라우트가 없으면 `(unmatched)`). 로그에서 볼 수 없는 상세 operation 상태는 `/v1/operations/{operation_id}`와 이벤트에서 조회합니다.
+
+이 보장은 Drover logger에 한정됩니다. 컨테이너 이미지와 Kolla role의 `uvicorn` 명령은 access log를 끄지 않으므로 uvicorn access log(`INFO: ... "GET /path?query HTTP/1.1" 401`)에는 원본 경로와 쿼리 문자열이 남습니다. 쿼리 문자열에 credential을 넣지 마십시오. Kolla role은 `LOG_LEVEL` 변수를 제공하지 않으므로 DEBUG를 쓰려면 운영자가 두 컨테이너 환경에 직접 지정해야 합니다.
+
 ### 1.2 표준 HTTP 상태 코드
 * `200 OK` / `201 Created` / `204 No Content`: 성공적인 처리
 * `400 Bad Request`: 요청 파라미터 검증 실패 (Pydantic 모델 검증 오류 포함)

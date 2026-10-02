@@ -12,6 +12,8 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - 현재 소스 기준의 책임 경계, MariaDB 정본/Redis 보조 저장소 분리, runtime flow, 운영 한계
    - 코드·설정·schema·배포·테스트 변경 때 함께 갱신해야 하는 maintenance 절차
 
+**기여자 계약:** [architecture maintenance OpenSpec](../openspec/specs/architecture-maintenance/spec.md), [CI OpenSpec](../openspec/specs/ci-governance/spec.md), [CI 기준선·미해결 위험 evidence](../openspec/specs/ci-governance/evidence.md). 구현·배포 증거는 현재 source 및 각 릴리스 노트와 구분한다.
+
 1. **[Afterglow 서비스 통합 및 엔드포인트 디스커버리 마이그레이션 가이드](afterglow-service-integration.md)**
    - Afterglow 서비스의 Keystone 카탈로그 기반 엔드포인트 자동 탐색(Discovery) 전환 계획과 운영 체크리스트
    - 배포 및 카탈로그 검증 체크리스트 (`openstack catalog show drover`, `openstack endpoint list --service drover`)

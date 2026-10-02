@@ -93,7 +93,7 @@ def _resolve_admin_role_id() -> str | None:
         if roles:
             _admin_role_id_cache = roles[0].id
     except Exception:
-        _logger.warning("Failed to resolve Keystone admin role", exc_info=True)
+        _logger.warning("Failed to resolve Keystone admin role")
     return _admin_role_id_cache
 
 
@@ -112,7 +112,7 @@ def _is_system_admin(user_id: str) -> bool:
         )
         return bool(assignments)
     except Exception:
-        _logger.warning("Keystone system-admin check failed", exc_info=True)
+        _logger.warning("Keystone system-admin check failed")
         return False
 
 
@@ -156,7 +156,7 @@ async def require_token(
     try:
         info = await asyncio.to_thread(validate_token, x_auth_token, x_project_id or "")
     except Exception:
-        _logger.info("Keystone token validation failed", exc_info=True)
+        _logger.info("Keystone token validation failed")
         raise HTTPException(status_code=401, detail="Invalid or expired Keystone token") from None
     if not info.get("project_id"):
         raise HTTPException(status_code=401, detail="A project-scoped Keystone token is required")

@@ -35,6 +35,7 @@ from drover.api import (
 from drover.cache import _get_redis, close_cache
 from drover.config import get_settings, validate_config
 from drover.db import check_db, close_db, get_session_factory, init_db
+from drover.logging import configure_logging
 from drover.middleware import CorrelationMiddleware
 from drover.models.schemas import (
     HealthResponse,
@@ -95,6 +96,7 @@ async def readiness_checks() -> dict[str, str]:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    configure_logging()
     settings = get_settings()
     validate_config(settings)
     init_db(

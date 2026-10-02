@@ -6,7 +6,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: `drover==0.2.25`, `drover-sdk==0.2.21` (별도 SDK 버전)
+- 패키지: `drover==0.3.0`, `drover-sdk==0.2.21` (별도 SDK 버전)
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -46,6 +46,7 @@ graph LR
 | 경로·심볼 | 책임 | 의존 방향 |
 |---|---|---|
 | `drover/main.py:app`, `readiness_checks` | FastAPI lifecycle, `/v1` router mount, liveness/readiness | API → DB/Redis/Keystone |
+| `drover/middleware.py:CorrelationMiddleware`, `safe_metadata`, `drover/logging.py:configure_logging` | HTTP 완료 로그, 값 없는 제한적 DEBUG 요약, API/Worker 공통 `LOG_LEVEL` | API/Worker → 표준 logging; credential payload 제외 |
 | `drover/api/clusters.py:create_k3s_cluster_async` | policy snapshot, cluster row, durable create job, SSE event replay | API → `services.store`, `services.jobs`, `services.operations` |
 | `drover/api/callback.py:k3s_callback` | CIDR 검사, one-time token 소비, callback 상태 기록, HA/agent job enqueue | VM → API → DB/Redis |
 | `drover/services/jobs.py` | MariaDB queue enqueue/claim, 15분 lease, heartbeat, retry/complete | Worker → provisioner/autoscale/deletion/reconciliation |
@@ -143,11 +144,13 @@ FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 �
 - `drover-sdk`: `sdk/`의 독립 Python package이며 API/Worker process에 import되어야 하는 내부 module이 아니다.
 - `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
 - 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
-- Kolla role의 `drover_image_tag`은 `v0.2.25`다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 이미지의 실제 발행과 immutable digest 확인은 이 소스 기본값과 별도로 검증한다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
+- Kolla role의 `drover_image_tag`은 `v0.3.0`다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 이미지의 실제 발행과 immutable digest 확인은 이 소스 기본값과 별도로 검증한다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
 
-릴리스 변경과 검증 경계는 [`docs/release-0.2.25.md`](docs/release-0.2.25.md)에 정리한다. 이전 릴리스는 [`docs/release-0.2.24.md`](docs/release-0.2.24.md)에 남아 있다. root wheel/런타임/lock은 `0.2.25`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag 원문으로 발행한다. 이 문구 자체는 발행·배포 완료의 증거가 아니다.
+릴리스 변경과 검증 경계는 [`docs/release-0.3.0.md`](docs/release-0.3.0.md)에 정리한다. 이전 릴리스는 [`docs/release-0.2.25.md`](docs/release-0.2.25.md)에 남아 있다. root wheel/런타임/lock은 `0.3.0`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag 원문으로 발행한다. 이 문구 자체는 발행·배포 완료의 증거가 아니다.
 
 `GET /v1/health`와 `/v1/health/live`는 process liveness만 의미한다. `/v1/health/ready`는 MariaDB, Redis ping, migration ledger, Keystone service credentials를 모두 확인하고 하나라도 unavailable이면 `503`을 반환한다. 로그는 각 process의 표준 logging과 correlation ID에 남고, operation event 및 reconciliation drift는 MariaDB API 조회로 확인한다. health 결과·Stampede event는 Redis cache이므로 장애 시 최신 값이 없을 수 있다.
+
+API/Worker는 `drover/logging.py:configure_logging`으로 Drover logger를 기본 INFO, 명시적 `LOG_LEVEL=DEBUG`에서만 DEBUG로 설정한다(라이브러리 전체 DEBUG가 아니다). `CorrelationMiddleware`는 HTTP 응답 완료 시 INFO로 method, 정적 route template, status, outcome, duration 및 검증된 request ID를 남긴다. FastAPI `include_router`가 scope에 넣는 route는 prefix 없는 router-local path(`GET /v1/clusters`는 `""`)이므로 template은 `fastapi.routing.iter_route_contexts`로 prefix가 붙은 경로를 원본 route별로 색인해 얻고, 같은 route가 여러 prefix에 포함되면 요청 path와 일치하는 template을 고른다. pre-response 예외는 500으로 응답하고 error로 기록하며, 시작한 SSE 응답에서 예외가 발생하면 이미 전송한 status와 error outcome을 함께 기록한다. Worker의 durable job은 attempt fence가 승인한 완료/재시도/실패/보류를 INFO로 기록한다. DEBUG query/state/result는 `safe_metadata`의 개수 및 허용된 필드 **이름**만 최대 길이로 요약하며 값·raw path·header·body·응답 본문·job payload·Kubernetes/Keystone credential·exception traceback을 기록하지 않는다. 기존 operation/event의 상세 상태는 DB 계약이며 이 로그는 그것을 대체하지 않는다. `LOG_LEVEL=DEBUG drover-api` / `LOG_LEVEL=DEBUG drover-worker`는 로컬 실행 예시이며 프로덕션에서는 두 프로세스 환경에 각각 명시한다. Kolla role(`drover_service_environments`)은 `LOG_LEVEL` 변수를 제공하지 않는다. 이 범위 밖의 기존 동작은 바뀌지 않았다: Dockerfile·Kolla의 `uvicorn` 명령은 access log를 끄지 않으므로 uvicorn access log에는 raw path와 query string이 남고, readiness 검사 실패 경고(`drover/main.py`, `drover/db.py`)는 traceback을 남긴다.
 
 운영 선행 조건은 MariaDB schema migration, Redis 접근, Keystone service credentials, callback base URL/CIDR, kubeconfig encryption key와 OpenStack 네트워크/이미지/flavor 정책이다. 실제 OpenStack 자원과 K3s VM callback이 없으면 API readiness만으로 cluster provisioning 성공을 의미하지 않는다.
 
@@ -180,13 +183,13 @@ Callback endpoint가 인증 불필요한 VM 경계라는 사실은 token+CIDR �
 - migration: `uv run drover-migrate --apply`
 - architecture snapshot: `python3 scripts/check_architecture.py`
 
-2026-09-27 로컬 `uv run pytest tests`는 679건 통과·3건 skip(약 13초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. 같은 날 `uv --directory sdk run pytest`는 111건 통과했다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
+2026-10-02 로컬 `uv run pytest tests`는 689건 통과·3건 skip(약 13초)이었으며 `tests/test_architecture_guard.py` 13건도 포함한다. 같은 날 `uv --directory sdk run pytest`는 111건 통과했다. Disposable MariaDB/Redis, 유효한 Keystone credentials, live OpenStack이 필요한 skip·migration/readiness 검증은 통과로 승격하지 않는다.
 
-GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규정과 기준선은 [`AGENTS.md`](AGENTS.md)의 CI 절에 있다. 계약은 trigger 집합(`docker-build.yml` push 필터는 `branches`·`tags`만), fail-closed 발행 게이트(`docker-build.yml`에서 `test`를 뺀 잡 중 `packages: write`·`write-all` 권한(job 또는 상속한 workflow 수준), `docker/login-action`, literal `false`가 아닌 `push`의 `docker/build-push-action` 중 하나라도 있는 모든 잡의 `needs`에 `test`, 그 잡들과 `test`의 job-level `if`·`continue-on-error` 금지, `ci.yml` 잡·스텝의 `continue-on-error` 금지), `ci.yml` 잡·스텝의 `if`와 잡 간 `needs` 금지, PR 코드를 실행하는 workflow의 `ubuntu-*` runner·`permissions: contents: read`·job-level `permissions`/`environment`/`secrets` 금지·`secrets.GITHUB_TOKEN` 외 secret 참조 금지, `service`의 checkout 다음 첫 스텝인 architecture check와 `uv run pytest tests`, 빌드한 두 이미지의 Trivy 스캔, 서비스 health-check의 2초 이하 interval과 30초 이상 window(start-period + interval×retries)를 포함한다.
+GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규정은 [CI OpenSpec](openspec/specs/ci-governance/spec.md), 기준선·투영치·설정 확인 범위는 [별도 evidence](openspec/specs/ci-governance/evidence.md)에 있다. 계약은 trigger 집합(`docker-build.yml` push 필터는 `branches`·`tags`만), fail-closed 발행 게이트(`docker-build.yml`에서 `test`를 뺀 잡 중 `packages: write`·`write-all` 권한(job 또는 상속한 workflow 수준), `docker/login-action`, literal `false`가 아닌 `push`의 `docker/build-push-action` 중 하나라도 있는 모든 잡의 `needs`에 `test`, 그 잡들과 `test`의 job-level `if`·`continue-on-error` 금지, `ci.yml` 잡·스텝의 `continue-on-error` 금지), `ci.yml` 잡·스텝의 `if`와 잡 간 `needs` 금지, PR 코드를 실행하는 workflow의 `ubuntu-*` runner·`permissions: contents: read`·job-level `permissions`/`environment`/`secrets` 금지·`secrets.GITHUB_TOKEN` 외 secret 참조 금지, `service`의 checkout 다음 첫 스텝인 architecture check와 `uv run pytest tests`, 빌드한 두 이미지의 Trivy 스캔, 서비스 health-check의 2초 이하 interval과 30초 이상 window(start-period + interval×retries)를 포함한다.
 
 - main/dev 대상 PR(fork·dependabot 포함)은 `CI`(`.github/workflows/ci.yml`)를 한 번 실행한다. `ci.yml`에는 push trigger가 없고 `workflow_call`과 `workflow_dispatch`가 있다.
-- dev/main push와 `v*` tag의 suite는 `Docker Build & Push`(`.github/workflows/docker-build.yml`)에서만 실행한다(tag는 별도로 `release.yml`의 GitHub Release wheel 발행도 실행하며, 이 발행은 suite 결과를 기다리지 않는다. 이 CI 변경 전부터 있는 공백이며 [`AGENTS.md`](AGENTS.md) CI 3번에 기록했다). 그 `test` job이 `ci.yml`을 reusable workflow로 실행하고 `build-and-push`가 `needs: test`로 전체 결과를 기다린 뒤 GHCR에 발행한다. 이 workflow에는 `pull_request` trigger가 없다.
-- `docker-build-and-scan`은 `setup-buildx-action` 없이 default docker driver로 `drover-api`/`drover-worker` target을 daemon에 직접 빌드(`load: true`)하고 Trivy 두 단계로 스캔한다. 발행용 `build-and-push`는 Buildx를 그대로 쓴다. docker driver 경로는 로컬에서 실행하지 않았으므로 CI 실행으로만 확인된다. PR은 발행용 Buildx 빌드와 metadata/labels 단계를 실행하지 않으므로 그 경로에만 있는 실패는 merge 후 dev/main push에서 드러나며, `needs: test` 뒤 발행 단계라 fail-closed다. 이 post-merge 검출은 [`AGENTS.md`](AGENTS.md) CI 절에서 수용한 검증 공백이다.
+- dev/main push와 `v*` tag의 suite는 `Docker Build & Push`(`.github/workflows/docker-build.yml`)에서만 실행한다(tag는 별도로 `release.yml`의 GitHub Release wheel 발행도 실행하며, 이 발행은 suite 결과를 기다리지 않는다. 이 CI 변경 전부터 있는 [미해결 공백](openspec/specs/ci-governance/spec.md#requirement-parallel-validation-with-fail-closed-artifact-publication-original-rules-3-11)이다). 그 `test` job이 `ci.yml`을 reusable workflow로 실행하고 `build-and-push`가 `needs: test`로 전체 결과를 기다린 뒤 GHCR에 발행한다. 이 workflow에는 `pull_request` trigger가 없다.
+- `docker-build-and-scan`은 `setup-buildx-action` 없이 default docker driver로 `drover-api`/`drover-worker` target을 daemon에 직접 빌드(`load: true`)하고 Trivy 두 단계로 스캔한다. 발행용 `build-and-push`는 Buildx를 그대로 쓴다. docker driver 경로는 로컬에서 실행하지 않았으므로 CI 실행으로만 확인된다. PR은 발행용 Buildx 빌드와 metadata/labels 단계를 실행하지 않으므로 그 경로에만 있는 실패는 merge 후 dev/main push에서 드러나며, `needs: test` 뒤 발행 단계라 fail-closed다. 이 post-merge 검출은 [CI OpenSpec](openspec/specs/ci-governance/spec.md)의 수용한 검증 공백이다. Trivy `exit-code: '0'`은 취약점 발견을 차단하지 않는다.
 - `db-migration-and-readiness`의 MariaDB/Redis service health-check는 2초 interval에 각각 30회/15회 retry(60초/30초 window)다.
 
 ## Change guide
@@ -200,7 +203,7 @@ GitHub Actions 형태는 `tests/test_ci_workflows.py`가 고정하며 성능 규
 | Stampede/GPU/Afterglow boundary | `drover/services/stampede.py`, `afterglow.py`, `docs/afterglow-service-integration.md` | current intent/admission scope, `tests/test_k3s_stampede.py`, `tests/test_afterglow_*`, feature coverage |
 | schema, migration, durable model | `drover/models/orm.py`, `drover/migrations/`, `drover/scripts/migrate.py` | migration ledger/readiness, `tests/test_durable_create.py`, Deployment and operations |
 | SDK/catalog | `sdk/drover_sdk/service.py`, `sdk/drover_sdk/proxy.py`, `sdk/pyproject.toml` | `/v1` and alias wording, `sdk/tests/test_proxy.py`, docs catalog sections |
-| CI workflow/test runtime | `.github/workflows/*.yml`, [`AGENTS.md`](AGENTS.md) CI 절 | `tests/test_ci_workflows.py`, 20회 이상 전후 실측 기록, Development and verification |
+| CI workflow/test runtime | `.github/workflows/*.yml`, [CI OpenSpec](openspec/specs/ci-governance/spec.md)와 [evidence](openspec/specs/ci-governance/evidence.md) | `tests/test_ci_workflows.py`, 20회 이상 전후 실측 기록, Development and verification |
 | bugfix/refactor with no topology change | affected source and tests | explain why topology/data contract is unchanged in the Maintenance review summary and restamp |
 
 ## Maintenance
@@ -216,9 +219,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "325e70a5501cfbe6656b9a098a5652b4f62be2f08f3bf9a4fab2b1442cd0df7c",
-  "reviewed_at": "2026-09-26T18:00:26Z",
-  "summary": "0.2.25: cluster deletion reads every Service's annotations before touching nodes/VMs (kube.list_service_annotations) and the OCCM LB cleanup keeps floating IPs whose creator or load-balancer-id sharer set keep-floatingip, or whose intent is unknown; release notes and versions; no schema/public API change"
+  "source_sha256": "8ffa2993c06a3271e7d34a3dfe53aa36c99d47c6b3cc8576f79b303219875f68",
+  "reviewed_at": "2026-10-02T05:22:02Z",
+  "summary": "0.3.0: API CorrelationMiddleware logs INFO HTTP completion (method, prefixed route template resolved via fastapi.routing.iter_route_contexts because included routers expose router-local paths, status, outcome, duration, validated request ID); drover.logging.configure_logging gives API/Worker a shared format with opt-in LOG_LEVEL=DEBUG for Drover loggers only; safe_metadata emits value-free allowlisted key/count summaries; worker durable jobs log only attempt-fenced success/retry/error/deferred outcomes; callback/auth/worker loops stop logging exception strings, tracebacks, source IPs and plugin errors; AGENTS CI rules moved to openspec ci-governance spec/evidence; version 0.3.0 in pyproject/__init__/uv.lock/Kolla image tag; uvicorn access log and readiness tracebacks unchanged; no schema, migration or public API change"
 }
 ```
 <!-- architecture-review:end -->
