@@ -12,6 +12,7 @@ from sqlalchemy import exists, or_, select
 from sqlalchemy.orm import aliased
 
 from drover.db import get_session_factory
+from drover.logging import safe_metadata
 from drover.models.orm import DroverJob, DroverOperation, K3sCluster
 from drover.services import operations
 
@@ -239,6 +240,10 @@ async def _claim_one() -> tuple[str, int, str, str, str, dict] | None:
         return None
     now = _now()
     stale_before = now - timedelta(seconds=_LEASE_SECONDS)
+    if _logger.isEnabledFor(logging.DEBUG):
+        _logger.debug(
+            "Drover job query=%s", safe_metadata({"status": ("queued", "running"), "cluster_id": None})
+        )
     active_job = aliased(DroverJob)
     async with factory() as session, session.begin():
         while True:
@@ -490,26 +495,47 @@ async def _heartbeat_lease(job_id: str, *, attempt: int, stop: asyncio.Event) ->
                 return
 
 
+def _log_job_completion(job_id: str, attempt: int, kind: str, outcome: str) -> None:
+    """Report only committed outcomes, with a validated durable ID and kind."""
+    try:
+        safe_id = str(uuid.UUID(job_id))
+        if safe_id != job_id:
+            safe_id = "untrusted"
+    except (ValueError, TypeError, AttributeError):
+        safe_id = "untrusted"
+    safe_kind = kind if kind in _SUPPORTED_KINDS else "unknown"
+    _logger.info(
+        "Drover job completion kind=%s job_id=%s attempt=%d outcome=%s", safe_kind, safe_id, attempt, outcome
+    )
+    if _logger.isEnabledFor(logging.DEBUG):
+        _logger.debug("Drover job result=%s", safe_metadata({"status": outcome, "attempt": attempt}))
+
+
 async def process_one_job() -> bool:
     """Claim and execute at most one durable Drover job."""
     claimed = await _claim_one()
     if claimed is None:
         return False
     job_id, attempt, kind, cluster_id, project_id, payload = claimed
+    if _logger.isEnabledFor(logging.DEBUG):
+        _logger.debug(
+            "Drover job claimed state=%s",
+            safe_metadata({"status": "running", "kind": kind, "attempt": attempt, "cluster_id": cluster_id}),
+        )
     stop = asyncio.Event()
     heartbeat = asyncio.create_task(_heartbeat_lease(job_id, attempt=attempt, stop=stop))
     try:
         await _execute_job_direct(kind, payload, cluster_id, project_id)
-        await _complete(job_id, attempt=attempt)
+        if await _complete(job_id, attempt=attempt):
+            _log_job_completion(job_id, attempt, kind, "success")
     except Exception as exc:
         from drover.services.autoscale import ProvisioningInProgress
 
         if isinstance(exc, ProvisioningInProgress):
-            _logger.info("Drover job deferred job_id=%s kind=%s attempt=%d", job_id, kind, attempt)
-            await _defer_in_progress(job_id, attempt=attempt)
-        else:
-            _logger.exception("Drover job failed job_id=%s kind=%s attempt=%d", job_id, kind, attempt)
-            await _retry_or_fail(job_id, attempt=attempt, error=str(exc))
+            if await _defer_in_progress(job_id, attempt=attempt):
+                _log_job_completion(job_id, attempt, kind, "deferred")
+        elif await _retry_or_fail(job_id, attempt=attempt, error=str(exc)):
+            _log_job_completion(job_id, attempt, kind, "error" if attempt >= _MAX_ATTEMPTS else "retry")
     finally:
         stop.set()
         heartbeat.cancel()

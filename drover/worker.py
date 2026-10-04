@@ -8,6 +8,7 @@ import signal
 
 from drover.config import get_settings, validate_config
 from drover.db import close_db, init_db
+from drover.logging import configure_logging
 
 _logger = logging.getLogger("drover.worker")
 
@@ -23,8 +24,8 @@ async def _reconcile_worker_loop():
         try:
             await operations.recover_expired_callback_operations(timeout_seconds=1800)
             await reconciliation.schedule_worker_reconciliations(max_per_project=concurrency)
-        except Exception as exc:
-            _logger.warning("Reconcile worker loop error: %s", exc)
+        except Exception:
+            _logger.warning("Reconcile worker loop failed")
         await asyncio.sleep(interval)
 
 
@@ -35,12 +36,13 @@ async def _jobs_worker_loop():
     while True:
         try:
             processed = await claim_and_run_jobs()
+            _logger.debug("Jobs worker batch complete processed=%d", processed)
             if processed == 0:
                 await asyncio.sleep(5)
             else:
                 await asyncio.sleep(1)
-        except Exception as exc:
-            _logger.warning("Jobs worker loop error: %s", exc)
+        except Exception:
+            _logger.warning("Jobs worker loop failed")
             await asyncio.sleep(5)
 
 
@@ -53,8 +55,8 @@ async def _health_worker_loop():
     while True:
         try:
             await health.check_all_active_clusters()
-        except Exception as exc:
-            _logger.warning("Health worker loop error: %s", exc)
+        except Exception:
+            _logger.warning("Health worker loop failed")
         await asyncio.sleep(interval)
 
 
@@ -68,13 +70,13 @@ async def _stampede_worker_loop():
         try:
             if s.drover_stampede_enabled:
                 await stampede.run_all()
-        except Exception as exc:
-            _logger.warning("Stampede worker loop error: %s", exc)
+        except Exception:
+            _logger.warning("Stampede worker loop failed")
         await asyncio.sleep(interval)
 
 
 async def _main_async():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    configure_logging()
     _logger.info("Starting Drover background worker...")
 
     settings = get_settings()

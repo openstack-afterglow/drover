@@ -5,13 +5,36 @@ from __future__ import annotations
 import contextvars
 import logging
 import re
+import time
 import uuid
 from collections.abc import MutableMapping
 from typing import Any
 
 from fastapi.responses import JSONResponse
+from fastapi.routing import iter_route_contexts
+from starlette.routing import compile_path
+
+_logger = logging.getLogger("drover.api")
+_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
 
 _REQUEST_ID_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,128}$")
+
+# Only known, non-credential field *names* appear in diagnostics. Values are never rendered.
+_SUMMARY_KEYS = frozenset({
+    "attempt", "cluster_id", "include_deleted", "kind", "limit", "offset",
+    "operation_id", "page", "request_id", "state", "status",
+})
+
+
+def safe_metadata(value: Any) -> str:
+    """Summarize shape without converting untrusted values or secret field names to text."""
+    if isinstance(value, MutableMapping):
+        keys = sorted(key for key in _SUMMARY_KEYS if key in value)
+        return f"mapping(count={min(len(value), 9999)},keys={','.join(keys)})"
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return f"{type(value).__name__}(count={min(len(value), 9999)})"
+    return "scalar"
+
 
 request_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar("drover_request_id", default=None)
 
@@ -73,6 +96,45 @@ class CorrelationMiddleware:
 
     def __init__(self, app: Any) -> None:
         self.app = app
+        # id(original route) -> (route, ((full template, compiled regex), ...)); the route reference
+        # guards against id reuse. FastAPI's included routers put the router-local route in scope,
+        # whose `path` lacks the include prefix (e.g. "" for GET /v1/clusters).
+        self._route_templates: dict[int, tuple[Any, tuple[tuple[str, re.Pattern[str] | None], ...]]] = {}
+
+    def _index_routes(self, app: Any) -> None:
+        routes = getattr(app, "routes", None)
+        if not routes:
+            return
+        grouped: dict[int, tuple[Any, list[tuple[str, re.Pattern[str] | None]]]] = {}
+        for context in iter_route_contexts(routes):
+            if context.path:
+                original = context.original_route
+                grouped.setdefault(id(original), (original, []))[1].append(
+                    (context.path, compile_path(context.path)[0])
+                )
+        self._route_templates.update({key: (route, tuple(items)) for key, (route, items) in grouped.items()})
+
+    def _route_template(self, scope: MutableMapping[str, Any]) -> str:
+        """Return the static, prefixed route template; never the raw request path."""
+        route = scope.get("route")
+        if route is None:
+            return "(unmatched)"
+        entry = self._route_templates.get(id(route))
+        if entry is None or entry[0] is not route:
+            self._index_routes(scope.get("app"))
+            entry = self._route_templates.get(id(route))
+            if entry is None or entry[0] is not route:
+                entry = (route, ((getattr(route, "path", "") or "(unmatched)", None),))
+                self._route_templates[id(route)] = entry
+        templates = entry[1]
+        if len(templates) == 1:
+            return templates[0][0]
+        # The same route object included under several prefixes: pick the one this request matched.
+        path = scope.get("path", "")
+        for template, regex in templates:
+            if regex is not None and regex.match(path):
+                return template
+        return "(ambiguous)"
 
     async def __call__(self, scope: MutableMapping[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -95,11 +157,15 @@ class CorrelationMiddleware:
         state["request_id"] = req_id
 
         token = request_id_ctx.set(req_id)
+        started = time.monotonic()
         response_started = False
+        status = 500
+        failed = False
 
         async def send_with_correlation(message: MutableMapping[str, Any]) -> None:
-            nonlocal response_started
+            nonlocal response_started, status
             if message["type"] == "http.response.start":
+                status = message["status"]
                 response_started = True
                 res_headers = list(message.get("headers", []))
                 has_header = any(k.lower() == b"x-openstack-request-id" for k, v in res_headers)
@@ -110,12 +176,27 @@ class CorrelationMiddleware:
 
         try:
             await self.app(scope, receive, send_with_correlation)
-        except Exception as exc:
+        except Exception:
+            failed = True
             if not response_started:
                 res = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
                 res.headers["X-Openstack-Request-Id"] = req_id
                 await res(scope, receive, send)
             else:
-                raise exc
+                raise
         finally:
+            route_path = self._route_template(scope)
+            method = scope.get("method", "")
+            method = method if method in _METHODS else "OTHER"
+            outcome = "error" if failed or status >= 400 else "success"
+            _logger.info(
+                "API completed method=%s route=%s status=%d outcome=%s duration_ms=%d request_id=%s",
+                method, route_path, status, outcome, int((time.monotonic() - started) * 1000), req_id,
+            )
+            if _logger.isEnabledFor(logging.DEBUG):
+                # Never inspect query values, request/response bodies, headers or path parameters.
+                query_keys = {key.decode("ascii"): None for item in scope.get("query_string", b"")[:2048].split(b"&")
+                              if (key := item.split(b"=", 1)[0]) in {k.encode("ascii") for k in _SUMMARY_KEYS}}
+                _logger.debug("API metadata query=%s state=%s result=%s",
+                              safe_metadata(query_keys), safe_metadata(state), safe_metadata({"status": status}))
             request_id_ctx.reset(token)

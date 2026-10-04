@@ -113,7 +113,7 @@ async def test_probe_tls_server_cert_unreachable_returns_empty():
 
     from drover.services.certs import probe_tls_server_cert
 
-    # 실제 192.0.2.1:6443에 접속하지 않고 연결 실패 경로만 hermetic하게 실행한다(AGENTS.md CI 규칙 7).
+    # 실제 192.0.2.1:6443에 접속하지 않고 연결 실패 경로만 hermetic하게 실행한다(openspec/specs/ci-governance/spec.md hermetic test 요구사항).
     connect = MagicMock(side_effect=OSError("unreachable"))
     with patch("drover.services.certs.socket.create_connection", new=connect):
         result = await probe_tls_server_cert("192.0.2.1", 6443, timeout=0.5)
