@@ -688,8 +688,8 @@ async def migrate_redis(source_url: str, destination_url: str, *, apply: bool) -
                     raise CutoverError(f"Redis key count mismatch after copying {pattern}")
         return counts
     finally:
-        await source.aclose()
-        await destination.aclose()
+        await source.close()
+        await destination.close()
 
 
 async def cutover(*, apply: bool) -> dict[str, Any]:

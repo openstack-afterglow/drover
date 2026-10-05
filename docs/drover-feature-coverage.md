@@ -93,7 +93,7 @@ drover wheel
         └── drover-migrate.json.j2# Pre-start Migration 컨테이너 템플릿
 ```
 
-소스 role은 `deploy/kolla/ansible/roles/drover`에 있으며 root `drover` wheel의 shared data로 설치됩니다. wheel 기본 설치는 Kolla-Ansible 및 API/Worker runtime dependencies를 포함하지 않으며 서비스 process에는 `drover[service]` extra가 필요합니다. `drover_image_tag` 기본값은 `v0.3.0`입니다(`defaults/main.yml`). 실제 GHCR 이미지 발행과 digest 확인 없이 소스 기본값만으로 배포 완료를 판단하지 않습니다. `drover_source_version`은 별도 source-build pin이고 SDK 버전(`0.2.21`)도 독립적입니다. 이전 릴리스 경계는 [0.2.25 릴리스 노트](release-0.2.25.md)에 보존합니다.
+소스 role은 `deploy/kolla/ansible/roles/drover`에 있으며 root `drover` wheel의 shared data로 설치됩니다. wheel 기본 설치는 Kolla-Ansible 및 API/Worker runtime dependencies를 포함하지 않으며 서비스 process에는 `drover[service]` extra가 필요합니다. `drover_image_tag` 기본값은 `v0.3.1`입니다(`defaults/main.yml`). 실제 GHCR 이미지 발행과 digest 확인 없이 소스 기본값만으로 배포 완료를 판단하지 않습니다. `drover_source_version`은 별도 source-build pin이고 SDK 버전(`0.2.21`)도 독립적입니다. 현재 patch candidate 검증 경계는 [0.3.0 릴리스 문서의 0.3.1 section](release-0.3.0.md)에, 이전 릴리스 경계는 [0.2.25 릴리스 노트](release-0.2.25.md)에 보존합니다.
 
 ### Schema Readiness 및 Pre-start Migration
 - API 및 Worker 프로세스 시작 전, `drover-migrate` 컨테이너가 먼저 실행되어 `drover/migrations/manifest.txt` 및 `001_baseline.sql` 래저 체크섬을 검증하고 DB 마이그레이션을 안전하게 수행합니다.

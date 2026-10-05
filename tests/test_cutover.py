@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 from collections.abc import AsyncIterator
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -307,6 +308,22 @@ async def test_redis_copy_preserves_payload_ttl_and_is_dry_run_safe():
     )
     assert count == 1
     assert destination.restored == [(b"drover:health:c1", 1000, b"dump-health", True)]
+
+
+async def test_redis_migration_closes_both_pinned_clients():
+    source = cutover.Redis.from_url("redis://127.0.0.1:1/0")
+    destination = cutover.Redis.from_url("redis://127.0.0.1:1/1")
+    with (
+        patch.object(cutover.Redis, "from_url", side_effect=[source, destination]),
+        patch.object(cutover, "_copy_redis_pattern", new_callable=AsyncMock, return_value=0),
+        patch.object(source.connection_pool, "disconnect", new_callable=AsyncMock) as source_disconnect,
+        patch.object(destination.connection_pool, "disconnect", new_callable=AsyncMock) as destination_disconnect,
+    ):
+        counts = await cutover.migrate_redis("redis://source/0", "redis://destination/0", apply=False)
+
+        assert all(count == 0 for count in counts.values())
+        source_disconnect.assert_awaited_once_with()
+        destination_disconnect.assert_awaited_once_with()
 
 
 def test_database_url_normalization_and_backend_rejection():
