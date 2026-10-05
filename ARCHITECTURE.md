@@ -6,7 +6,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: `drover==0.3.0`, `drover-sdk==0.2.21` (별도 SDK 버전)
+- 패키지: `drover==0.3.1`, `drover-sdk==0.2.21` (별도 SDK 버전)
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -144,11 +144,13 @@ FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 �
 - `drover-sdk`: `sdk/`의 독립 Python package이며 API/Worker process에 import되어야 하는 내부 module이 아니다.
 - `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
 - 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
-- Kolla role의 `drover_image_tag`은 `v0.3.0`다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 이미지의 실제 발행과 immutable digest 확인은 이 소스 기본값과 별도로 검증한다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
+- Kolla role의 `drover_image_tag`은 `v0.3.1`다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 이미지의 실제 발행과 immutable digest 확인은 이 소스 기본값과 별도로 검증한다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
 
-릴리스 변경과 검증 경계는 [`docs/release-0.3.0.md`](docs/release-0.3.0.md)에 정리한다. 이전 릴리스는 [`docs/release-0.2.25.md`](docs/release-0.2.25.md)에 남아 있다. root wheel/런타임/lock은 `0.3.0`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag 원문으로 발행한다. 이 문구 자체는 발행·배포 완료의 증거가 아니다.
+릴리스 변경과 검증 경계는 [`docs/release-0.3.0.md`](docs/release-0.3.0.md)의 0.3.1 patch candidate section에 정리한다. 0.3.0 및 이전 [`0.2.25`](docs/release-0.2.25.md)의 검증 기록은 보존한다. root wheel/런타임/lock은 `0.3.1`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag 원문으로 발행한다. 두 이미지 모두 main ref는 명시적 `latest`를 만들고, version-tag ref도 `docker/metadata-action@v5`의 기본 `latest=auto` 및 `type=ref,event=tag`에 의해 `latest`를 만든다. 따라서 tag push도 `latest`를 이동하며 main-only 정책이 아니다. 이 문구 자체는 발행·배포 완료의 증거가 아니다.
 
 `GET /v1/health`와 `/v1/health/live`는 process liveness만 의미한다. `/v1/health/ready`는 MariaDB, Redis ping, migration ledger, Keystone service credentials를 모두 확인하고 하나라도 unavailable이면 `503`을 반환한다. 로그는 각 process의 표준 logging과 correlation ID에 남고, operation event 및 reconciliation drift는 MariaDB API 조회로 확인한다. health 결과·Stampede event는 Redis cache이므로 장애 시 최신 값이 없을 수 있다.
+
+0.3.1은 disposable Redis readiness/shutdown 및 cutover dry-run에서 관측한 `redis==5.0.0` client API 불일치를 수정한다. `drover/cache.py:close_cache`와 `drover/scripts/cutover.py:migrate_redis`는 존재하지 않는 `aclose()` 대신 pinned client의 비동기 `close()`를 호출한다. 실제 Redis class를 사용하는 `tests/test_redis_backend.py::test_close_cache_disconnects_pinned_redis_and_clears_client`, `tests/test_cutover.py::test_redis_migration_closes_both_pinned_clients`가 pool 해제와 singleton reset을 검증한다. topology·schema·data contract는 변경하지 않는다.
 
 API/Worker는 `drover/logging.py:configure_logging`으로 Drover logger를 기본 INFO, 명시적 `LOG_LEVEL=DEBUG`에서만 DEBUG로 설정한다(라이브러리 전체 DEBUG가 아니다). `CorrelationMiddleware`는 HTTP 응답 완료 시 INFO로 method, 정적 route template, status, outcome, duration 및 검증된 request ID를 남긴다. FastAPI `include_router`가 scope에 넣는 route는 prefix 없는 router-local path(`GET /v1/clusters`는 `""`)이므로 template은 `fastapi.routing.iter_route_contexts`로 prefix가 붙은 경로를 원본 route별로 색인해 얻고, 같은 route가 여러 prefix에 포함되면 요청 path와 일치하는 template을 고른다. pre-response 예외는 500으로 응답하고 error로 기록하며, 시작한 SSE 응답에서 예외가 발생하면 이미 전송한 status와 error outcome을 함께 기록한다. Worker의 durable job은 attempt fence가 승인한 완료/재시도/실패/보류를 INFO로 기록한다. DEBUG query/state/result는 `safe_metadata`의 개수 및 허용된 필드 **이름**만 최대 길이로 요약하며 값·raw path·header·body·응답 본문·job payload·Kubernetes/Keystone credential·exception traceback을 기록하지 않는다. 기존 operation/event의 상세 상태는 DB 계약이며 이 로그는 그것을 대체하지 않는다. `LOG_LEVEL=DEBUG drover-api` / `LOG_LEVEL=DEBUG drover-worker`는 로컬 실행 예시이며 프로덕션에서는 두 프로세스 환경에 각각 명시한다. Kolla role(`drover_service_environments`)은 `LOG_LEVEL` 변수를 제공하지 않는다. 이 범위 밖의 기존 동작은 바뀌지 않았다: Dockerfile·Kolla의 `uvicorn` 명령은 access log를 끄지 않으므로 uvicorn access log에는 raw path와 query string이 남고, readiness 검사 실패 경고(`drover/main.py`, `drover/db.py`)는 traceback을 남긴다.
 
@@ -219,9 +221,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "8ffa2993c06a3271e7d34a3dfe53aa36c99d47c6b3cc8576f79b303219875f68",
-  "reviewed_at": "2026-10-02T05:22:02Z",
-  "summary": "0.3.0: API CorrelationMiddleware logs INFO HTTP completion (method, prefixed route template resolved via fastapi.routing.iter_route_contexts because included routers expose router-local paths, status, outcome, duration, validated request ID); drover.logging.configure_logging gives API/Worker a shared format with opt-in LOG_LEVEL=DEBUG for Drover loggers only; safe_metadata emits value-free allowlisted key/count summaries; worker durable jobs log only attempt-fenced success/retry/error/deferred outcomes; callback/auth/worker loops stop logging exception strings, tracebacks, source IPs and plugin errors; AGENTS CI rules moved to openspec ci-governance spec/evidence; version 0.3.0 in pyproject/__init__/uv.lock/Kolla image tag; uvicorn access log and readiness tracebacks unchanged; no schema, migration or public API change"
+  "source_sha256": "0b0bfd402de00927f1976ff7416824e37ac4e898905487be3e47970513b578b1",
+  "reviewed_at": "2026-10-05T08:48:54Z",
+  "summary": "0.3.1 patch: root pyproject/runtime/lock and Kolla API/worker image tag bumped, SDK0.2.21 and ordinary dependencies/source-build pin preserved. Fixed observed redis==5.0.0 shutdown AttributeError in API cache and cutover source/destination by using its async close API; real-class regressions fail before fix and cover pool disconnect/singleton reset. No topology, schema, migration or public API/data contract changes. Reviewed existing CI/wheel lifecycle and both-target metadata-action latest=auto tag policy; preserved historical 0.3.0 evidence."
 }
 ```
 <!-- architecture-review:end -->

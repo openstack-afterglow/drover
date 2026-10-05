@@ -1,8 +1,11 @@
-"""Redis Sentinel client construction contracts."""
+"""Redis client construction and pinned-client lifecycle contracts."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from redis.asyncio import Redis
+
+from drover import cache
 from drover.services.cache.redis_backend import RedisBackend
 
 
@@ -43,3 +46,17 @@ def test_sentinel_master_omits_password_for_unauthenticated_redis() -> None:
         RedisBackend._build_sentinel_client(settings)
 
     assert "password" not in sentinel.master_for.call_args.kwargs
+
+
+async def test_close_cache_disconnects_pinned_redis_and_clears_client(monkeypatch):
+    client = Redis.from_url("redis://127.0.0.1:1/0")
+    disconnect = AsyncMock()
+    monkeypatch.setattr(client.connection_pool, "disconnect", disconnect)
+    monkeypatch.setattr(cache, "_client", client)
+
+    await cache.close_cache()
+
+    disconnect.assert_awaited_once_with()
+    assert cache._client is None
+    await cache.close_cache()
+    disconnect.assert_awaited_once_with()
