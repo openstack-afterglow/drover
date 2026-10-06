@@ -62,6 +62,7 @@ openstack endpoint list --service drover
 ### 2.2 Kolla-Ansible 배포 환경 설정
 Kolla catalog registration의 source authority는 `deploy/kolla/ansible/roles/drover/tasks/preconditions_keystone.yml`이다.
 - `service_ks_register_services`에 `name: drover`, `type: drover`와 public/internal/admin root endpoints가 정의되어 있다. SDK는 root 또는 `/v1` catalog URL을 받아 versioned API로 연결한다. 위 `/v1` URL은 지원되는 예시이지 Kolla 기본 등록값은 아니다.
+- 기존 설치의 `deploy`에서 DB·Keystone resource 재생성만 건너뛰려면 `drover_run_preconditions: false`를 사용할 수 있다(`defaults/main.yml`, `tasks/deploy.yml`). 기존 DB/schema·서비스 사용자·catalog가 확인된 경우에만 적용한다. migration bootstrap과 API/Worker start는 생략되지 않는다. 신규 설치는 기본 `true`를 유지한다. 2026-10-06 DMSLab 적용 근거와 실제 배포·외부 인증 결과는 [0.4.3 배포 기록](release-0.4.0.md#tagged-043-verification-2026-10-06)을 참조한다.
 
 ---
 

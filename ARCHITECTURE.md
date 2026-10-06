@@ -24,7 +24,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 | Afterglow provisioning intent/GPU admission 연동 | partial | source-reviewed, test-defined | 일반 create는 Drover가 직접 Nova/Cinder 등을 호출하고 intent/admission은 특정 Stampede 경로다 | `drover/services/afterglow.py`, `drover/services/stampede.py`, `tests/test_afterglow_admission.py`, `tests/test_afterglow_provisioning.py` |
 | legacy `gpu_quotas` 제거 | partial | source-reviewed, test-defined | 역사적 `001_baseline.sql` 테이블은 아직 물리 삭제하지 않았고 조건부 runbook만 있다 | `drover/migrations/001_baseline.sql`, `drover/migrations/README.md`, `docs/gpu-quota-table-retirement-runbook.md` |
 
-위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-10-06 로컬 `v0.3.1` 기준 통합 후 0.4.3 소스에서 `uv run --frozen pytest tests`는 852건 통과·3건 skip이었고, `uv --directory sdk run --frozen pytest`는 111건 통과했다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 이 수치에 포함되지 않는다.
+위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-10-06 최종 0.4.3 hardening 소스에서 `uv run --frozen pytest tests`는 866건 통과·3건 skip이었고, `uv --directory sdk run --frozen pytest`는 111건 통과했다. skip된 live integration은 이 수치에 포함되지 않는다. 별도로 관측한 OpenStack/K3s CPU·GPU scaling, 삭제 안전 경로, 실제 tagged Kolla 배포와 외부 endpoint 결과 및 한계는 [`0.4.3 검증 기록`](docs/release-0.4.0.md#tagged-043-verification-2026-10-06)에서 구분한다.
 
 ## System context
 
@@ -152,6 +152,7 @@ FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 �
 - `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
 - 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
 - Kolla role의 `drover_image_tag`은 `v0.4.3`다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 이미지의 실제 발행과 immutable digest 확인은 이 소스 기본값과 별도로 검증한다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
+- `drover_run_preconditions`의 기본값은 `true`다. `tasks/deploy.yml`은 이 flag로 DB·Keystone resource 생성만 조건부 실행하며 `bootstrap_service.yml` migration과 `start.yml`은 계속 실행한다. 기존 DB·catalog를 확인한 2026-10-06 DMSLab 재배포는 ProxySQL의 기존 `kolla_root` 생성 권한 거부 때문에 operator override를 `false`로 두었다. 신규 설치는 기본값을 유지해야 한다. API에만 Docker healthcheck가 있으므로 Worker 실행 여부와 durable job 성공은 별도로 검증한다. 실제 v0.4.3 digest·세 controller·외부 endpoint 검증은 아래 릴리스 기록을 따른다.
 
 릴리스 변경과 검증 경계는 [`docs/release-0.4.0.md`](docs/release-0.4.0.md)(0.4.1–0.4.3 patch section 포함)에 정리한다. 0.3.1 patch와 0.3.0은 [`docs/release-0.3.0.md`](docs/release-0.3.0.md), 이전 [`0.2.25`](docs/release-0.2.25.md)의 검증 기록으로 보존한다. root wheel/런타임/lock은 `0.4.3`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag 원문으로 발행한다. 두 이미지 모두 main ref는 명시적 `latest`를 만들고, version-tag ref도 `docker/metadata-action@v5`의 기본 `latest=auto` 및 `type=ref,event=tag`에 의해 `latest`를 만든다. 따라서 tag push도 `latest`를 이동하며 main-only 정책이 아니다. 발행 workflow는 `platforms`를 지정하지 않으므로 GitHub `ubuntu-latest` runner의 단일 `linux/amd64` image를 만든다. 이 문구 자체는 발행·배포 완료의 증거가 아니다.
 
@@ -229,8 +230,8 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 {
   "schema_version": 1,
   "source_sha256": "275a988f285d314a32551a197e39a4d32fbe17fd0d79e556351dd93adcdabb28",
-  "reviewed_at": "2026-10-06T12:16:01Z",
-  "summary": "0.4.3: autoscale/kube reserve a missing worker Node name cordoned after complete observation, fail closed on POST conflict/denial/ambiguity, retain reservation and normal drain/final Nova ownership gates; stampede distinguishes join and GPU allocation failures; targeted safety regressions and API/integration/feature/release docs updated; no topology/schema/public endpoint changes"
+  "reviewed_at": "2026-10-06T13:32:20Z",
+  "summary": "v0.4.3 tagged release and actual DMSLab genconfig/pull/deploy evidence recorded; supported existing-resource preconditions override and API-only Docker healthcheck boundary source-reviewed; three-controller readiness, public TLS/auth/Swagger execution, deployed durable jobs and owned fixture cleanup verified; no topology/schema/runtime source changes"
 }
 ```
 <!-- architecture-review:end -->

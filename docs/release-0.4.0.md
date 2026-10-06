@@ -66,7 +66,7 @@ Live evidence with 0.4.3 (`dev`/`sha-75eb5f9` digests on all three DMSLab contro
 - **Fresh GPU scale-up.** On 0.4.3 userdata a new GPU worker joined without intervention about five minutes after its intent was submitted. It reported `nvidia.com/gpu: 1` and ran the `nvidia-smi` Pod. Two earlier attempts within four minutes of the previous GPU worker's deletion failed in Afterglow `/submit` (502). Nova reported "Exhausted all hosts available for retrying build failures". Drover marked them `provision_failed`, did not create local fallback VMs, and succeeded on the next reservation. Afterglow left those two `ERROR` servers in the project; that is outside Drover's tracking.
 - **Automatic GPU scale-down.** After the GPU Pod was removed, Stampede waited out the cooldown and the 600-second window, then drained the node. Nova deleted the server, Drover deleted the intent-provisioned boot volume, and the nodegroup reached `node_count=0`/`tracked_count=0` with `scale_down success` 25 seconds after start.
 
-Throughout, the pre-existing `test-cluster` stayed `stampede_enabled=false`, and no Stampede activity was logged for any other project. The disposable project and everything created for it were removed afterwards. That covered the cluster through Drover's delete path, the two Afterglow `ERROR` orphans, the Afterglow GPU quota row, flavor access, the role grants and the Drover-created manager user. The Drover `project_manager_credentials` row for the deleted project was left in MariaDB, because no direct SQL was used. No `v0.4.1`–`v0.4.3` version tag has been published.
+Throughout, the pre-existing `test-cluster` stayed `stampede_enabled=false`, and no Stampede activity was logged for any other project. The disposable project and everything created for it were removed afterwards. That covered the cluster through Drover's delete path, the two Afterglow `ERROR` orphans, the Afterglow GPU quota row, flavor access, the role grants and the Drover-created manager user. The Drover `project_manager_credentials` row for the deleted project was left in MariaDB, because no direct SQL was used. At that dev-verification point, no `v0.4.1`–`v0.4.3` version tag had been published.
 
 ### 0.4.3 release hardening
 
@@ -75,4 +75,38 @@ Throughout, the pre-existing `test-cluster` stayed `stampede_enabled=false`, and
 - Retained-volume regressions also cover busy state, foreign-cluster metadata, Cinder 400/403 observations, rejected DELETE and accepted-but-unconfirmed DELETE. All preserve cleanup tracking rather than report success or force deletion.
 
 Local hardening gates: `uv run --frozen pytest tests` **866 passed / 3 skipped**, SDK **111 passed**, Ruff and source-linked architecture check passed. Final API and worker source built for both `linux/amd64` and `linux/arm64`; execution inside all four image/platform pairs reported package `0.4.3` and the expected `x86_64`/`aarch64`. The wheel built as `drover-0.4.3-py3-none-any.whl`. The independent applied-delta review found no blocking issue. These gates alone do not establish live reservation/late-registration, PDB, CPU scaling or final release deployment behavior.
+
+### Tagged 0.4.3 verification (2026-10-06)
+
+`v0.4.3` points to `9a99c8e3d4e45f7ebd92758b116cc56a1ea39a52`. The tag CI passed service/SDK tests and lint, architecture, disposable MariaDB migration/readiness smoke, image build/scan execution and wheel packaging before image publication. The published wheel is `drover-0.4.3-py3-none-any.whl` (SHA-256 `caf037ccf65c18bb6e4600db87d0396e6c8accfab03606794d908acdf1383e05`). Published registry images are amd64; the separate local dual-architecture execution evidence above is not a claim that the registry tag contains arm64.
+
+An isolated Ubuntu cluster exercised the public Drover API and the exact candidate image:
+
+- CPU Pending demand caused 0→1 scale-up; the worker became Ready and both demand Pods ran after **215 seconds**.
+- A real PDB with `minAvailable=2` rejected drain. The VM stayed ACTIVE, tracking remained and the newly acquired cordon was removed.
+- After demand was deleted, cooldown and the **600-second** stabilization window completed; automatic scale-down finished after **867 seconds**, with Nova VM and Cinder boot volume absent and nodegroup desired/tracked counts both zero.
+- A real POST reservation preceded kubelet registration. The deployed K3s/cloud-controller configuration retained both `spec.unschedulable=true` and the exact removal VM annotation after that worker became Ready. The normal manual delete path then removed it.
+- A second worker was deleted by the candidate's actual `delete_nodegroup_vms` while its Node was still absent. Its boot volume, Node reservation and VM tracking were removed only after verified Nova disappearance.
+
+The two ad-hoc verification processes emitted an `aiomysql.Connection.__del__` event-loop-closed warning after their successful assertions; those scripts did not dispose the async DB engine. This is recorded as probe teardown output, not silently presented as clean stderr or a live service failure. Ad-hoc container probes must initialize the DB before manager credential helpers and call `close_db` before the event loop exits.
+
+
+#### Actual Kolla deployment and external connection
+
+The operator `/etc/kolla/pyproject.toml` and lock now pin the Drover wheel/role to `v0.4.3`. Both registry `v0.4.3` and `latest` resolve to the deployed immutable references:
+
+| Container | Deployed reference |
+| --- | --- |
+| API | `ghcr.io/openstack-afterglow/drover-api@sha256:84fce558b57fd9efa820d740b04eec692b036c0b15e51f1dc853a926b5626923` |
+| Worker | `ghcr.io/openstack-afterglow/drover-worker@sha256:20ad980519edae585c22e0d2e1ec0e59bea4924ecec21e526118be9c9402db3d` |
+
+The real operator ran `genconfig`, `pull` and `deploy` with `/etc/kolla/.venv/bin/kolla-ansible -i multimode --tags drover`. The noninteractive runner explicitly prepended the venv bin directory to PATH; an absolute CLI path alone did not make `ansible-playbook` discoverable. The initial deploy stopped at existing DB resource creation because ProxySQL rejected `kolla_root`. Existing DB/schema and Keystone/catalog were checked, then the supported `drover_run_preconditions: false` override skipped only resource recreation. Migration bootstrap and service start still ran; DB privileges, SQL data and role source were not patched. Fresh installations must keep the default `true`.
+
+Final deploy returned **RC 0**: controller1 `ok=69 changed=2`, controller2/3 each `ok=53 changed=1`; all three had **unreachable=0 failed=0**. Their API and Worker containers run package `0.4.3`, the references above and OCI revision `9a99c8e3d4e45f7ebd92758b116cc56a1ea39a52`. All three APIs are Docker-healthy and return readiness **200**, with database/Redis/migrations/Keystone all `ok`. Workers have no Docker healthcheck; they are running, not labeled healthy. After deployment, public nodegroup PATCH requests produced provision operation `d148a690-36fa-4a45-b5db-2a253fc62a81` and absent-Node deletion operation `239d2d82-a18d-48a7-8009-e9a5c95e613c`, both **SUCCEEDED**. The new worker consumed the jobs and removed the VM, reserved Node, tracking and boot volume. HAProxy, ProxySQL and Keepalived image IDs/start timestamps were unchanged on every controller.
+
+Public `drover.dmslab.re.kr` resolves through `openstack.dmslab.re.kr` to `117.16.137.199`. Verified HTTPS readiness returned **200**, TLS verification result **0**, and all four checks `ok`. Authenticated project read returned **200**; cross-project access **404**; tenant access to an admin endpoint **403**; an invalid token **401**. Real isolated headless Chromium loaded `/docs` and executed Swagger's `/v1/health/ready`, showing **200** and the same check results. This is Drover API/Swagger verification, not an Afterglow UI workflow test. Root `/` is not an application landing page; OpenAPI `version: 1.0` denotes the API namespace, not the wheel version.
+
+The disposable cluster was removed through public durable DELETE and reached its retained **DELETED** tombstone (GET still returns **200**, not 404). Live Nova servers, Cinder volumes, project-owned networks/ports/routers/floating IPs and active managed inventory were all zero. Its keypairs/application credentials, default security group, scoped member grant, manager user and project were removed. Default security-group deletion needed existing admin rights; Neutron's deployed `get_security_groups` recreates the filtered project's default group even for an admin LIST, so disappearance was checked by recorded ID instead. No existing workload was deleted or opted into Stampede; pre-existing `test-cluster` stayed `stampede_enabled=false`. The encrypted `project_manager_credentials` row and lifecycle tombstones remain intentionally; no unsupported SQL deletion was used.
+
+Protected rollback evidence: `/etc/kolla/afterglow-release-backups/pre-drover-0.4.3-20261006T121751Z` contains the DB/config/operator backup, first failure logs, successful genconfig/pull/deploy logs, sanitized controller/public/job/cleanup results and Swagger screenshot. Final deploy stdout originated in `/tmp/drover043-kolla-20261006T130306Z`. Published images remain **amd64-only**; FCOS live checks were unavailable because no FCOS image was configured. Trivy scan execution is not a vulnerability-blocking gate (`exit-code: 0`), and the independent GitHub Release wheel workflow still does not wait for the tag test suite.
 
