@@ -252,6 +252,7 @@ LOG_LEVEL=DEBUG drover-worker
   ```
 - `ready_count`는 K3s Ready 수이고 GPU-ready 수가 아닙니다. `capacity.allocatable.gpu`, `stampede_state.ready_nodes`/`failed_nodes` 및 최종 operation 상태를 함께 확인합니다. `tracked_count`는 DB 추적 row 수입니다.
 - `quota_state.allowed`는 admission 결과일 뿐, 현재 Nova quota/GPU 호스트 여유를 보장하지 않습니다. `blocked_reasons`는 Pending Pod 분류이고 flavor/cooldown/min-max 등 결정 차단은 `last_blocked_reason`에 기록합니다.
+- 증설 실패 사유는 Node가 Ready가 되지 않았으면 `node_not_ready`, Ready 이후 GPU allocatable이 요청보다 부족하면 `gpu_not_allocatable`입니다. 부분 VM 생성은 `provision_failed`가 우선하고, 여러 worker 중 join 실패가 있으면 GPU 부족보다 우선합니다.
 
 ### `GET /v1/clusters/{cluster_id}/stampede/events`
 - **설명**: Redis 기반 Stampede 스케일링 이벤트 최신 이력을 역순(최신순)으로 조회합니다 (내구성 저널이 아닌 보조적 Activity 피드).

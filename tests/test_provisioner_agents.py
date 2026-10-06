@@ -659,7 +659,9 @@ def nodegroup_deletion(monkeypatch):
     monkeypatch.setattr("drover.services.keystone.close_connection", AsyncMock())
     monkeypatch.setattr("drover.services.kube.cordon_node", cordon)
     monkeypatch.setattr("drover.services.kube.drain_node", drain)
-    monkeypatch.setattr("drover.services.kube.get_node_capacity", AsyncMock(return_value=[]))
+    monkeypatch.setattr("drover.services.kube.get_node_capacity", AsyncMock(return_value=[
+        {"name": "worker-1"}, {"name": "worker-2"},
+    ]))
     monkeypatch.setattr("drover.services.kube.uncordon_node", uncordon)
     monkeypatch.setattr("drover.services.kube.delete_k8s_node", delete_node)
     monkeypatch.setattr("drover.services.nova.wait_server_deleted", wait_deleted)

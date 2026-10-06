@@ -199,7 +199,7 @@ Afterglow 대시보드 및 BFF에서 테넌트 클러스터의 오토스케일�
      - `pending_assignments`: 노드그룹에 배정된 미스케줄 Pod 목록 및 필요 리소스.
      - `blocked_reasons`: Pending Pod 분류 사유 (`pvc_unbound`, `not_resource_shortage`, `unsupported_pod_affinity`, `no_matching_nodegroup` 등). flavor·quota·cooldown 등 노드그룹 결정 차단은 `last_blocked_reason`으로 표시합니다.
      - `last_decision`: 최근 스케줄러 동작 (`scale_up_queued`, `scale_up_complete`, `scale_down_queued`, `scale_down_complete`, `stabilizing`, `within_capacity`, `observation_failed` 등).
-     - `last_blocked_reason`: 최근 차단 상세 사유 (`gpu_not_allocatable`, `scale_down_cooldown`, `min_size_reached` 등).
+     - `last_blocked_reason`: 최근 차단 상세 사유. CPU/GPU Node가 Ready가 되지 않으면 `node_not_ready`, Ready 이후 요청한 GPU allocatable이 부족하면 `gpu_not_allocatable`입니다. 부분 provisioning은 `provision_failed`가 우선하며, 여러 worker 중 join 실패가 있으면 GPU 부족보다 우선 표시합니다. 그 밖에 `scale_down_cooldown`, `min_size_reached` 등이 있습니다.
      - `quota_state.allowed`는 admission 단계의 결과입니다. Nova quota나 GPU 호스트의 현재 여유를 예약·보장하지 않으며, 이후 provisioning 실패는 operation 상태로 확인합니다.
      - `last_blocked_reason=gpu_admission_unavailable`이 지속되면 Afterglow admission 자체가 503을 반환하는 상태입니다. Afterglow는 `/api/v1/internal/k3s/gpu-admission`과 provisioning intent에서 서비스 사용자(Kolla 기본 `afterglow_admin`)를 tenant project scope로 인증하므로, 그 사용자가 해당 project에서 role을 받지 못하면 Keystone 401로 실패합니다. Drover는 admission URL이 설정되면 CPU flavor 증설도 이 판정을 기다립니다. 2026-10-06 DMSLab의 일회용 test project에서 이 상태를 관측했습니다. `afterglow_admin`의 직접 role assignment는 1건이었고 effective/inherited/group assignment는 확인하지 않았습니다. 다른 tenant project의 동작과 role 부여 정책은 Afterglow 쪽 onboarding/credential 결정입니다.
 

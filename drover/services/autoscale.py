@@ -448,12 +448,15 @@ async def delete_nodegroup_vms(
 
         live_vm_by_node = {entry.get("name"): entry["vm_id"] for entry in vm_entries if requires_drain[entry["vm_id"]]}
         inherited: set[str] = set()
+        observed_names: set[str] = set()
         if live_vm_by_node:
             # A matching marker may predate an earlier DELETE attempt: such a cordon is
             # never reversible, so it stays out of this attempt's rollback.
             phase = "node_observation_failed"
+            nodes = await k3s_kube.get_node_capacity(cluster_id)
+            observed_names = {node["name"] for node in nodes}
             inherited = {
-                node["name"] for node in await k3s_kube.get_node_capacity(cluster_id)
+                node["name"] for node in nodes
                 if node.get("unschedulable") and node.get("removal_vm_id")
                 and node.get("removal_vm_id") == live_vm_by_node.get(node.get("name"))
             }
@@ -465,12 +468,17 @@ async def delete_nodegroup_vms(
             if not node_name:
                 raise ValueError("Live VM is missing Kubernetes node name")
             phase = f"cordon_failed:{node_name}"
-            # The PATCH may have reached the apiserver before a transport error.
-            if node_name not in inherited:
-                cordoned.append(node_name)
-            # The annotation lets a retry of this removal resume despite its own cordon.
-            if not await k3s_kube.cordon_node(cluster_id, node_name, removal_vm_id=entry["vm_id"]):
-                raise RuntimeError(phase)
+            if node_name not in observed_names:
+                # A new reservation (including an ambiguous POST) remains fenced on failure.
+                # A conflict may be a late join or someone else's Node: never patch/uncordon it.
+                if not await k3s_kube.cordon_node(cluster_id, node_name, removal_vm_id=entry["vm_id"], create_missing=True):
+                    raise RuntimeError(phase)
+            else:
+                # The PATCH may reach the apiserver before a transport error.
+                if node_name not in inherited:
+                    cordoned.append(node_name)
+                if not await k3s_kube.cordon_node(cluster_id, node_name, removal_vm_id=entry["vm_id"]):
+                    raise RuntimeError(phase)
             phase = f"drain_failed:{node_name}"
             if not await k3s_kube.drain_node(cluster_id, node_name):
                 raise RuntimeError(phase)

@@ -262,6 +262,8 @@ def stampede_deletion(monkeypatch):
         group=group, servers={"a": server}, volumes={"boot": volume}, nodes={"a": _node("a")},
         pending=[], pods=[], deleted_resources=set(), transitions=[], volume_failure=False, node_failure=False,
         delete_on_termination=True, volume_status="available", volume_attachments=[], volume_project="project",
+        volume_metadata={},
+        cordon_impl=kube.cordon_node,
     )
     connection = MagicMock()
 
@@ -285,7 +287,7 @@ def stampede_deletion(monkeypatch):
             raise os_exceptions.NotFoundException(f"No Volume found for {volume_id}")
         return SimpleNamespace(
             id=volume_id, name="a-boot", status=state.volume_status, attachments=list(state.volume_attachments),
-            project_id=state.volume_project, metadata={},
+            project_id=state.volume_project, metadata=state.volume_metadata,
         )
 
     def delete_volume(volume_id, **_):
@@ -685,7 +687,10 @@ async def test_stampede_deletes_boot_volume_kept_after_server_deletion(stampede_
     assert state.group["vms"] == [] and state.group["node_count"] == 0
 
 
-@pytest.mark.parametrize("volume_state", ["attached_elsewhere", "foreign_project"])
+@pytest.mark.parametrize("volume_state", [
+    "attached_elsewhere", "foreign_project", "foreign_cluster", "busy", "denied_lookup",
+    "invalid_lookup", "rejected_delete", "unconfirmed_delete",
+])
 async def test_stampede_preserves_boot_volume_it_cannot_safely_delete(stampede_deletion, monkeypatch, volume_state):
     import functools
 
@@ -695,8 +700,19 @@ async def test_stampede_preserves_boot_volume_it_cannot_safely_delete(stampede_d
     state.delete_on_termination = False
     if volume_state == "attached_elsewhere":
         state.volume_status, state.volume_attachments = "in-use", [{"server_id": "someone-else"}]
-    else:
+    elif volume_state == "foreign_project":
         state.volume_project = "another-project"
+    elif volume_state == "foreign_cluster":
+        state.volume_metadata = {"drover.cluster_id": "another-cluster"}
+    elif volume_state == "busy":
+        state.volume_status = "deleting"
+    elif volume_state in {"denied_lookup", "invalid_lookup"}:
+        error = os_exceptions.ForbiddenException if volume_state == "denied_lookup" else os_exceptions.BadRequestException
+        state.connection.block_storage.get_volume.side_effect = error("Cinder lookup failed")
+    elif volume_state == "rejected_delete":
+        state.connection.block_storage.delete_volume.side_effect = os_exceptions.ForbiddenException("Cinder DELETE denied")
+    else:
+        state.connection.block_storage.delete_volume.side_effect = lambda *_args, **_kwargs: state.transitions.append("delete_accepted")
     monkeypatch.setattr(cinder, "delete_detached_boot_volume", functools.partial(cinder.delete_detached_boot_volume, timeout=0))
     with pytest.raises(autoscale.NodegroupDeletionError, match="boot_volume_delete_unverified:boot"):
         await jobs._execute_job_direct("nodegroup_reconcile", state.payload, "cluster", "project")
@@ -705,12 +721,74 @@ async def test_stampede_preserves_boot_volume_it_cannot_safely_delete(stampede_d
     assert state.group["vms"] == [{"vm_id": "a", "name": "a"}]
 
 
-async def test_gpu_worker_not_successful_until_devices_are_allocatable(monkeypatch):
+@pytest.mark.parametrize("failure", [None, "observation", "forbidden", "conflict", "ambiguous", "drain", "final_lookup"])
+async def test_manual_missing_node_removal_reserves_name_before_vm_delete(stampede_deletion, monkeypatch, failure):
+    import json
+    from contextlib import asynccontextmanager
+
+    import httpx
+
+    state = stampede_deletion
+    state.nodes.clear()
+    state.payload.pop("stampede")  # Automatic scale-down still requires a Ready candidate.
+    state.delete_on_termination = False
+    if failure == "observation":
+        state.capacity_observation.side_effect = RuntimeError("Node observation unavailable")
+    elif failure == "drain":
+        monkeypatch.setattr(kube, "drain_node", AsyncMock(return_value=False))
+    elif failure == "final_lookup":
+        state.connection.compute.get_server.side_effect = [
+            state.servers["a"], os_exceptions.ForbiddenException("final lookup denied"),
+        ]
+
+    def handler(request):
+        assert request.method == "POST" and request.url.path == "/api/v1/nodes"
+        if failure == "forbidden":
+            return httpx.Response(403)
+        if failure == "conflict":
+            state.nodes["a"] = _node("a", unschedulable=True, removal_vm_id="foreign")
+            return httpx.Response(409)
+        body = json.loads(request.content)
+        state.nodes["a"] = _node(
+            body["metadata"]["name"], ready=False, unschedulable=body["spec"]["unschedulable"],
+            removal_vm_id=body["metadata"]["annotations"][kube.REMOVAL_VM_ANNOTATION],
+        )
+        state.transitions.append("node_reserved")
+        if failure == "ambiguous":
+            raise httpx.ReadTimeout("Node created but response lost", request=request)
+        return httpx.Response(201, json=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        @asynccontextmanager
+        async def kube_client(_):
+            yield client, "https://kube.test"
+
+        monkeypatch.setattr(kube, "_kube_client", kube_client)
+        monkeypatch.setattr(kube, "cordon_node", state.cordon_impl)
+        if failure:
+            with pytest.raises(autoscale.NodegroupDeletionError):
+                await jobs._execute_job_direct("nodegroup_reconcile", state.payload, "cluster", "project")
+            assert "a" in state.servers and "boot" in state.volumes
+            assert state.group["vms"] == [{"vm_id": "a", "name": "a"}]
+            assert not state.deleted_resources
+            assert "uncordon" not in state.transitions
+            if failure in {"conflict", "ambiguous", "drain", "final_lookup"}:
+                assert state.nodes["a"]["unschedulable"] is True
+                assert state.nodes["a"]["removal_vm_id"] == ("foreign" if failure == "conflict" else "a")
+        else:
+            await jobs._execute_job_direct("nodegroup_reconcile", state.payload, "cluster", "project")
+            assert state.transitions.index("node_reserved") < state.transitions.index("drain") < state.transitions.index("nova_deleted")
+            assert not state.servers and not state.volumes and not state.nodes
+            assert state.group["vms"] == [] and state.group["node_count"] == 0
+
+
+@pytest.mark.parametrize("node_ready,reason", [(False, "node_not_ready"), (True, "gpu_not_allocatable")])
+async def test_gpu_worker_not_successful_until_devices_are_allocatable(monkeypatch, node_ready, reason):
     from drover.services import gpu
 
     monkeypatch.setattr(autoscale, "provision_nodegroup_vms", AsyncMock(return_value=[{"vm_id": "gpu-vm", "name": "gpu-node"}]))
     monkeypatch.setattr(gpu, "ensure_device_plugin", AsyncMock())
-    monkeypatch.setattr(kube, "wait_node_ready", AsyncMock(return_value=True))
+    monkeypatch.setattr(kube, "wait_node_ready", AsyncMock(return_value=node_ready))
     monkeypatch.setattr(kube, "wait_node_gpu_allocatable", AsyncMock(return_value=False))
     states = {}
     async def status(_, vm_id, value):
@@ -719,13 +797,13 @@ async def test_gpu_worker_not_successful_until_devices_are_allocatable(monkeypat
     updates = []
     monkeypatch.setattr(stampede, "_update_stampede_state", AsyncMock(side_effect=lambda _, __, patch: updates.append(patch)))
     monkeypatch.setattr(stampede, "_record_stampede_event", AsyncMock())
-    with pytest.raises(RuntimeError, match="gpu_not_allocatable"):
+    with pytest.raises(RuntimeError, match=reason):
         await jobs._execute_job_direct("stampede_provision", {
             "nodegroup_id": "gpu", "add_count": 1, "flavor_id": "gpu",
             "gpu_required": True, "gpu_count": 2,
         }, "cluster", "project")
     assert states == {"gpu-vm": "ERROR"}
-    assert updates[-1]["last_blocked_reason"] == "gpu_not_allocatable"
+    assert updates[-1]["last_blocked_reason"] == reason
 
 
 async def test_gpu_job_finishes_only_after_all_requested_devices_register(monkeypatch):

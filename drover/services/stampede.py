@@ -418,18 +418,24 @@ async def _provision_and_track(
         await ensure_device_plugin(cluster_id)
     deadline = time.monotonic() + 2400
 
-    async def observe(vm: dict) -> tuple[str, bool]:
+    async def observe(vm: dict) -> tuple[str, str]:
         name = vm.get("name", "")
         ready = bool(name) and await kube.wait_node_ready(cluster_id, name, timeout=max(0, deadline - time.monotonic()))
-        if ready and gpu_required:
-            ready = await kube.wait_node_gpu_allocatable(cluster_id, name, min_gpu=max(1, gpu_count), timeout=600.0)
-        await nodegroup.set_nodegroup_vm_status(nodegroup_id, vm["vm_id"], "ACTIVE" if ready else "ERROR")
-        return name, ready
+        failure = "" if ready else "node_not_ready"
+        if ready and gpu_required and not await kube.wait_node_gpu_allocatable(cluster_id, name, min_gpu=max(1, gpu_count), timeout=600.0):
+            failure = "gpu_not_allocatable"
+        await nodegroup.set_nodegroup_vm_status(nodegroup_id, vm["vm_id"], "ERROR" if failure else "ACTIVE")
+        return name, failure
 
     observed = await asyncio.gather(*(observe(vm) for vm in new_vms))
-    ready_nodes = [name for name, ready in observed if ready]
-    failed_nodes = [name for name, ready in observed if not ready]
-    reason = "provision_failed" if len(new_vms) != add_count else ("gpu_not_allocatable" if gpu_required else "node_not_ready") if failed_nodes else ""
+    ready_nodes = [name for name, failure in observed if not failure]
+    failed_nodes = [name for name, failure in observed if failure]
+    if len(new_vms) != add_count:
+        reason = "provision_failed"
+    elif any(failure == "node_not_ready" for _, failure in observed):
+        reason = "node_not_ready"
+    else:
+        reason = "gpu_not_allocatable" if failed_nodes else ""
     await _update_stampede_state(nodegroup_id, cluster_id, {"last_blocked_reason": reason, "ready_nodes": ready_nodes, "failed_nodes": failed_nodes})
     result = {"nodegroup_id": nodegroup_id, "add_count": add_count, "vm_ids": [vm["vm_id"] for vm in new_vms],
               "ready_nodes": ready_nodes, "failed_nodes": failed_nodes, "reason": reason,

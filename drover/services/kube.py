@@ -1197,9 +1197,26 @@ async def get_pod_resource_usage(cluster_id: str) -> list[dict]:
 REMOVAL_VM_ANNOTATION = "drover.io/removing-vm-id"
 
 
-async def _set_node_unschedulable(cluster_id: str, node_name: str, unschedulable: bool, removal_vm_id: str | None) -> bool:
+async def _set_node_unschedulable(
+    cluster_id: str, node_name: str, unschedulable: bool, removal_vm_id: str | None, *, create_missing: bool = False,
+) -> bool:
     try:
         async with _kube_client(cluster_id) as (client, server_url):
+            if create_missing:
+                # Reserve an authoritatively absent name so a late kubelet cannot join schedulable.
+                resp = await client.post(
+                    f"{server_url}/api/v1/nodes",
+                    json={
+                        "apiVersion": "v1", "kind": "Node",
+                        "metadata": {"name": node_name, "annotations": {REMOVAL_VM_ANNOTATION: removal_vm_id}},
+                        "spec": {"unschedulable": True},
+                    },
+                    headers={"Accept": "application/json"},
+                )
+                if resp.status_code == 201:
+                    return True
+                _logger.warning("stampede: node removal reservation failed HTTP %d", resp.status_code)
+                return False
             resp = await client.patch(
                 f"{server_url}/api/v1/nodes/{node_name}",
                 # Merge-patch null removes the annotation together with the cordon.
@@ -1218,9 +1235,9 @@ async def _set_node_unschedulable(cluster_id: str, node_name: str, unschedulable
         return False
 
 
-async def cordon_node(cluster_id: str, node_name: str, *, removal_vm_id: str) -> bool:
-    """Prevent scheduling for one VM removal; False means callers must not proceed."""
-    return await _set_node_unschedulable(cluster_id, node_name, True, removal_vm_id)
+async def cordon_node(cluster_id: str, node_name: str, *, removal_vm_id: str, create_missing: bool = False) -> bool:
+    """Fence a VM removal; create_missing requires an authoritative absent-node observation."""
+    return await _set_node_unschedulable(cluster_id, node_name, True, removal_vm_id, create_missing=create_missing)
 
 
 async def uncordon_node(cluster_id: str, node_name: str) -> bool:
