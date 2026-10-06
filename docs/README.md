@@ -40,6 +40,7 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - Pod 요청/Node allocatable 계산, GPU 준비성, 원자적 예약/fencing, 300–600초 안정화 및 drain 축소
    - Afterglow 상태/이벤트 API, 부분 삭제 재시도와 실제 배포 검증 범위
    - 0.4.1 patch: project에 공유된 private(GPU) flavor를 nodegroup flavor로 허용
+   - 0.4.2 patch: runc가 PATH에 없는 신규 GPU worker의 join 실패(`nvidia-container-runtime --version`) 수정
 
 6. **[Drover 0.3.0 및 0.3.1 준비 기록](release-0.3.0.md)**
    - 구조화 요청/job 로그, opt-in `LOG_LEVEL=DEBUG`, Redis 5 종료 API 수정과 당시 검증 기록

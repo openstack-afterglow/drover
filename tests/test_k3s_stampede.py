@@ -733,3 +733,32 @@ async def test_gpu_job_finishes_only_after_all_requested_devices_register(monkey
 ])
 def test_gpu_aliases_exclude_non_gpu_pci_functions(extra_specs, count):
     assert stampede._flavor_gpu_count(extra_specs) == count
+
+
+@pytest.mark.parametrize("os_type", ["ubuntu", "fcos"])
+@pytest.mark.parametrize("driver_ok", [True, False])
+def test_gpu_bootstrap_passes_before_k3s_provides_a_low_level_runtime(tmp_path, os_type, driver_ok):
+    """Fresh GPU workers have no runc/crun on PATH until K3s starts; the join must not need one."""
+    import os
+    import shutil
+    import subprocess
+
+    from drover.services import gpu
+
+    stubs = {
+        "nvidia-smi": "echo 'GPU 0: NVIDIA GeForce RTX 3060'",
+        # Real 1.20.1 behaviour: --version prints, then fails to locate runc/crun and exits 1.
+        "nvidia-container-runtime": "echo 'NVIDIA Container Runtime version 1.20.1'; "
+                                    "echo 'no runtime binary found from candidate list: [runc crun]' >&2; exit 1",
+        "nvidia-container-cli": "echo 'NVRM version: 580.0'" if driver_ok else "echo 'nvml error: driver not loaded' >&2; exit 1",
+    }
+    for name, body in stubs.items():
+        path = tmp_path / name
+        path.write_text(f"#!/bin/bash\n{body}\n")
+        path.chmod(0o755)
+    os.symlink(shutil.which("timeout"), tmp_path / "timeout")
+    result = subprocess.run(
+        [shutil.which("bash"), "-euo", "pipefail", "-c", gpu.bootstrap_script(os_type)],
+        env={"PATH": str(tmp_path)}, capture_output=True, text=True, timeout=30,
+    )
+    assert (result.returncode == 0) is driver_ok, result.stderr

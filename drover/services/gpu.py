@@ -41,7 +41,9 @@ command -v nvidia-smi >/dev/null || {{ echo 'GPU image is missing the NVIDIA dri
 timeout 30 nvidia-smi -L
 {install}
 command -v nvidia-container-runtime >/dev/null || {{ echo 'GPU image is missing the NVIDIA container runtime' >&2; exit 1; }}
-nvidia-container-runtime --version
+# `nvidia-container-runtime --version` exits 1 until a low-level runtime (runc/crun) is on PATH,
+# which K3s never provides before it starts; libnvidia-container checks the driver stack itself.
+timeout 30 nvidia-container-cli info
 """
 
 
