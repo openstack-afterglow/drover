@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -264,12 +264,12 @@ class Settings(BaseSettings):
     drover_cert_rotation_job_image: str = "rancher/k3s:v1.28.4-k3s2"
     k3s_health_interval: int = 180
     drover_stampede_enabled: bool = False
-    drover_stampede_interval: int = 60
-    drover_stampede_scale_down_threshold: float = 0.5
-    drover_stampede_scale_down_window: int = 600
-    drover_stampede_scale_up_cooldown: int = 120
-    drover_stampede_scale_down_cooldown: int = 300
-    drover_stampede_resource_headroom_factor: float = 0.3
+    drover_stampede_interval: int = Field(default=60, ge=10)
+    drover_stampede_scale_down_threshold: float = Field(default=0.5, gt=0, le=1)
+    drover_stampede_scale_down_window: int = Field(default=600, ge=300, le=600)
+    drover_stampede_scale_up_cooldown: int = Field(default=120, ge=0)
+    drover_stampede_scale_down_cooldown: int = Field(default=300, ge=0)
+    drover_stampede_resource_headroom_factor: float = Field(default=0.3, ge=0, lt=1)
     drover_reconcile_interval: int = 300
     drover_reconcile_concurrency_per_project: int = 2
     drover_callback_allowed_cidrs: list[str] = []

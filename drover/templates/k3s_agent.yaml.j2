@@ -58,6 +58,9 @@ write_files:
         log "ERROR: 서버 API에 30분 내 연결 실패. systemd가 2분 후 재시도 예정."
         exit 1
       fi
+{% if gpu_bootstrap %}
+{{ gpu_bootstrap | indent(6, first=True) }}
+{% endif %}
 
       NODE_IP="${AFTERGLOW_K3S_NODE_IP}"
       log "k3s 에이전트 설치 시작 (버전: {{ k3s_version }}, node-ip: ${NODE_IP})..."

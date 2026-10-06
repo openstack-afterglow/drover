@@ -349,6 +349,64 @@ class K3sNodegroupInfo(BaseModel):
     updated_at: str | None = None
 
 
+class StampedePolicyInfo(BaseModel):
+    interval: int
+    scale_down_window: int
+    scale_up_cooldown: int
+    scale_down_cooldown: int
+    scale_down_threshold: float
+    resource_headroom_factor: float
+
+
+class StampedeNodegroupStatus(BaseModel):
+    id: str
+    name: str
+    role: str
+    flavor_id: str | None = None
+    stampede_enabled: bool
+    min_size: int
+    max_size: int
+    node_count: int
+    desired_count: int
+    tracked_count: int
+    ready_count: int | None = None
+    in_flight: int
+    observed_at: str | float | None = None
+    last_operation_id: str | None = None
+    last_job_id: str | None = None
+    active_operation_ids: list[str] = Field(default_factory=list)
+    capacity: dict = Field(default_factory=dict)
+    pending_assignments: list = Field(default_factory=list)
+    blocked_reasons: list = Field(default_factory=list)
+    last_decision: str = ""
+    last_blocked_reason: str = ""
+    flavor_summary: dict = Field(default_factory=dict)
+    quota_state: dict = Field(default_factory=dict)
+    stampede_state: dict = Field(default_factory=dict)
+
+
+class StampedeStatusResponse(BaseModel):
+    cluster_id: str
+    stampede_enabled: bool
+    global_stampede_enabled: bool
+    policy: StampedePolicyInfo
+    nodegroups: list[StampedeNodegroupStatus]
+    active_operation_ids: list[str] = Field(default_factory=list)
+
+
+class StampedeMutationResponse(BaseModel):
+    message: str
+    cluster_id: str
+    stampede_enabled: bool
+
+
+def _validate_nodegroup_resource_id(value: str | None) -> str | None:
+    # Nova flavor IDs need not be UUIDs. Names/whitespace are not selectors.
+    if value is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value):
+        raise ValueError("flavor_id/image_id는 공백 없는 유효한 리소스 ID여야 합니다 (최대 64자)")
+    return value
+
+
 class CreateK3sNodegroupRequest(BaseModel):
     name: str
     role: str = "agent"
@@ -360,6 +418,11 @@ class CreateK3sNodegroupRequest(BaseModel):
     stampede_enabled: bool = False
     min_size: int = Field(default=0, ge=0)
     max_size: int = Field(default=5, ge=0)
+
+    @field_validator("flavor_id", "image_id")
+    @classmethod
+    def validate_resource_ids(cls, value: str | None) -> str | None:
+        return _validate_nodegroup_resource_id(value)
 
     @field_validator("name")
     @classmethod
@@ -431,6 +494,11 @@ class UpdateK3sNodegroupRequest(BaseModel):
     min_size: int | None = Field(default=None, ge=0)
     max_size: int | None = Field(default=None, ge=0)
 
+    @field_validator("flavor_id", "image_id")
+    @classmethod
+    def validate_resource_ids(cls, value: str | None) -> str | None:
+        return _validate_nodegroup_resource_id(value)
+
     @field_validator("labels", mode="before")
     @classmethod
     def validate_labels(cls, v):
@@ -466,8 +534,6 @@ class UpdateK3sNodegroupRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_stampede_sizes(self) -> UpdateK3sNodegroupRequest:
-        if self.stampede_enabled is True and self.flavor_id == "":
-            raise ValueError("Stampede 노드그룹은 flavor_id가 필요합니다")
         if self.min_size is not None and self.max_size is not None and self.min_size > self.max_size:
             raise ValueError("min_size는 max_size보다 클 수 없습니다")
         if self.node_count is not None:

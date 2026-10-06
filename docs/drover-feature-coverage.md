@@ -114,9 +114,10 @@ drover wheel
 - **Application Credential 소유자**: worker가 사용하는 project manager의 `current_user_id`와 기록된 credential ID를 함께 SDK에 전달합니다. Keystone 404는 missing drift이고 인증·연결 장애는 missing으로 숨기지 않습니다. 이 변경은 DB schema나 외부 API를 바꾸지 않습니다.
 
 ### 4.3 Stampede 오토스케일링 (Autoscaling)
-- **메트릭 기반 스케일링**: Stampede 엔진이 K3s 에이전트 노드그룹의 부하를 감지하여 자동으로 `Scale Out` 또는 `Scale In`을 트리거합니다.
-- **경계 조건 및 Cooldown**: 노드그룹 생성 시 설정한 `min_size` 및 `max_size` 경계를 엄격히 준수하며, 급격한 핑퐁 스케일링을 방지하기 위한 Cooldown 쿨다운 기간을 적용합니다.
-
+- **Pod Request 기반 스케일링**: Kubernetes API의 Pod requests(CPU millicores, RAM bytes, NVIDIA GPU slots, extended resources)를 노드의 allocatable 용량과 직접 대조하여 부족분을 산정합니다. PVC 바인딩 지연, 고정 노드 지정, unsupported pod affinity/topology spread/host port 등 비용량적 원인으로 pending된 Pod는 워커 증설을 유발하지 않습니다.
+- **GPU 워커 부트스트랩 및 가용성 검증**: 명시적 GPU flavor를 사용하는 노드그룹은 agent userdata에 `--default-runtime=nvidia` 및 `afterglow.io/gpu=true` 라벨을 주입하고, Ubuntu에서는 NVIDIA container toolkit을 설치하며 FCOS에서는 드라이버/런타임이 사전 탑재된 이미지를 사용합니다. Drover가 클러스터에 `afterglow-nvidia-device-plugin` DaemonSet을 배포하며, K3s 노드가 `Ready` 상태가 되는 것뿐만 아니라 `nvidia.com/gpu` allocatable이 실제 관측될 때까지 대기한 후 내구성 작업을 성공 처리합니다.
+- **원자적 예약 및 Fencing**: 수동 변경과 오토스케일러의 증설/축소 요청은 MariaDB 트랜잭션 내에서 row lock(`with_for_update`)과 함께 durable job(`stampede_provision`, `nodegroup_reconcile`)을 큐잉합니다. `in_flight_count`로 중복 증설을 차단하고 작업 종료 시 DB의 실제 VM 인벤토리를 기준으로 `node_count`를 동기화합니다.
+- **안정화 윈도우 및 안전한 Drain/축소**: 노드그룹의 사용률이 임계값(`drover_stampede_scale_down_threshold`, 기본 0.5) 미만으로 300–600초(`drover_stampede_scale_down_window`) 동안 지속되고 `min_size`를 초과할 때만 축소 후보를 선정합니다. 후보 노드의 모든 Pod가 남은 활성 스케줄 가능 노드로 안전하게 재배치(relocate) 가능한지(컨트롤러 유무, PVC, 로컬 스토리지, PDB 준수) 검증한 후 1개씩 축소합니다. 삭제 직전 live pending Pod, Ready, min-size headroom을 Nova ID 조회로 재검증하며 실제 404만 absent로 봅니다(403/400 등 관측 오류는 정리를 허가하지 않음). cordon은 Node annotation `drover.io/removing-vm-id`를 함께 기록합니다. drain 실패나 DELETE 직전 최종 Nova 조회·소유권 재검증 실패 시에는 이번 시도가 새로 건 cordon만 해제하고 리소스를 보존합니다. 이전 시도에서 남은 같은 VM annotation cordon은 DELETE 이후일 수 있어 해제하지 않습니다. 최종 재검증 뒤에는 DELETE 거부나 정리 실패가 있어도 cordon을 유지하고, 재시도는 같은 VM annotation의 자기 cordon만 재개합니다. Nova VM 소멸이 확인된 후에만 boot volume, Kubernetes Node, tracking row를 순차 정리합니다.
 ---
 
 ## 5. 의도적인 설계 제약사항 (Intentional Non-Goals)
@@ -129,7 +130,7 @@ Drover 서비스의 아키텍처 단순화와 성능 최적화를 위해 아래 
 
 2. **OpenStack Placement API 직접 할당 연동 미지원**
    - Placement 서비스의 Resource Class 직접 커스텀 allocation 할당을 사용하지 않습니다.
-   - 노드 배치는 Nova Flavor 스케줄링을 따르며, GPU quota 판단 권한은 Afterglow (`app.services.gpu_quota`)에 있습니다. Drover는 일반 cluster create에서 quota authority가 되지 않고, 현재 `drover/services/stampede.py`의 GPU nodegroup scale 경로에서만 `drover/services/afterglow.py:check_gpu_admission`을 통해 admission 결과를 받아 provisioning intent를 제한적으로 진행합니다.
+   - 노드 배치는 Nova Flavor 스케줄링을 따릅니다. `drover_afterglow_admission_url`이 설정된 환경에서는 `drover/services/afterglow.py:check_gpu_admission`을 통해 Afterglow의 admission을 검사하여 fail-closed로 진행하며, 해당 URL이 미설정된 독립 OpenStack 환경에서는 Nova flavor 및 프로젝트 native quota를 기준으로 직접 GPU 워커 증설을 수행합니다. Drover는 일반 클러스터 생성에서는 quota authority가 되지 않습니다.
 
 ---
 

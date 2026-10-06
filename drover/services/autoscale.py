@@ -33,6 +33,54 @@ def _stampede_node_name(cluster_name: str, provisioning_key: str) -> str:
     return f"{cluster_name}-stampede-{digest}"
 
 
+async def _find_native_resources(conn, cluster_id: str, nodegroup_id: str, name: str, key: str):
+    """Recover a prior attempt, including resources created before DB persistence."""
+    from drover.services import inventory, nodegroup
+
+    group = await nodegroup.get_nodegroup(cluster_id, nodegroup_id)
+    recorded = [v for v in (group or {}).get("vms", []) if v.get("name") == name]
+    resources = await inventory.list_managed_resources(cluster_id=cluster_id)
+    server_ids = {v["vm_id"] for v in recorded}
+    volume_ids = set()
+    for resource in resources:
+        if resource.service == "nova" and resource.resource_type == "server" and resource.name == name:
+            server_ids.add(resource.resource_id)
+        if resource.service == "cinder" and resource.resource_type == "volume" and resource.name == f"{name}-boot":
+            volume_ids.add(resource.resource_id)
+
+    def recover():
+        servers = {}
+        volumes = {}
+        for resource_id in server_ids:
+            server = conn.compute.find_server(resource_id, ignore_missing=True)
+            if server is None:
+                raise RuntimeError(f"Recorded provisioning server {resource_id} is missing")
+            servers[server.id] = server
+        for server in conn.compute.servers(details=True, name=name):
+            meta = server.metadata or {}
+            if server.name == name and meta.get("drover.provisioning_idempotency_key") == key:
+                if meta.get("drover.cluster_id") != cluster_id:
+                    raise RuntimeError("Provisioning server ownership mismatch")
+                servers[server.id] = server
+        for resource_id in volume_ids:
+            volume = conn.block_storage.find_volume(resource_id, ignore_missing=True)
+            if volume is None:
+                raise RuntimeError(f"Recorded provisioning volume {resource_id} is missing")
+            volumes[volume.id] = volume
+        for volume in conn.block_storage.volumes(details=True, name=f"{name}-boot"):
+            meta = volume.metadata or {}
+            if volume.name == f"{name}-boot" and meta.get("drover.provisioning_idempotency_key") == key:
+                if meta.get("drover.cluster_id") != cluster_id:
+                    raise RuntimeError("Provisioning volume ownership mismatch")
+                volumes[volume.id] = volume
+        if len(servers) > 1 or len(volumes) > 1:
+            raise RuntimeError("Ambiguous provisioning resources; refusing to create duplicates")
+        return next(iter(servers.values()), None), next(iter(volumes.values()), None)
+
+    server, volume = await asyncio.to_thread(recover)
+    return server, volume, {v["vm_id"] for v in recorded}
+
+
 async def provision_nodegroup_vms(
     project_id: str,
     cluster_id: str,
@@ -44,14 +92,16 @@ async def provision_nodegroup_vms(
     labels: dict | None = None,
     taints: list | None = None,
     provisioning_key_prefix: str | None = None,
+    gpu_required: bool = False,
+    inspect_flavor_gpu: bool = False,
 ) -> list[dict]:
     """노드그룹에 agent VM을 add_count개 생성해 k3s 클러스터에 join시킨다.
 
     labels/taints는 cloud-init extra_agent_args로 주입.
     생성된 VM 목록 {vm_id, name}을 반환한다 (실패한 것은 포함하지 않음).
     """
+    from drover.services import cinder, inventory, keystone, nova
     from drover.services import cloudinit as k3s_cloudinit
-    from drover.services import inventory
     from drover.services import nodegroup as k3s_nodegroup
     from drover.services import plugins as k3s_plugins
     from drover.services import store as k3s_db
@@ -90,16 +140,27 @@ async def provision_nodegroup_vms(
         _logger.error("provision_nodegroup_vms: creation-time resource snapshot is incomplete")
         return []
 
+    remote_provisioning = provisioning_key_prefix is not None and bool(
+        getattr(s, "drover_afterglow_provisioning_url", "")
+    )
     conn = None
-    if provisioning_key_prefix is None:
-        from drover.services import cinder, keystone, nova
-
-        try:
-            conn = await keystone.get_project_manager_connection(project_id)
-        except Exception as exc:
-            _logger.error("provision_nodegroup_vms: OpenStack connection failed: %s", exc)
-            return []
+    if not remote_provisioning:
+        conn = await keystone.get_project_manager_connection(project_id)
     try:
+        if (provisioning_key_prefix is None or inspect_flavor_gpu) and add_count > 0 and not gpu_required:
+            # Manual nodegroups use the same explicitly selected Nova flavor.
+            from drover.services import gpu
+            from drover.services.stampede import _flavor_gpu_count
+
+            if conn is None:
+                conn = await keystone.get_project_manager_connection(project_id)
+            flavors = await asyncio.to_thread(nova.list_flavors, conn)
+            selected = next((flavor for flavor in flavors if flavor.id == flavor_id), None)
+            if selected is None:
+                raise RuntimeError("Selected nodegroup flavor is unavailable")
+            gpu_required = _flavor_gpu_count(selected.extra_specs or {}) > 0
+            if gpu_required:
+                await gpu.ensure_device_plugin(cluster_id)
         # extra_agent_args 구성 (플러그인 + labels/taints + nodegroup 식별 라벨)
         _agent_args = k3s_plugins.aggregate_agent_args(s)
         if not _agent_args and cluster.get("occm_enabled"):
@@ -147,9 +208,10 @@ async def provision_nodegroup_vms(
                     }
                 )
                 if provisioning_key is not None:
+                    agent_metadata["drover.provisioning_idempotency_key"] = provisioning_key
+                if remote_provisioning:
                     from drover.services import afterglow as afterglow_service
 
-                    agent_metadata["drover.provisioning_idempotency_key"] = provisioning_key
                     intent = await afterglow_service.create_provisioning_intent(
                         idempotency_key=provisioning_key,
                         project_id=project_id,
@@ -179,6 +241,7 @@ async def provision_nodegroup_vms(
                             ssh_public_key=ssh_public_key,
                             extra_agent_args=_agent_args,
                             os_type=os_type,
+                            gpu_required=gpu_required,
                         )
                         try:
                             result = await afterglow_service.submit_provisioning_intent(
@@ -221,20 +284,54 @@ async def provision_nodegroup_vms(
                         resource_id=str(result["server_id"]),
                         name=agent_name,
                     )
-                    new_entries.append({"vm_id": str(result["server_id"]), "name": agent_name})
+                    entry = {"vm_id": str(result["server_id"]), "name": agent_name}
+                    group = await k3s_nodegroup.get_nodegroup(cluster_id, nodegroup_id)
+                    if entry["vm_id"] not in {v["vm_id"] for v in (group or {}).get("vms", [])}:
+                        await k3s_nodegroup.add_nodegroup_vms(nodegroup_id, cluster_id, [entry])
+                    new_entries.append(entry)
                     _logger.info("stampede: nodegroup %s — agent %s 생성됨", nodegroup_id, agent_name)
                     continue
 
+                existing_vm = None
+                vol = None
+                recorded_ids = set()
+                if provisioning_key is not None:
+                    existing_vm, vol, recorded_ids = await _find_native_resources(
+                        conn, cluster_id, nodegroup_id, agent_name, provisioning_key
+                    )
+                if existing_vm is not None:
+                    entry = {"vm_id": existing_vm.id, "name": agent_name}
+                    if existing_vm.id not in recorded_ids:
+                        await k3s_nodegroup.add_nodegroup_vms(nodegroup_id, cluster_id, [entry])
+                    await inventory.record_resource(
+                        None, cluster_id=cluster_id, service="nova", resource_type="server",
+                        resource_id=existing_vm.id, name=agent_name, metadata=agent_metadata,
+                    )
+                    if vol is not None:
+                        await inventory.record_resource(
+                            None, cluster_id=cluster_id, service="cinder", resource_type="volume",
+                            resource_id=vol.id, name=f"{agent_name}-boot", metadata=vol.metadata or {},
+                        )
+                    if str(existing_vm.status).upper() != "ACTIVE":
+                        await asyncio.to_thread(conn.compute.wait_for_server, existing_vm, status="ACTIVE", wait=600)
+                    new_entries.append(entry)
+                    continue
                 vol_metadata = inventory.build_drover_metadata(cluster_id, None, "volume")
-                vol = await asyncio.to_thread(
-                    cinder.create_volume_from_image,
-                    conn,
-                    f"{agent_name}-boot",
-                    image_id,
-                    boot_volume_size,
-                    volume_availability_zone,
-                    metadata=vol_metadata,
-                )
+                vol_metadata["k3s_horse_generator_nodegroup_id"] = nodegroup_id
+                if provisioning_key is not None:
+                    vol_metadata["drover.provisioning_idempotency_key"] = provisioning_key
+                if vol is None:
+                    vol = await asyncio.to_thread(
+                        cinder.create_volume_from_image,
+                        conn,
+                        f"{agent_name}-boot",
+                        image_id,
+                        boot_volume_size,
+                        volume_availability_zone,
+                        metadata=vol_metadata,
+                    )
+                elif str(vol.status).lower() != "available":
+                    vol = await asyncio.to_thread(cinder.wait_volume_available, conn, vol.id, timeout=300)
                 await inventory.record_resource(
                     None,
                     cluster_id=cluster_id,
@@ -242,6 +339,7 @@ async def provision_nodegroup_vms(
                     resource_type="volume",
                     resource_id=vol.id,
                     name=f"{agent_name}-boot",
+                    metadata=vol_metadata,
                 )
                 userdata = k3s_cloudinit.generate_agent_userdata(
                     cluster_name=cluster_name,
@@ -252,6 +350,7 @@ async def provision_nodegroup_vms(
                     ssh_public_key=ssh_public_key,
                     extra_agent_args=_agent_args,
                     os_type=os_type,
+                    gpu_required=gpu_required,
                 )
                 vm = await asyncio.to_thread(
                     nova.create_server,
@@ -265,6 +364,7 @@ async def provision_nodegroup_vms(
                     delete_boot_volume_on_termination=True,
                     security_groups=[sg_id] if sg_id else None,
                     config_drive=userdata.config_drive,
+                    wait=provisioning_key is None,
                 )
                 await inventory.record_resource(
                     None,
@@ -273,8 +373,13 @@ async def provision_nodegroup_vms(
                     resource_type="server",
                     resource_id=vm.id,
                     name=agent_name,
+                    metadata=agent_metadata,
                 )
                 new_entries.append({"vm_id": vm.id, "name": agent_name})
+                await k3s_nodegroup.add_nodegroup_vms(nodegroup_id, cluster_id, [new_entries[-1]])
+                if provisioning_key is not None:
+                    server = await asyncio.to_thread(conn.compute.get_server, vm.id)
+                    await asyncio.to_thread(conn.compute.wait_for_server, server, status="ACTIVE", wait=600)
                 _logger.info("stampede: nodegroup %s — agent %s (%s) 생성됨", nodegroup_id, agent_name, vm.id)
             except ProvisioningInProgress:
                 raise
@@ -283,14 +388,29 @@ async def provision_nodegroup_vms(
                 if provisioning_key is not None:
                     raise
 
-        # DB에 VM 추적 레코드 추가
-        if new_entries:
-            await k3s_nodegroup.add_nodegroup_vms(nodegroup_id, cluster_id, new_entries)
-
         return new_entries
     finally:
         if conn is not None:
             await keystone.close_connection(conn)
+
+
+class NodegroupDeletionError(RuntimeError):
+    """Deletion stopped without forgetting resources that may still exist."""
+
+    def __init__(self, reason: str, *, uncordon_failed: list[str] | None = None):
+        self.reason = reason
+        self.uncordon_failed = uncordon_failed or []
+        super().__init__(reason + (f"; uncordon failed: {self.uncordon_failed}" if self.uncordon_failed else ""))
+
+
+def _observe_owned_worker(conn, vm_id: str, project_id: str, cluster_id: str):
+    """ID-only Nova observation; an ownership mismatch blocks every mutation."""
+    from drover.services import inventory, nova
+
+    server = nova.observe_server(conn, vm_id)
+    if server is not None and not inventory.validate_resource_ownership(server, project_id, cluster_id, "server"):
+        raise ValueError("Worker server ownership validation failed")
+    return server
 
 
 async def delete_nodegroup_vms(
@@ -299,46 +419,85 @@ async def delete_nodegroup_vms(
     nodegroup_id: str,
     vm_entries: list[dict],
 ) -> None:
-    """노드그룹 VM을 cordon→drain→삭제한다.
-
-    vm_entries: [{"vm_id": ..., "name": ...}, ...]
-    """
-    from drover.services import keystone, nova
+    """Drain every live node before deleting any VM; retain failed records for retry."""
+    from drover.services import cinder, inventory, keystone, nova
     from drover.services import kube as k3s_kube
     from drover.services import nodegroup as k3s_nodegroup
 
-    # cordon + drain
-    node_names = [e["name"] for e in vm_entries if e.get("name")]
-    for node_name in node_names:
-        cordon_ok = await k3s_kube.cordon_node(cluster_id, node_name)
-        if cordon_ok:
-            drain_ok = await k3s_kube.drain_node(cluster_id, node_name)
-            if not drain_ok:
-                _logger.warning("stampede: drain %s timeout/실패, 강제 삭제 진행", node_name)
-
-    # K8s 노드 오브젝트 삭제
-    if node_names:
-        await k3s_kube.delete_k8s_nodes(cluster_id, node_names)
-
-    # Nova VM 삭제
-    try:
-        conn = await keystone.get_project_manager_connection(project_id)
-    except Exception as e:
-        _logger.error("delete_nodegroup_vms: OpenStack 연결 실패: %s", e)
+    if not vm_entries:
         return
+    conn = await keystone.get_project_manager_connection(project_id)
+    cordoned: list[str] = []
+    phase = "server_lookup"
     try:
-        vm_ids = [e["vm_id"] for e in vm_entries if e.get("vm_id")]
-        for vm_id in vm_ids:
-            try:
-                await asyncio.to_thread(nova.delete_server, conn, vm_id)
-                _logger.info("stampede: VM %s 삭제됨", vm_id)
-            except Exception as e:
-                _logger.warning("stampede: VM %s 삭제 실패: %s", vm_id, e)
+        # Authoritatively absent/deleting servers resume cleanup without another drain.
+        requires_drain = {}
+        boot_volumes = {}
+        resources = await inventory.list_managed_resources(cluster_id=cluster_id)
+        for entry in vm_entries:
+            vm_id = entry.get("vm_id")
+            if not vm_id:
+                raise ValueError("Deletion entry is missing vm_id")
+            server = await asyncio.to_thread(_observe_owned_worker, conn, vm_id, project_id, cluster_id)
+            requires_drain[vm_id] = server is not None and not nova.is_server_deleting(server)
+            volumes = {
+                r.resource_id for r in resources
+                if r.service == "cinder" and r.resource_type == "volume" and r.name == f"{entry.get('name')}-boot"
+            }
+            boot_volumes[vm_id] = volumes
 
-        # DB 레코드 제거
-        await k3s_nodegroup.remove_nodegroup_vms(nodegroup_id, vm_ids)
+        live_vm_by_node = {entry.get("name"): entry["vm_id"] for entry in vm_entries if requires_drain[entry["vm_id"]]}
+        inherited: set[str] = set()
+        if live_vm_by_node:
+            # A matching marker may predate an earlier DELETE attempt: such a cordon is
+            # never reversible, so it stays out of this attempt's rollback.
+            phase = "node_observation_failed"
+            inherited = {
+                node["name"] for node in await k3s_kube.get_node_capacity(cluster_id)
+                if node.get("unschedulable") and node.get("removal_vm_id")
+                and node.get("removal_vm_id") == live_vm_by_node.get(node.get("name"))
+            }
 
-        # scale-down 완료 이벤트 (best-effort, project_id 없으면 스킵)
+        for entry in vm_entries:
+            if not requires_drain[entry["vm_id"]]:
+                continue
+            node_name = entry.get("name")
+            if not node_name:
+                raise ValueError("Live VM is missing Kubernetes node name")
+            phase = f"cordon_failed:{node_name}"
+            # The PATCH may have reached the apiserver before a transport error.
+            if node_name not in inherited:
+                cordoned.append(node_name)
+            # The annotation lets a retry of this removal resume despite its own cordon.
+            if not await k3s_kube.cordon_node(cluster_id, node_name, removal_vm_id=entry["vm_id"]):
+                raise RuntimeError(phase)
+            phase = f"drain_failed:{node_name}"
+            if not await k3s_kube.drain_node(cluster_id, node_name):
+                raise RuntimeError(phase)
+
+        for entry in vm_entries:
+            vm_id = entry["vm_id"]
+            node_name = entry.get("name")
+            phase = f"server_delete_failed:{vm_id}"
+            server = await asyncio.to_thread(_observe_owned_worker, conn, vm_id, project_id, cluster_id)
+            # Past the final ownership check Nova may accept DELETE even when the call or wait
+            # fails, so Pods must never be rescheduled onto this node again.
+            if node_name in cordoned:
+                cordoned.remove(node_name)
+            if server is not None:
+                if not nova.is_server_deleting(server):
+                    await asyncio.to_thread(conn.compute.delete_server, vm_id, ignore_missing=True)
+                await asyncio.to_thread(nova.wait_server_deleted, conn, vm_id)
+            await inventory.mark_resource_deleted(service="nova", resource_type="server", resource_id=vm_id)
+            for volume_id in boot_volumes[vm_id]:
+                phase = f"boot_volume_delete_unverified:{volume_id}"
+                await asyncio.to_thread(cinder.wait_volume_deleted, conn, volume_id)
+                await inventory.mark_resource_deleted(service="cinder", resource_type="volume", resource_id=volume_id)
+            phase = f"node_delete_failed:{node_name}"
+            if node_name and not await k3s_kube.delete_k8s_node(cluster_id, node_name):
+                raise RuntimeError(phase)
+            await k3s_nodegroup.remove_nodegroup_vms(nodegroup_id, [vm_id])
+
         if project_id:
             try:
                 from drover.services.activity import record
@@ -356,8 +515,19 @@ async def delete_nodegroup_vms(
                 )
             except Exception:
                 pass
+    except Exception as exc:
+        uncordon_failed = []
+        for node_name in cordoned:
+            try:
+                if not await k3s_kube.uncordon_node(cluster_id, node_name):
+                    uncordon_failed.append(node_name)
+            except Exception:
+                uncordon_failed.append(node_name)
+        raise NodegroupDeletionError(phase, uncordon_failed=uncordon_failed) from exc
     finally:
         await keystone.close_connection(conn)
+
+
 
 
 async def reconcile_nodegroup_vms(
@@ -380,42 +550,18 @@ async def reconcile_nodegroup_vms(
         return []
 
     verified_vms: list[dict] = []
-    conn = None
+    conn = await keystone.get_project_manager_connection(project_id)
     try:
-        conn = await keystone.get_project_manager_connection(project_id)
-    except Exception as exc:
-        _logger.debug("reconcile_nodegroup_vms: OpenStack connection unavailable: %s", exc)
-    try:
-        cluster_tag = f"drover.cluster_id={cluster_id}"
         for vm_entry in vms:
             vm_id = vm_entry.get("vm_id")
             if not vm_id:
                 continue
-            if conn is not None:
-                try:
-                    s = await asyncio.to_thread(nova.get_server, conn, vm_id)
-                    if s:
-                        status = str(
-                            getattr(s, "status", None) or (s.get("status") if isinstance(s, dict) else "")
-                        ).upper()
-                        meta = getattr(s, "metadata", None) or (s.get("metadata") if isinstance(s, dict) else {})
-                        tags = getattr(s, "tags", None) or (s.get("tags") if isinstance(s, dict) else [])
-                        has_tag = (
-                            isinstance(meta, dict)
-                            and (
-                                meta.get("drover.cluster_id") == cluster_id
-                                or meta.get("k3s_horse_generator_nodegroup_id") == nodegroup_id
-                            )
-                        ) or (isinstance(tags, (list, tuple, set)) and cluster_tag in tags)
-                        if status in ("ACTIVE", "BUILD") or (
-                            has_tag and status not in ("ERROR", "DELETED", "SOFT_DELETED")
-                        ):
-                            verified_vms.append(vm_entry)
-                except Exception as e:
-                    _logger.debug("reconcile_nodegroup_vms: VM %s check failed: %s", vm_id, e)
-            else:
-                if vm_entry.get("status") != "ERROR":
-                    verified_vms.append(vm_entry)
+            # Only a genuine Nova 404 is absence; the absent row stays tracked for its own
+            # volume/Node cleanup. Other observation errors propagate.
+            s = await asyncio.to_thread(nova.observe_server, conn, vm_id)
+            # ERROR/SHUTOFF workers still occupy quota and have tracked resources.
+            if s is not None and str(s.status or "").upper() not in ("DELETED", "SOFT_DELETED"):
+                verified_vms.append(vm_entry)
 
         actual_count = len(verified_vms)
         if ng.get("node_count") != actual_count:
@@ -447,6 +593,10 @@ async def provision_nodegroup_and_reconcile(
         image_id=nodegroup.get("image_id"),
         labels=nodegroup.get("labels"),
         taints=nodegroup.get("taints"),
+        provisioning_key_prefix=(
+            f"nodegroup-{cluster_id}-{nodegroup['id']}-{operation_id}" if operation_id else None
+        ),
+        inspect_flavor_gpu=True,
     )
     verified = await reconcile_nodegroup_vms(project_id, cluster_id, nodegroup["id"])
     result_vm_ids = [v["vm_id"] for v in created]

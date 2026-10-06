@@ -25,7 +25,7 @@ async def _record_stampede_event(
     status: str,
     extra: dict | None = None,
 ) -> None:
-    """Stampede 스케일 이벤트를 activity_logs에 영속화 (best-effort)."""
+    """Record best-effort Redis activity; durable jobs retain operation events."""
     try:
         from drover.services.activity import record
 
@@ -40,8 +40,8 @@ async def _record_stampede_event(
             status=status,  # type: ignore[arg-type]
             extra=extra or {},
         )
-    except Exception as e:
-        _logger.debug("stampede: 이벤트 기록 실패 (무시): %s", e)
+    except Exception:
+        _logger.debug("Stampede activity recording unavailable")
 
 
 # ---------------------------------------------------------------------------
@@ -50,178 +50,76 @@ async def _record_stampede_event(
 
 
 def _node_matches_nodegroup(pod: dict, nodegroup: dict) -> bool:
-    """pod가 이 nodegroup에 스케줄 가능한지 기초 매칭.
-
-    확인 항목:
-      1. pod.nodeSelector 키가 nodegroup.labels에 모두 포함되는지
-      2. pod.tolerations가 nodegroup.taints를 커버하는지 (NoSchedule/NoExecute)
-    """
-    ng_labels: dict = nodegroup.get("labels") or {}
-    ng_taints: list = nodegroup.get("taints") or []
-
-    # nodeSelector 체크
-    node_selector: dict = pod.get("node_selector") or {}
-    for k, v in node_selector.items():
-        if ng_labels.get(k) != v:
-            return False
-
-    # taints 체크 (NoSchedule / NoExecute — pod가 tolerate해야 배포 가능)
-    pod_tolerations: list = pod.get("tolerations") or []
-
-    def _tolerates(taint: dict) -> bool:
-        effect = taint.get("effect", "")
-        if effect not in ("NoSchedule", "NoExecute", ""):
-            return True  # PreferNoSchedule은 스케줄 차단 안 함
-        t_key = taint.get("key", "")
-        t_val = taint.get("value")
-        for tol in pod_tolerations:
-            if tol.get("operator") == "Exists":
-                if not tol.get("key") or tol.get("key") == t_key:
-                    return True
-            elif tol.get("key") == t_key and (tol.get("value") is None or tol.get("value") == t_val):
-                return True
+    """Match selectors, effect-specific tolerations and required node affinity."""
+    labels = nodegroup.get("labels") or {}
+    if any(labels.get(key) != value for key, value in (pod.get("node_selector") or {}).items()):
         return False
-
-    if not all(not (isinstance(taint, dict) and not _tolerates(taint)) for taint in ng_taints):
-        return False
-
-    # required node affinity: at least one term must be satisfied; all expressions in a term are AND.
-    required = ((pod.get("affinity") or {}).get("nodeAffinity") or {}).get(
-        "requiredDuringSchedulingIgnoredDuringExecution", {}
-    ).get("nodeSelectorTerms") or []
-    if required:
-        term_ok = False
-        for term in required:
-            exprs = term.get("matchExpressions") or []
-            fields = term.get("matchFields") or []
-            if fields:
+    for taint in nodegroup.get("taints") or []:
+        if taint.get("effect") not in {"NoSchedule", "NoExecute"}:
+            continue
+        tolerated = False
+        for tol in pod.get("tolerations") or []:
+            if tol.get("effect") and tol["effect"] != taint["effect"]:
                 continue
-            expr_ok = True
-            for expr in exprs:
-                key = expr.get("key", "")
-                op = expr.get("operator", "In")
-                values = [str(v) for v in (expr.get("values") or [])]
-                actual = ng_labels.get(key)
-                if (
-                    (op == "In" and actual not in values)
-                    or (op == "NotIn" and actual in values)
-                    or (op == "Exists" and key not in ng_labels)
-                    or (op == "DoesNotExist" and key in ng_labels)
-                ):
-                    expr_ok = False
-                elif op == "Gt":
-                    try:
-                        expr_ok = actual is not None and int(actual) > int(values[0])
-                    except (TypeError, ValueError, IndexError):
-                        expr_ok = False
-                elif op == "Lt":
-                    try:
-                        expr_ok = actual is not None and int(actual) < int(values[0])
-                    except (TypeError, ValueError, IndexError):
-                        expr_ok = False
-                if not expr_ok:
-                    break
-            if expr_ok:
-                term_ok = True
-                break
-        if not term_ok:
+            operator = tol.get("operator", "Equal")
+            if (operator == "Exists" and (not tol.get("key") or tol["key"] == taint.get("key"))) or (
+                operator == "Equal"
+                and tol.get("key") == taint.get("key")
+                and tol.get("value", "") == taint.get("value", "")
+            ):
+                tolerated = True
+        if not tolerated:
             return False
-
-    return True
+    affinity = ((pod.get("affinity") or {}).get("nodeAffinity") or {})
+    if "requiredDuringSchedulingIgnoredDuringExecution" not in affinity:
+        return True
+    terms = (affinity["requiredDuringSchedulingIgnoredDuringExecution"] or {}).get("nodeSelectorTerms") or []
+    for term in terms:
+        expressions = term.get("matchExpressions") or []
+        fields = term.get("matchFields") or []
+        if not expressions and not fields:
+            continue
+        matched = True
+        for expression in expressions + fields:
+            key = expression.get("key", "")
+            if expression in fields:
+                actual = nodegroup.get("name") if key == "metadata.name" else None
+                present = actual is not None
+            else:
+                actual = labels.get(key)
+                present = key in labels
+            values = expression.get("values") or []
+            operator = expression.get("operator")
+            if operator == "In":
+                ok = present and actual in values
+            elif operator == "NotIn":
+                ok = actual not in values
+            elif operator == "Exists":
+                ok = present
+            elif operator == "DoesNotExist":
+                ok = not present
+            elif operator in {"Gt", "Lt"}:
+                try:
+                    ok = len(values) == 1 and (int(actual) > int(values[0]) if operator == "Gt" else int(actual) < int(values[0]))
+                except (TypeError, ValueError, IndexError):
+                    ok = False
+            else:
+                ok = False
+            if not ok:
+                matched = False
+                break
+        if matched:
+            return True
+    return False
 
 
 def _is_pvc_issue(pod: dict) -> bool:
-    """pod가 PVC 미바운드로 Unschedulable인지 추정."""
-    msg: str = pod.get("message", "").lower()
-    return "persistentvolumeclaim" in msg or "pvc" in msg or "volume" in msg
+    message = pod.get("message", "").lower()
+    return any(text in message for text in ("unbound immediate persistentvolumeclaims", "persistentvolumeclaim", "volume node affinity", "volume binding"))
 
 
-def _pod_fits_flavor(pod: dict, flavor: dict) -> bool:
-    """pod의 resource requests가 flavor capacity에 맞는지."""
-    req = pod.get("resource_requests", {})
-    cpu_m = req.get("cpu_m", 0)
-    mem = req.get("memory_bytes", 0)
-    gpu = req.get("gpu", 0)
-    if cpu_m > flavor.get("vcpus_m", 0):
-        return False
-    if mem > flavor.get("ram_bytes", 0):
-        return False
-    if gpu > flavor.get("gpu", 0):
-        return False
-    return True
 
 
-def _select_flavor(
-    pending_pods: list[dict],
-    node_pods: list[dict],
-    available_flavors: list[dict],
-    nodegroup: dict,
-    headroom_factor: float,
-) -> dict | None:
-    """가중치 기반 flavor 자동 선택.
-
-    target = Σ(pending pod requests) × (1 + α × 기존_부하_비율)
-    → target 이상 capacity를 가진 최소 flavor 반환.
-    """
-    if not available_flavors:
-        return None
-
-    # pending pod requests 합산 (이 nodegroup에 할당될 pod만)
-    total_cpu_m = sum(p["resource_requests"]["cpu_m"] for p in pending_pods)
-    total_mem = sum(p["resource_requests"]["memory_bytes"] for p in pending_pods)
-    needs_gpu = any(p["resource_requests"].get("gpu", 0) > 0 for p in pending_pods)
-
-    # 기존 부하 비율 계산 (nodegroup 노드들의 평균 사용률)
-    ng_node_names = {v["name"] for v in nodegroup.get("vms", []) if v.get("name")}
-    ng_pods = [p for p in node_pods if p.get("node") in ng_node_names]
-
-    existing_cpu_m = sum(p["cpu_m"] for p in ng_pods)
-    existing_mem = sum(p["memory_bytes"] for p in ng_pods)
-
-    # 노드그룹 총 allocatable (간략 추정: node_count × 첫 flavor capacity)
-    node_count = nodegroup.get("node_count", 0)
-    if node_count > 0 and available_flavors:
-        ref = available_flavors[0]
-        ng_total_cpu_m = node_count * ref.get("vcpus_m", 1)
-        ng_total_mem = node_count * ref.get("ram_bytes", 1)
-        existing_cpu_frac = min(existing_cpu_m / ng_total_cpu_m, 1.0) if ng_total_cpu_m else 0.0
-        existing_mem_frac = min(existing_mem / ng_total_mem, 1.0) if ng_total_mem else 0.0
-    else:
-        existing_cpu_frac = 0.0
-        existing_mem_frac = 0.0
-
-    # 헤드룸 적용
-    target_cpu_m = int(total_cpu_m * (1 + headroom_factor * existing_cpu_frac))
-    target_mem = int(total_mem * (1 + headroom_factor * existing_mem_frac))
-
-    # 최소 1 pod를 수용할 수 있는 후보 필터
-    max_pod_cpu_m = max((p["resource_requests"]["cpu_m"] for p in pending_pods), default=0)
-    max_pod_mem = max((p["resource_requests"]["memory_bytes"] for p in pending_pods), default=0)
-    max_pod_gpu = max((p["resource_requests"].get("gpu", 0) for p in pending_pods), default=0)
-
-    candidates = [
-        f
-        for f in available_flavors
-        if f.get("vcpus_m", 0) >= max(max_pod_cpu_m, target_cpu_m)
-        and f.get("ram_bytes", 0) >= max(max_pod_mem, target_mem)
-        and (not needs_gpu or f.get("gpu", 0) >= max_pod_gpu)
-    ]
-
-    if not candidates:
-        # target을 맞출 수 없으면 최소한 한 pod라도 담을 수 있는 것 선택
-        candidates = [
-            f
-            for f in available_flavors
-            if f.get("vcpus_m", 0) >= max_pod_cpu_m
-            and f.get("ram_bytes", 0) >= max_pod_mem
-            and (not needs_gpu or f.get("gpu", 0) >= max_pod_gpu)
-        ]
-
-    if not candidates:
-        return None
-
-    # 최소 flavor (비용 최소화)
-    return min(candidates, key=lambda f: (f.get("vcpus_m", 0), f.get("ram_bytes", 0)))
 
 
 _NON_GPU_PCI_ALIAS_TOKENS = frozenset(
@@ -261,178 +159,168 @@ def _flavor_gpu_count(extra_specs: dict) -> int:
 
 
 def _fits_capacity(req: dict, cap: dict) -> bool:
-    return (
-        req.get("cpu_m", 0) <= cap.get("cpu_m", cap.get("vcpus_m", 0))
-        and req.get("memory_bytes", 0) <= cap.get("memory_bytes", cap.get("ram_bytes", 0))
-        and req.get("gpu", 0) <= cap.get("gpu", 0)
-    )
+    if any(req.get(key, 0) > cap.get(key, 0) for key in ("cpu_m", "memory_bytes", "gpu")):
+        return False
+    if req.get("pods", 1) > cap.get("pods", 110):
+        return False
+    return all(value <= (cap.get("extended_resources") or {}).get(key, 0) for key, value in (req.get("extended_resources") or {}).items())
+
+
+def _requests(pod: dict) -> dict:
+    return pod.get("resource_requests") or {
+        "cpu_m": pod.get("cpu_m", 0), "memory_bytes": pod.get("memory_bytes", 0),
+        "gpu": pod.get("gpu", 0), "pods": 1,
+    }
+
+
+def _consume(free: dict, req: dict) -> None:
+    for key in ("cpu_m", "memory_bytes", "gpu"):
+        free[key] = free.get(key, 0) - req.get(key, 0)
+    free["pods"] = free.get("pods", 110) - req.get("pods", 1)
+    for key, value in (req.get("extended_resources") or {}).items():
+        resources = free.setdefault("extended_resources", {})
+        resources[key] = resources.get(key, 0) - value
+
+
+def _flavor_capacity(flavor: dict, headroom: float = 0.0) -> dict:
+    """Estimate schedulable CPU/RAM; GPU devices are indivisible."""
+    return dict(flavor.get("estimated_allocatable") or {
+        "cpu_m": int(flavor.get("vcpus_m", 0) * (1 - headroom)),
+        "memory_bytes": int(flavor.get("ram_bytes", 0) * (1 - headroom)),
+        "gpu": flavor.get("gpu", 0), "pods": 110,
+    })
+
+
+def _free_nodes(node_pods: list[dict], nodes: list[dict]) -> list[dict]:
+    free_nodes = []
+    for node in nodes:
+        if not node.get("ready") or node.get("unschedulable"):
+            continue
+        free = dict(node.get("allocatable") or {})
+        free["extended_resources"] = dict(free.get("extended_resources") or {})
+        for pod in node_pods:
+            if pod.get("node") == node.get("name"):
+                _consume(free, _requests(pod))
+        for key in ("cpu_m", "memory_bytes", "gpu", "pods"):
+            free[key] = max(0, free.get(key, 110 if key == "pods" else 0))
+        free_nodes.append({**node, **free})
+    return free_nodes
+
+
+def _scheduling_block(pod: dict) -> str:
+    if pod.get("scheduler_name", "default-scheduler") not in {"", "default-scheduler"}:
+        return "unsupported_scheduler"
+    affinity = pod.get("affinity") or {}
+    if affinity.get("podAffinity") or affinity.get("podAntiAffinity"):
+        return "unsupported_pod_affinity"
+    if any(item.get("whenUnsatisfiable") == "DoNotSchedule" for item in pod.get("topology_spread_constraints") or []):
+        return "unsupported_topology_spread"
+    if pod.get("host_ports"):
+        return "unsupported_host_ports"
+    return ""
 
 
 def _binpack_count(pods: list[dict], flavor: dict) -> int:
     bins: list[dict] = []
-    ordered = sorted(
-        pods,
-        key=lambda p: (
-            p.get("resource_requests", {}).get("gpu", 0),
-            p.get("resource_requests", {}).get("memory_bytes", 0),
-            p.get("resource_requests", {}).get("cpu_m", 0),
-        ),
-        reverse=True,
-    )
+    ordered = sorted(pods, key=lambda p: (_requests(p).get("gpu", 0), _requests(p).get("memory_bytes", 0), _requests(p).get("cpu_m", 0)), reverse=True)
     for pod in ordered:
-        req = pod.get("resource_requests", {})
-        placed = False
-        for free in bins:
-            if _fits_capacity(req, free):
-                free["cpu_m"] -= req.get("cpu_m", 0)
-                free["memory_bytes"] -= req.get("memory_bytes", 0)
-                free["gpu"] -= req.get("gpu", 0)
-                placed = True
-                break
-        if not placed:
-            bins.append(
-                {
-                    "cpu_m": flavor.get("vcpus_m", 0) - req.get("cpu_m", 0),
-                    "memory_bytes": flavor.get("ram_bytes", 0) - req.get("memory_bytes", 0),
-                    "gpu": flavor.get("gpu", 0) - req.get("gpu", 0),
-                }
-            )
+        req = _requests(pod)
+        if _pod_fits_existing_capacity(pod, bins):
+            continue
+        free = _flavor_capacity(flavor)
+        if not _fits_capacity(req, free):
+            raise ValueError("pod exceeds nodegroup capacity")
+        _consume(free, req)
+        bins.append(free)
     return len(bins)
 
 
 def _nodegroup_resource_summary(nodegroup: dict, node_pods: list[dict], node_capacities: list[dict]) -> dict:
-    ng_node_names = {v["name"] for v in nodegroup.get("vms", []) if v.get("name")}
-    nodes = [n for n in node_capacities if n.get("name") in ng_node_names and n.get("ready")]
-    used_by_node: dict[str, dict] = {}
-    for pod in node_pods:
-        node = pod.get("node", "")
-        if node not in ng_node_names:
-            continue
-        used = used_by_node.setdefault(node, {"cpu_m": 0, "memory_bytes": 0, "gpu": 0})
-        used["cpu_m"] += pod.get("cpu_m", 0)
-        used["memory_bytes"] += pod.get("memory_bytes", 0)
-        used["gpu"] += pod.get("gpu", 0)
-    totals = {
-        "allocatable": {"cpu_m": 0, "memory_bytes": 0, "gpu": 0},
-        "requested": {"cpu_m": 0, "memory_bytes": 0, "gpu": 0},
-        "free": {"cpu_m": 0, "memory_bytes": 0, "gpu": 0},
-    }
-    free_nodes: list[dict] = []
+    names = {vm.get("name") for vm in nodegroup.get("vms") or []}
+    nodes = [node for node in node_capacities if node.get("name") in names and node.get("ready")]
+    free = _free_nodes(node_pods, nodes)
+    summary = {kind: {key: 0 for key in ("cpu_m", "memory_bytes", "gpu", "pods")} for kind in ("allocatable", "requested", "free")}
     for node in nodes:
-        alloc = node.get("allocatable", {})
-        used = used_by_node.get(node["name"], {"cpu_m": 0, "memory_bytes": 0, "gpu": 0})
-        free = {
-            "name": node["name"],
-            "cpu_m": max(0, alloc.get("cpu_m", 0) - used.get("cpu_m", 0)),
-            "memory_bytes": max(0, alloc.get("memory_bytes", 0) - used.get("memory_bytes", 0)),
-            "gpu": max(0, alloc.get("gpu", 0) - used.get("gpu", 0)),
-        }
-        free_nodes.append(free)
-        for key in ("cpu_m", "memory_bytes", "gpu"):
-            totals["allocatable"][key] += alloc.get(key, 0)
-            totals["requested"][key] += used.get(key, 0)
-            totals["free"][key] += free[key]
-    totals["nodes"] = free_nodes
-    return totals
+        for key in summary["allocatable"]:
+            summary["allocatable"][key] += (node.get("allocatable") or {}).get(key, 0)
+    for pod in node_pods:
+        if pod.get("node") in {node["name"] for node in nodes}:
+            for key in summary["requested"]:
+                summary["requested"][key] += _requests(pod).get(key, 1 if key == "pods" else 0)
+    for node in free:
+        for key in summary["free"]:
+            summary["free"][key] += node.get(key, 0)
+    summary["nodes"] = free
+    return summary
 
 
 def _pod_fits_existing_capacity(pod: dict, free_nodes: list[dict]) -> bool:
-    req = pod.get("resource_requests", {})
     for free in free_nodes:
-        if _fits_capacity(req, free):
-            free["cpu_m"] -= req.get("cpu_m", 0)
-            free["memory_bytes"] -= req.get("memory_bytes", 0)
-            free["gpu"] -= req.get("gpu", 0)
+        if "labels" in free and not _node_matches_nodegroup(pod, free):
+            continue
+        if _fits_capacity(_requests(pod), free):
+            _consume(free, _requests(pod))
             return True
     return False
 
 
 def _assign_pending_pods(
-    pending_pods: list[dict],
-    nodegroups: list[dict],
-    flavors_by_id: dict[str, dict],
-    node_pods: list[dict],
-    node_capacities: list[dict],
+    pending_pods: list[dict], nodegroups: list[dict], flavors_by_id: dict[str, dict],
+    node_pods: list[dict], node_capacities: list[dict], headroom_factor: float = 0.0,
 ) -> tuple[dict[str, list[dict]], list[dict], dict[str, dict]]:
     summaries = {ng["id"]: _nodegroup_resource_summary(ng, node_pods, node_capacities) for ng in nodegroups}
-    assignments: dict[str, list[dict]] = {ng["id"]: [] for ng in nodegroups}
-    blocked: list[dict] = []
-    for pod in pending_pods:
+    assignments = {ng["id"]: [] for ng in nodegroups}
+    blocked = []
+    free_nodes = _free_nodes(node_pods, node_capacities)
+    for pod in sorted(pending_pods, key=lambda p: (_requests(p).get("gpu", 0), _requests(p).get("memory_bytes", 0)), reverse=True):
+        reason = ""
         if _is_pvc_issue(pod):
-            blocked.append({"pod": pod, "reason": "pvc_unbound"})
+            reason = "pvc_unbound"
+        elif pod.get("node_name"):
+            reason = "pinned_missing_node"
+        elif _scheduling_block(pod):
+            reason = _scheduling_block(pod)
+        elif _requests(pod).get("extended_resources"):
+            reason = "unsupported_resource_request"
+        elif not re.search(r"insufficient (cpu|memory|nvidia\.com/gpu|pods)|no nodes available", pod.get("message", ""), re.IGNORECASE):
+            reason = "not_resource_shortage"
+        if reason:
+            blocked.append({"pod": pod, "reason": reason})
             continue
-        pinned = pod.get("node_name") or ""
-        if pinned:
-            tracked = {v.get("name") for ng in nodegroups for v in ng.get("vms", [])}
-            if pinned not in tracked:
-                blocked.append({"pod": pod, "reason": "pinned_missing_node"})
-                continue
+        if _pod_fits_existing_capacity(pod, free_nodes):
+            continue
         candidates = []
         for ng in nodegroups:
             flavor = flavors_by_id.get(ng.get("flavor_id"))
-            if not flavor:
-                continue
-            if not _node_matches_nodegroup(pod, ng):
-                continue
-            if not _pod_fits_flavor(pod, flavor):
-                continue
-            candidates.append((ng, flavor))
-        if not candidates:
+            template = {"labels": {"afterglow.io/nodegroup": ng["id"], "afterglow.io/stampede": "true", **(ng.get("labels") or {})}, "taints": ng.get("taints") or []}
+            if flavor and flavor.get("gpu", 0) > 0:
+                template["labels"]["afterglow.io/gpu"] = "true"
+            if flavor and _node_matches_nodegroup(pod, template) and _fits_capacity(_requests(pod), _flavor_capacity(flavor, headroom_factor)):
+                candidates.append((ng, flavor))
+        candidates.sort(key=lambda item: (item[0].get("node_count", 0) >= item[0].get("max_size", 5), item[1].get("gpu", 0), item[1].get("vcpus_m", 0), item[1].get("ram_bytes", 0)))
+        if candidates:
+            assignments[candidates[0][0]["id"]].append(pod)
+        else:
             blocked.append({"pod": pod, "reason": "no_matching_nodegroup"})
-            continue
-        candidates.sort(
-            key=lambda pair: (
-                pair[1].get("gpu", 0),
-                pair[1].get("vcpus_m", 0),
-                pair[1].get("ram_bytes", 0),
-                -summaries[pair[0]["id"]]["free"].get("cpu_m", 0),
-            )
-        )
-        assignments[candidates[0][0]["id"]].append(pod)
     return assignments, blocked, summaries
 
 
 async def _get_available_flavors(project_id: str) -> list[dict]:
-    """OpenStack flavor 목록 → Stampede용 구조로 변환."""
     from drover.services import keystone, nova
 
-    try:
-        async with keystone.project_manager_connection(project_id) as conn:
-            flavors_raw = await asyncio.to_thread(nova.list_flavors, conn)
-            result = []
-            for f in flavors_raw:
-                extra_specs = getattr(f, "extra_specs", {}) or {}
-                gpu = _flavor_gpu_count(extra_specs)
-                result.append(
-                    {
-                        "id": f.id,
-                        "name": f.name,
-                        "vcpus_m": int(f.vcpus or 0) * 1000,
-                        "ram_bytes": int(f.ram or 0) * 1024 * 1024,
-                        "gpu": gpu,
-                        "extra_specs": extra_specs,
-                    }
-                )
-            return result
-    except Exception as e:
-        _logger.warning("_get_available_flavors 오류 (project=%s): %s", project_id, e)
-        return []
+    async with keystone.project_manager_connection(project_id) as conn:
+        raw = await asyncio.to_thread(nova.list_flavors, conn)
+    return [{"id": flavor.id, "name": flavor.name, "vcpus_m": int(flavor.vcpus or 0) * 1000,
+             "ram_bytes": int(flavor.ram or 0) * 1024 * 1024, "gpu": _flavor_gpu_count(flavor.extra_specs or {}),
+             "extra_specs": flavor.extra_specs or {}} for flavor in raw]
 
 
 async def _update_stampede_state(nodegroup_id: str, cluster_id: str, updates: dict) -> None:
-    """nodegroup.stampede_state 를 원자적으로 갱신 (merge patch)."""
-    from drover.services import nodegroup as k3s_nodegroup
+    from drover.services import nodegroup
 
-    current = await k3s_nodegroup.get_nodegroup(cluster_id, nodegroup_id)
-    if not current:
-        return
-    state = dict(current.get("stampede_state") or {})
-    state.update(updates)
-    await k3s_nodegroup.update_nodegroup(cluster_id, nodegroup_id, {"stampede_state": state})
+    await nodegroup.merge_stampede_state(cluster_id, nodegroup_id, updates)
 
 
-async def _get_stampede_state(nodegroup: dict) -> dict:
-    return dict(nodegroup.get("stampede_state") or {})
 
 
 # ---------------------------------------------------------------------------
@@ -440,346 +328,117 @@ async def _get_stampede_state(nodegroup: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+async def _blocked(cluster_id: str, project_id: str, ng_id: str, reason: str, **extra) -> None:
+    await _update_stampede_state(ng_id, cluster_id, {"last_decision": "blocked", "last_blocked_reason": reason})
+    await _record_stampede_event(project_id, cluster_id, ng_id, "blocked", "skipped", {"reason": reason, **extra})
+
+
 async def _scale_up_nodegroup(
-    cluster_id: str,
-    project_id: str,
-    nodegroup: dict,
-    pending_pods: list[dict],
-    node_pods: list[dict],
-    node_capacities: list[dict],
-    s,
+    cluster_id: str, project_id: str, nodegroup: dict, pending_pods: list[dict],
+    node_pods: list[dict], node_capacities: list[dict], s, flavor: dict | None = None,
 ) -> None:
-    """nodegroup에 노드를 추가한다."""
-    from drover.services import nodegroup as k3s_nodegroup
+    """Provision the pending demand assigned after cluster-wide free-capacity packing."""
+    from drover.services import afterglow, jobs
 
     ng_id = nodegroup["id"]
-    max_size = nodegroup.get("max_size", 5)
-    node_count = nodegroup.get("node_count", 0)
-    state = await _get_stampede_state(nodegroup)
-
-    # 쿨다운 체크
-    last_up = state.get("last_scale_up", 0)
-    cooldown = s.drover_stampede_scale_up_cooldown
-    if time.time() - last_up < cooldown:
-        rem = cooldown - (time.time() - last_up)
-        _logger.debug("stampede: nodegroup %s scale-up 쿨다운 중 (%.0fs 남음)", ng_id, rem)
-        await _record_stampede_event(
-            project_id=project_id,
-            cluster_id=cluster_id,
-            nodegroup_id=ng_id,
-            action="cooldown",
-            status="skipped",
-            extra={
-                "reason": "cooldown",
-                "direction": "scale_up",
-                "cooldown_seconds": cooldown,
-                "remaining_seconds": rem,
-                "triggering_metric": "pending_pods",
-                "pending_pod_count": len(pending_pods),
-            },
-        )
+    state = nodegroup.get("stampede_state") or {}
+    now = time.time()
+    if state.get("in_flight_count", 0):
+        await _blocked(cluster_id, project_id, ng_id, "provisioning_in_progress")
         return
-
-    # in-flight 노드 수 (아직 Ready 안 된 것)
-    in_flight = state.get("in_flight_count", 0)
-    # in-flight TTL: 40분 초과 시 stale로 간주해 0으로 리셋
-    in_flight_since = state.get("in_flight_since", 0)
-    if in_flight > 0 and time.time() - in_flight_since > 2400:  # 40분
-        _logger.warning("stampede: nodegroup %s in-flight stale, 리셋", ng_id)
-        in_flight = 0
-        await _update_stampede_state(ng_id, cluster_id, {"in_flight_count": 0, "in_flight_since": 0})
-
-    summary = _nodegroup_resource_summary(nodegroup, node_pods, node_capacities)
-    free_nodes = [dict(node) for node in summary["nodes"]]
-    unresolvable_pods = []
-    for pod in pending_pods:
-        if not _pod_fits_existing_capacity(pod, free_nodes):
-            unresolvable_pods.append(pod)
-
-    if not unresolvable_pods:
-        _logger.debug("stampede: nodegroup %s — pending pod 없음 또는 기존 노드로 해결 가능", ng_id)
-        await _update_stampede_state(ng_id, cluster_id, {"capacity": summary, "last_decision": "existing_capacity"})
+    if now - state.get("last_scale_up", 0) < s.drover_stampede_scale_up_cooldown:
+        await _blocked(cluster_id, project_id, ng_id, "scale_up_cooldown")
         return
-
-    available_flavors = await _get_available_flavors(project_id)
-    flavors_by_id = {f["id"]: f for f in available_flavors}
-    flavor = flavors_by_id.get(nodegroup.get("flavor_id") or "")
+    if flavor is None:
+        flavor = next((item for item in await _get_available_flavors(project_id) if item["id"] == nodegroup.get("flavor_id")), None)
     if not flavor:
-        await _record_stampede_event(
-            project_id=project_id,
-            cluster_id=cluster_id,
-            nodegroup_id=ng_id,
-            action="blocked",
-            status="skipped",
-            extra={"reason": "missing_explicit_flavor", "pod_count": len(unresolvable_pods)},
-        )
-        await _update_stampede_state(ng_id, cluster_id, {"last_blocked_reason": "missing_explicit_flavor"})
+        await _blocked(cluster_id, project_id, ng_id, "missing_explicit_flavor")
         return
-    too_large = [p for p in unresolvable_pods if not _pod_fits_flavor(p, flavor)]
-    if too_large:
-        await _record_stampede_event(
-            project_id=project_id,
-            cluster_id=cluster_id,
-            nodegroup_id=ng_id,
-            action="blocked",
-            status="skipped",
-            extra={"reason": "flavor_too_small", "pod_count": len(too_large), "flavor_id": flavor["id"]},
-        )
-        await _update_stampede_state(ng_id, cluster_id, {"last_blocked_reason": "flavor_too_small"})
+    estimated = _flavor_capacity(flavor, s.drover_stampede_resource_headroom_factor)
+    if any(not _fits_capacity(_requests(pod), estimated) for pod in pending_pods):
+        await _blocked(cluster_id, project_id, ng_id, "flavor_too_small")
         return
-
-    requested_count = _binpack_count(unresolvable_pods, flavor)
-    capacity_left = max_size - node_count - in_flight
-    if capacity_left <= 0:
-        await _record_stampede_event(
-            project_id=project_id,
-            cluster_id=cluster_id,
-            nodegroup_id=ng_id,
-            action="blocked",
-            status="skipped",
-            extra={"reason": "max_size_reached", "pod_count": len(unresolvable_pods), "in_flight": in_flight},
-        )
-        await _update_stampede_state(ng_id, cluster_id, {"last_blocked_reason": "max_size_reached"})
+    needed = max(
+        _binpack_count(pending_pods, {**flavor, "estimated_allocatable": estimated}),
+        max(0, nodegroup.get("min_size", 0) - nodegroup.get("node_count", 0)),
+    )
+    room = max(0, nodegroup.get("max_size", 5) - nodegroup.get("node_count", 0))
+    if needed <= 0:
         return
-    add_count = min(requested_count, capacity_left)
-    if add_count < requested_count:
-        await _record_stampede_event(
-            project_id=project_id,
-            cluster_id=cluster_id,
-            nodegroup_id=ng_id,
-            action="blocked",
-            status="skipped",
-            extra={
-                "reason": "max_size_cap",
-                "requested_nodes": requested_count,
-                "add_count": add_count,
-                "unresolved_pods": len(unresolvable_pods),
-            },
-        )
-
-    from drover.services import afterglow as afterglow_service
-
-    gpu_required, blocked_reason = await afterglow_service.check_gpu_admission(
-        project_id=project_id,
-        flavor_id=flavor["id"],
-        settings=s,
-    )
-    if blocked_reason:
-        await _record_stampede_event(
-            project_id=project_id,
-            cluster_id=cluster_id,
-            nodegroup_id=ng_id,
-            action="blocked",
-            status="skipped",
-            extra={
-                "reason": blocked_reason,
-                "flavor_id": flavor["id"],
-                "add_count": add_count,
-            },
-        )
-        await _update_stampede_state(ng_id, cluster_id, {"last_blocked_reason": blocked_reason})
+    if room <= 0:
+        await _blocked(cluster_id, project_id, ng_id, "max_size_reached")
         return
-
-    _logger.info(
-        "stampede: nodegroup %s scale-up %d개 (flavor=%s, unresolvable_pods=%d, in_flight=%d)",
-        ng_id,
-        add_count,
-        flavor["name"],
-        len(unresolvable_pods),
-        in_flight,
-    )
-
-    # in-flight 증가 (즉시 DB 갱신 → 다음 루프에서 중복 scale-up 방지)
-    await _update_stampede_state(
-        ng_id,
-        cluster_id,
-        {
-            "in_flight_count": in_flight + add_count,
-            "in_flight_since": time.time(),
-            "last_scale_up": time.time(),
-        },
-    )
-    # node_count도 즉시 증가
-    await k3s_nodegroup.update_nodegroup(
-        cluster_id,
-        ng_id,
-        {
-            "node_count": node_count + add_count,
-        },
-    )
-
-    # scale-up 이벤트 기록
-    await _record_stampede_event(
-        project_id=project_id,
-        cluster_id=cluster_id,
-        nodegroup_id=ng_id,
-        action="scale_up",
-        status="started",
-        extra={
-            "add_count": add_count,
-            "flavor_id": flavor["id"],
-            "flavor_name": flavor.get("name", ""),
-            "triggering_metric": "pending_pods",
-            "pending_pod_count": len(unresolvable_pods),
-            "gpu_required": gpu_required,
-        },
-    )
-
-    provisioning_key_prefix = f"stampede-{cluster_id}-{ng_id}-{uuid.uuid4().hex}"
-    from drover.services.jobs import enqueue_job
-
-    await enqueue_job(
-        cluster_id=cluster_id,
-        project_id=project_id,
-        kind="stampede_provision",
+    gpu_required = flavor.get("gpu", 0) > 0
+    if s.drover_afterglow_admission_url:
+        admitted_gpu, reason = await afterglow.check_gpu_admission(project_id, flavor["id"], settings=s)
+        if reason:
+            await _update_stampede_state(ng_id, cluster_id, {"quota_state": {"allowed": False, "reason": reason}})
+            await _blocked(cluster_id, project_id, ng_id, reason)
+            return
+        gpu_required = gpu_required or admitted_gpu
+    await _update_stampede_state(ng_id, cluster_id, {"quota_state": {"allowed": True}, "flavor_summary": {**flavor, "estimated_allocatable": estimated}})
+    reservation = await jobs.enqueue_stampede_job(
+        cluster_id, project_id, ng_id, direction="up", requested_count=min(needed, room),
+        expected_node_count=nodegroup.get("node_count", 0),
         payload={
-            "nodegroup_id": ng_id,
-            "add_count": add_count,
-            "flavor_id": flavor["id"],
-            "image_id": nodegroup.get("image_id"),
-            "labels": nodegroup.get("labels"),
-            "taints": nodegroup.get("taints"),
             "gpu_required": gpu_required,
-            "provisioning_key_prefix": provisioning_key_prefix,
+            "gpu_count": max(1, flavor.get("gpu", 0)) if gpu_required else 0,
+            "provisioning_key_prefix": f"stampede-{cluster_id}-{ng_id}-{uuid.uuid4().hex}",
+            "triggering_metric": "pending_pods" if pending_pods else "min_size",
         },
-        user_id="stampede-system",
-        username="Stampede",
     )
+    if reservation is None:
+        await _blocked(cluster_id, project_id, ng_id, "operation_in_progress")
+        return
+    await _record_stampede_event(project_id, cluster_id, ng_id, "scale_up", "started", {
+        "add_count": reservation["count"], "flavor_id": flavor["id"], "gpu_required": gpu_required,
+        "pending_pod_count": len(pending_pods), "requested_nodes": needed, **reservation,
+    })
 
 
 async def _provision_and_track(
-    project_id: str,
-    cluster_id: str,
-    nodegroup_id: str,
-    add_count: int,
-    flavor_id: str,
-    image_id: str | None,
-    labels: dict | None,
-    taints: list | None,
-    gpu_required: bool = False,
-    provisioning_key_prefix: str | None = None,
-    operation_id: str | None = None,
-    triggering_metric: str | dict | None = None,
+    project_id: str, cluster_id: str, nodegroup_id: str, add_count: int, flavor_id: str,
+    image_id: str | None, labels: dict | None, taints: list | None,
+    gpu_required: bool = False, provisioning_key_prefix: str | None = None,
+    operation_id: str | None = None, triggering_metric: str | dict | None = None,
+    gpu_count: int = 0,
 ) -> None:
-    """VM 프로비저닝 후 Ready/GPU 대기, in-flight 카운터 감소."""
-    from drover.services import autoscale as k3s_autoscale
-    from drover.services import kube as k3s_kube
-    from drover.services import nodegroup as k3s_nodegroup
+    """A durable job succeeds only once its workers and GPU devices are schedulable."""
+    from drover.services import autoscale, kube, nodegroup, operations
 
-    provision_error = ""
-    try:
-        new_vms = await k3s_autoscale.provision_nodegroup_vms(
-            project_id=project_id,
-            cluster_id=cluster_id,
-            nodegroup_id=nodegroup_id,
-            add_count=add_count,
-            flavor_id=flavor_id,
-            image_id=image_id,
-            labels=labels,
-            taints=taints,
-            provisioning_key_prefix=provisioning_key_prefix,
-        )
-    except k3s_autoscale.ProvisioningInProgress:
-        _logger.info("stampede: nodegroup %s provisioning intent remains in progress", nodegroup_id)
-        raise
-    except Exception:
-        _logger.exception("stampede: nodegroup %s provisioning failed", nodegroup_id)
-        new_vms = []
-        provision_error = "provision_failed"
-    new_vm_ids = [v["vm_id"] for v in new_vms if v.get("vm_id")]
-    await k3s_autoscale.reconcile_nodegroup_vms(project_id, cluster_id, nodegroup_id)
-    missing_count = max(0, add_count - len(new_vms))
-    if missing_count:
-        _logger.warning(
-            "stampede: nodegroup %s provisioning returned %d/%d VMs",
-            nodegroup_id,
-            len(new_vms),
-            add_count,
-        )
-    ready_nodes = []
-    failed_nodes = []
-    for vm in new_vms:
-        node_name = vm.get("name", "")
-        if not node_name:
-            continue
-        ready = await k3s_kube.wait_node_ready(cluster_id, node_name, timeout=2400.0)
-        if not ready:
-            _logger.warning("stampede: node %s Ready 대기 timeout (40분)", node_name)
-            failed_nodes.append(node_name)
-            continue
-        if gpu_required:
-            gpu_ok = await k3s_kube.wait_node_gpu_allocatable(cluster_id, node_name, min_gpu=1, timeout=600.0)
-            if not gpu_ok:
-                _logger.warning("stampede: node %s Ready but GPU allocatable timeout", node_name)
-                failed_nodes.append(node_name)
-                continue
-        await k3s_nodegroup.update_nodegroup(cluster_id, nodegroup_id, {})
-        _logger.info("stampede: node %s Ready 확인됨", node_name)
-        ready_nodes.append(node_name)
-
-    ng = await k3s_nodegroup.get_nodegroup(cluster_id, nodegroup_id)
-    if ng:
-        state = dict(ng.get("stampede_state") or {})
-        current_in_flight = max(0, state.get("in_flight_count", 0) - add_count)
-        updates = {"in_flight_count": current_in_flight}
-        failure_count = missing_count + len(failed_nodes)
-        if failure_count:
-            reason = "provision_failed"
-            if gpu_required and failed_nodes:
-                reason = "gpu_not_allocatable"
-            elif failed_nodes:
-                reason = "node_not_ready"
-            updates["last_blocked_reason"] = reason
-            if failed_nodes:
-                tracked_count = len(ng.get("vms") or [])
-                actual_count = max(0, tracked_count - len(failed_nodes))
-                await k3s_nodegroup.set_nodegroup_count(cluster_id, nodegroup_id, actual_count)
-        await _update_stampede_state(nodegroup_id, cluster_id, updates)
-
-    if missing_count:
-        reason = "provision_failed"
-    elif gpu_required and failed_nodes:
-        reason = "gpu_not_allocatable"
-    elif failed_nodes:
-        reason = "node_not_ready"
-    else:
-        reason = ""
-    final_status = "success" if not reason else ("failed" if not ready_nodes else "partial")
-    await _record_stampede_event(
-        project_id=project_id,
-        cluster_id=cluster_id,
-        nodegroup_id=nodegroup_id,
-        action="scale_up",
-        status=final_status,
-        extra={
-            "add_count": add_count,
-            "flavor_id": flavor_id,
-            "ready_nodes": ready_nodes,
-            "failed_nodes": failed_nodes,
-            "missing_count": missing_count,
-            "provision_error": provision_error,
-            "reason": reason,
-            "vm_ids": new_vm_ids,
-            "triggering_metric": triggering_metric or "pending_pods",
-        },
+    new_vms = await autoscale.provision_nodegroup_vms(
+        project_id=project_id, cluster_id=cluster_id, nodegroup_id=nodegroup_id, add_count=add_count,
+        flavor_id=flavor_id, image_id=image_id, labels=labels, taints=taints,
+        provisioning_key_prefix=provisioning_key_prefix,
+        gpu_required=gpu_required,
     )
-    if operation_id:
-        from drover.services import operations
+    if gpu_required:
+        from drover.services.gpu import ensure_device_plugin
 
-        await operations.append_operation_event(
-            None,
-            operation_id,
-            phase="stampede_provision_complete",
-            message=f"Stampede provisioned {len(new_vms)} VMs for nodegroup {nodegroup_id}",
-            payload_json={
-                "nodegroup_id": nodegroup_id,
-                "add_count": add_count,
-                "vm_ids": new_vm_ids,
-                "ready_nodes": ready_nodes,
-                "failed_nodes": failed_nodes,
-                "triggering_metric": triggering_metric or "pending_pods",
-            },
-        )
+        await ensure_device_plugin(cluster_id)
+    deadline = time.monotonic() + 2400
+
+    async def observe(vm: dict) -> tuple[str, bool]:
+        name = vm.get("name", "")
+        ready = bool(name) and await kube.wait_node_ready(cluster_id, name, timeout=max(0, deadline - time.monotonic()))
+        if ready and gpu_required:
+            ready = await kube.wait_node_gpu_allocatable(cluster_id, name, min_gpu=max(1, gpu_count), timeout=600.0)
+        await nodegroup.set_nodegroup_vm_status(nodegroup_id, vm["vm_id"], "ACTIVE" if ready else "ERROR")
+        return name, ready
+
+    observed = await asyncio.gather(*(observe(vm) for vm in new_vms))
+    ready_nodes = [name for name, ready in observed if ready]
+    failed_nodes = [name for name, ready in observed if not ready]
+    reason = "provision_failed" if len(new_vms) != add_count else ("gpu_not_allocatable" if gpu_required else "node_not_ready") if failed_nodes else ""
+    await _update_stampede_state(nodegroup_id, cluster_id, {"last_blocked_reason": reason, "ready_nodes": ready_nodes, "failed_nodes": failed_nodes})
+    result = {"nodegroup_id": nodegroup_id, "add_count": add_count, "vm_ids": [vm["vm_id"] for vm in new_vms],
+              "ready_nodes": ready_nodes, "failed_nodes": failed_nodes, "reason": reason,
+              "triggering_metric": triggering_metric or "pending_pods"}
+    await _record_stampede_event(project_id, cluster_id, nodegroup_id, "scale_up", "failed" if reason else "success", result)
+    if operation_id:
+        await operations.append_operation_event(None, operation_id, phase="stampede_workers_observed", payload_json=result)
+    if reason:
+        raise RuntimeError(reason)
 
 
 # ---------------------------------------------------------------------------
@@ -787,188 +446,128 @@ async def _provision_and_track(
 # ---------------------------------------------------------------------------
 
 
+def _removal_block(candidate: dict, node_pods: list[dict], node_capacities: list[dict]) -> str:
+    labels = candidate.get("labels") or {}
+    if any(key in labels for key in ("node-role.kubernetes.io/control-plane", "node-role.kubernetes.io/master", "node-role.kubernetes.io/etcd")):
+        return "control_plane_node"
+    pods = [pod for pod in node_pods if pod.get("node") == candidate["name"] and not pod.get("is_daemonset")]
+    for pod in pods:
+        if pod.get("is_mirror") or not pod.get("has_controller", False):
+            return "unmanaged_pod"
+        if pod.get("safe_to_evict") is False or pod.get("has_local_storage") or pod.get("has_pvc"):
+            return "protected_pod"
+        if pod.get("deleting") or _scheduling_block(pod):
+            return "unsupported_relocation"
+    free = _free_nodes(node_pods, [node for node in node_capacities if node["name"] != candidate["name"]])
+    for pod in sorted(pods, key=lambda p: (_requests(p).get("gpu", 0), _requests(p).get("memory_bytes", 0)), reverse=True):
+        if not _pod_fits_existing_capacity(pod, free):
+            return "scale_down_no_fit"
+    return ""
+
+
 async def _scale_down_nodegroup(
-    cluster_id: str,
-    project_id: str,
-    nodegroup: dict,
-    node_pods: list[dict],
-    node_capacities: list[dict],
-    s,
+    cluster_id: str, project_id: str, nodegroup: dict,
+    node_pods: list[dict], node_capacities: list[dict], s,
 ) -> None:
-    """nodegroup의 유휴 노드를 cordon→drain→삭제한다."""
-    from drover.services import nodegroup as k3s_nodegroup
+    """Remove one managed worker only after continuous low demand and a relocation fit."""
+    from drover.services.jobs import enqueue_stampede_job
 
     ng_id = nodegroup["id"]
-    min_size = nodegroup.get("min_size", 0)
-    node_count = nodegroup.get("node_count", 0)
-    state = await _get_stampede_state(nodegroup)
-
-    if node_count <= min_size:
+    state = nodegroup.get("stampede_state") or {}
+    now = time.time()
+    if nodegroup.get("node_count", 0) <= nodegroup.get("min_size", 0) or state.get("in_flight_count", 0):
+        await _update_stampede_state(ng_id, cluster_id, {"idle_since": {}})
         return
-
-    # 쿨다운 체크
-    last_down = state.get("last_scale_down", 0)
-    cooldown = s.drover_stampede_scale_down_cooldown
-    if time.time() - last_down < cooldown:
-        rem = cooldown - (time.time() - last_down)
-        await _record_stampede_event(
-            project_id=project_id,
-            cluster_id=cluster_id,
-            nodegroup_id=ng_id,
-            action="cooldown",
-            status="skipped",
-            extra={
-                "reason": "cooldown",
-                "direction": "scale_down",
-                "cooldown_seconds": cooldown,
-                "remaining_seconds": rem,
-                "triggering_metric": "idle_nodes",
-            },
-        )
+    if now - max(state.get("last_scale_down", 0), state.get("last_scale_up", 0)) < s.drover_stampede_scale_down_cooldown:
+        await _blocked(cluster_id, project_id, ng_id, "scale_down_cooldown")
         return
-
-    threshold = s.drover_stampede_scale_down_threshold
-    window = s.drover_stampede_scale_down_window
-    interval = s.drover_stampede_interval
-
-    ng_node_names = {v["name"] for v in nodegroup.get("vms", []) if v.get("name")}
-    ng_nodes = [n for n in node_capacities if n["name"] in ng_node_names and n["ready"]]
-
-    evictable_by_node: dict[str, list[dict]] = {}
-    node_used: dict[str, dict] = {}
-    ng_node_set = {n["name"] for n in ng_nodes}
-    for p in node_pods:
-        nn = p.get("node", "")
-        if nn not in ng_node_set:
+    names = {vm.get("name") for vm in nodegroup.get("vms") or []}
+    nodes = [node for node in node_capacities if node.get("name") in names]
+    if len(nodes) != len(names) or any(not node.get("ready") or node.get("unschedulable") for node in nodes):
+        await _update_stampede_state(ng_id, cluster_id, {"idle_since": {}, "last_blocked_reason": "node_not_ready"})
+        return
+    previous = state.get("idle_since") or {}
+    idle_since = {}
+    candidates = []
+    blocked_reason = ""
+    for node in nodes:
+        alloc = node.get("allocatable") or {}
+        used = {key: sum(_requests(pod).get(key, 0) for pod in node_pods if pod.get("node") == node["name"]) for key in ("cpu_m", "memory_bytes", "gpu")}
+        utilization = max(used["cpu_m"] / alloc["cpu_m"] if alloc.get("cpu_m") else 1,
+                          used["memory_bytes"] / alloc["memory_bytes"] if alloc.get("memory_bytes") else 1,
+                          used["gpu"] / alloc["gpu"] if alloc.get("gpu") else 0)
+        if utilization >= s.drover_stampede_scale_down_threshold:
             continue
-        used = node_used.setdefault(nn, {"cpu_m": 0, "memory_bytes": 0, "gpu": 0})
-        used["cpu_m"] += p.get("cpu_m", 0)
-        used["memory_bytes"] += p.get("memory_bytes", 0)
-        used["gpu"] += p.get("gpu", 0)
-        if not p.get("is_daemonset") and not p.get("is_mirror"):
-            evictable_by_node.setdefault(nn, []).append(p)
-
-    idle_nodes = []
-    for node in ng_nodes:
-        alloc = node["allocatable"]
-        used = node_used.get(node["name"], {"cpu_m": 0, "memory_bytes": 0, "gpu": 0})
-        cpu_util = used["cpu_m"] / alloc["cpu_m"] if alloc.get("cpu_m") else 1.0
-        mem_util = used["memory_bytes"] / alloc["memory_bytes"] if alloc.get("memory_bytes") else 1.0
-        gpu_util = used["gpu"] / alloc["gpu"] if alloc.get("gpu") else 0.0
-        if max(cpu_util, mem_util, gpu_util) < threshold:
-            idle_nodes.append((node, len(evictable_by_node.get(node["name"], [])), max(cpu_util, mem_util, gpu_util)))
-
-    if not idle_nodes:
-        await _update_stampede_state(ng_id, cluster_id, {"consecutive_idle_checks": 0})
+        reason = _removal_block(node, node_pods, node_capacities)
+        if reason:
+            blocked_reason = reason
+            continue
+        since = previous.get(node["name"], now)
+        idle_since[node["name"]] = since
+        if now - since >= s.drover_stampede_scale_down_window:
+            candidates.append((utilization, node))
+    await _update_stampede_state(ng_id, cluster_id, {
+        "idle_since": idle_since, "last_decision": "stabilizing" if idle_since else "within_capacity",
+        "last_blocked_reason": blocked_reason,
+    })
+    if not candidates:
         return
-
-    consecutive = state.get("consecutive_idle_checks", 0) + 1
-    await _update_stampede_state(ng_id, cluster_id, {"consecutive_idle_checks": consecutive})
-
-    if consecutive * interval < window:
-        _logger.debug(
-            "stampede: nodegroup %s — 유휴 노드 %d개, stabilization window 대기 (%d/%ds)",
-            ng_id,
-            len(idle_nodes),
-            consecutive * interval,
-            window,
-        )
-        return
-
-    idle_nodes.sort(key=lambda item: (item[1], item[2]))
-    remove_node = None
-    for candidate, _pod_count, _util in idle_nodes:
-        candidate_name = candidate["name"]
-        evictable = evictable_by_node.get(candidate_name, [])
-        remaining_free = []
-        for node in ng_nodes:
-            if node["name"] == candidate_name:
-                continue
-            alloc = node["allocatable"]
-            used = node_used.get(node["name"], {"cpu_m": 0, "memory_bytes": 0, "gpu": 0})
-            remaining_free.append(
-                {
-                    "cpu_m": max(0, alloc.get("cpu_m", 0) - used.get("cpu_m", 0)),
-                    "memory_bytes": max(0, alloc.get("memory_bytes", 0) - used.get("memory_bytes", 0)),
-                    "gpu": max(0, alloc.get("gpu", 0) - used.get("gpu", 0)),
-                }
-            )
-        if all(
-            _pod_fits_existing_capacity(
-                {
-                    "resource_requests": {
-                        "cpu_m": p.get("cpu_m", 0),
-                        "memory_bytes": p.get("memory_bytes", 0),
-                        "gpu": p.get("gpu", 0),
-                    }
-                },
-                remaining_free,
-            )
-            for p in evictable
-        ):
-            remove_node = candidate
-            break
-
-    if remove_node is None:
-        await _update_stampede_state(
-            ng_id, cluster_id, {"consecutive_idle_checks": 0, "last_blocked_reason": "scale_down_no_fit"}
-        )
-        return
-
-    remove_name = remove_node["name"]
-
-    # 해당 노드 VM 찾기
-    vm_entry = next(
-        (v for v in nodegroup.get("vms", []) if v.get("name") == remove_name),
-        None,
+    remove_node = min(candidates, key=lambda item: (item[0], item[1]["name"]))[1]
+    entry = next(vm for vm in nodegroup["vms"] if vm.get("name") == remove_node["name"])
+    reservation = await enqueue_stampede_job(
+        cluster_id, project_id, ng_id, direction="down", requested_count=1,
+        expected_node_count=nodegroup.get("node_count", 0),
+        payload={"remove_entries": [entry], "triggering_metric": "excess_requested_capacity"},
     )
-    if not vm_entry:
-        _logger.warning("stampede: scale-down — %s VM 레코드 없음", remove_name)
-        return
+    if reservation:
+        await _record_stampede_event(project_id, cluster_id, ng_id, "scale_down", "started", {"node_name": remove_node["name"], **reservation})
 
-    _logger.info("stampede: nodegroup %s scale-down — node %s 제거 시작", ng_id, remove_name)
 
-    # node_count 감소 + 쿨다운 갱신
-    await k3s_nodegroup.update_nodegroup(
-        cluster_id,
-        ng_id,
-        {
-            "node_count": max(min_size, node_count - 1),
-        },
-    )
-    await _update_stampede_state(
-        ng_id,
-        cluster_id,
-        {
-            "last_scale_down": time.time(),
-            "consecutive_idle_checks": 0,
-        },
-    )
+async def _delete_and_track(project_id: str, cluster_id: str, payload: dict, operation_id: str | None) -> None:
+    """Guard live VM deletion without blocking cleanup of confirmed-absent servers."""
+    from drover.services import autoscale, keystone, kube, nodegroup, nova
 
-    # scale-down 이벤트 기록
-    await _record_stampede_event(
-        project_id=project_id,
-        cluster_id=cluster_id,
-        nodegroup_id=ng_id,
-        action="scale_down",
-        status="started",
-        extra={"node_name": remove_name, "vm_id": vm_entry.get("vm_id", "")},
-    )
-
-    # Persist deletion so an API/worker restart cannot strand the VM.
-    from drover.services.jobs import enqueue_job
-
-    await enqueue_job(
-        cluster_id=cluster_id,
-        project_id=project_id,
-        kind="nodegroup_reconcile",
-        payload={
-            "action": "delete_vms",
-            "nodegroup": nodegroup,
-            "remove_entries": [vm_entry],
-        },
-        user_id="stampede-system",
-        username="Stampede",
+    ng_id = payload["nodegroup"]["id"]
+    ng = await nodegroup.get_nodegroup(cluster_id, ng_id)
+    if not ng:
+        raise RuntimeError("nodegroup_missing")
+    entries = payload.get("remove_entries") or []
+    tracked_ids = {vm["vm_id"] for vm in ng.get("vms") or [] if vm.get("vm_id")}
+    requested_ids = set()
+    for entry in entries:
+        if not entry.get("vm_id"):
+            raise ValueError("Deletion entry is missing vm_id")
+        requested_ids.add(entry["vm_id"])
+    live_ids = set()
+    if entries:
+        async with keystone.project_manager_connection(project_id) as conn:
+            for vm_id in tracked_ids | requested_ids:
+                server = await asyncio.to_thread(nova.observe_server, conn, vm_id)
+                if server is not None and not nova.is_server_deleting(server):
+                    live_ids.add(vm_id)
+    # Lookup/auth failures propagate; absent/deleting servers only resume cleanup.
+    live_entries = [entry for entry in entries if entry["vm_id"] in live_ids]
+    remaining_live = len(tracked_ids & live_ids)
+    if live_entries:
+        pending, capacities, pods = await asyncio.gather(kube.list_unschedulable_pods(cluster_id), kube.get_node_capacity(cluster_id), kube.get_pod_resource_usage(cluster_id))
+        for entry in live_entries:
+            candidate = next((node for node in capacities if node.get("name") == entry.get("name")), None)
+            if candidate is None:
+                raise RuntimeError("scale_down_node_missing")
+            reason = "pending_pods_present" if pending else _removal_block(candidate, pods, capacities)
+            # Only this removal's own retained cordon may resume; any other cordon blocks.
+            foreign_cordon = candidate.get("unschedulable") and candidate.get("removal_vm_id") != entry["vm_id"]
+            if not candidate.get("ready") or foreign_cordon:
+                reason = "node_not_ready"
+            if remaining_live <= ng.get("min_size", 0):
+                reason = "min_size_reached"
+            if reason:
+                await _blocked(cluster_id, project_id, ng_id, reason)
+                raise RuntimeError(reason)
+            remaining_live -= 1
+    await autoscale.delete_nodegroup_and_reconcile(
+        project_id, cluster_id, ng, entries, operation_id=operation_id,
+        triggering_metric=payload.get("triggering_metric"),
     )
 
 
@@ -978,162 +577,57 @@ async def _scale_down_nodegroup(
 
 
 async def reconcile_cluster(cluster: dict) -> None:
-    """클러스터 1개의 Stampede nodegroup을 순회해 scale-up/down 판단."""
-    from drover.services import kube as k3s_kube
-    from drover.services import nodegroup as k3s_nodegroup
+    from drover.services import kube, nodegroup
 
     cluster_id = cluster.get("id") or cluster.get("cluster_id", "")
     project_id = cluster.get("project_id", "")
-
     if not cluster_id or not project_id:
         return
-
-    s = get_settings()
-
-    # 클러스터의 stampede agent nodegroup 목록. v1은 agent+explicit flavor만 autoscale한다.
-    all_nodegroups = await k3s_nodegroup.list_nodegroups(cluster_id)
-    stampede_ngs = [
-        ng for ng in all_nodegroups if ng.get("stampede_enabled") and ng.get("role") == "agent" and ng.get("flavor_id")
-    ]
-
-    if not stampede_ngs:
+    settings = get_settings()
+    groups = [ng for ng in await nodegroup.list_nodegroups(cluster_id) if ng.get("stampede_enabled") and ng.get("role") == "agent" and ng.get("flavor_id")]
+    if not groups:
         return
-
-    # K8s 상태 조회 (1회 조회 후 재사용)
     try:
-        pending_pods = await k3s_kube.list_unschedulable_pods(cluster_id)
-        node_capacities = await k3s_kube.get_node_capacity(cluster_id)
-        node_pods = await k3s_kube.get_pod_resource_usage(cluster_id)
-    except Exception as e:
-        _logger.warning("stampede: cluster %s K8s API 조회 실패: %s", cluster_id, e)
+        pending, capacities, pods = await asyncio.gather(kube.list_unschedulable_pods(cluster_id), kube.get_node_capacity(cluster_id), kube.get_pod_resource_usage(cluster_id))
+        flavors = {item["id"]: item for item in await _get_available_flavors(project_id)}
+    except Exception:
+        _logger.warning("Stampede observation failed cluster_id=%s", cluster_id)
+        for ng in groups:
+            await _update_stampede_state(ng["id"], cluster_id, {"idle_since": {}, "last_decision": "observation_failed", "last_blocked_reason": "observation_unavailable"})
         return
-
-    available_flavors = await _get_available_flavors(project_id)
-    flavors_by_id = {f["id"]: f for f in available_flavors}
-    assignments, blocked_pods, summaries = _assign_pending_pods(
-        pending_pods,
-        stampede_ngs,
-        flavors_by_id,
-        node_pods,
-        node_capacities,
-    )
-    for blocked in blocked_pods:
-        pod = blocked["pod"]
-        await _record_stampede_event(
-            project_id=project_id,
-            cluster_id=cluster_id,
-            nodegroup_id="",
-            action="blocked",
-            status="skipped",
-            extra={
-                "reason": blocked["reason"],
-                "pod": {"namespace": pod.get("namespace"), "name": pod.get("name")},
-                "message": pod.get("message", ""),
-            },
-        )
-    blocked_summary = [
-        {
-            "namespace": item["pod"].get("namespace"),
-            "name": item["pod"].get("name"),
-            "reason": item["reason"],
-            "message": item["pod"].get("message", ""),
+    assignments, blocked, summaries = _assign_pending_pods(pending, groups, flavors, pods, capacities, settings.drover_stampede_resource_headroom_factor)
+    blocked_summary = [{"namespace": item["pod"].get("namespace"), "name": item["pod"].get("name"), "reason": item["reason"], "message": item["pod"].get("message", "")} for item in blocked]
+    observed_at = time.time()
+    for ng in groups:
+        names = {vm.get("name") for vm in ng.get("vms") or []}
+        updates = {
+            "observed_at": observed_at, "capacity": summaries[ng["id"]], "blocked_reasons": blocked_summary,
+            "pending_assignments": [{"namespace": pod.get("namespace"), "name": pod.get("name"), "resources": _requests(pod)} for pod in assignments[ng["id"]]],
+            "tracked_count": len(ng.get("vms") or []), "ready_count": sum(node.get("ready", False) for node in capacities if node.get("name") in names),
         }
-        for item in blocked_pods
-    ]
-
-    # in_flight 재조정 (worker 재시작 대비 — 실제 CREATING VM 수와 비교)
-    for ng in stampede_ngs:
-        state = ng.get("stampede_state") or {}
-        recorded_in_flight = state.get("in_flight_count", 0)
-        if recorded_in_flight > 0:
-            try:
-                actual_creating = await k3s_nodegroup.count_creating_vms(ng["id"])
-                if actual_creating != recorded_in_flight:
-                    _logger.info(
-                        "stampede: nodegroup %s in_flight 재조정 %d→%d (worker 재시작 보정)",
-                        ng["id"],
-                        recorded_in_flight,
-                        actual_creating,
-                    )
-                    await _update_stampede_state(
-                        ng["id"],
-                        cluster_id,
-                        {
-                            "in_flight_count": actual_creating,
-                        },
-                    )
-                    # ng dict 갱신 (이후 로직에서 사용)
-                    ng = dict(ng)
-                    state = dict(state)
-                    state["in_flight_count"] = actual_creating
-                    ng["stampede_state"] = state
-            except Exception as e:
-                _logger.warning("stampede: in_flight 재조정 실패 (%s): %s", ng["id"], e)
-
-    for ng in stampede_ngs:
-        ng_id = ng["id"]
+        previous_observation = (ng.get("stampede_state") or {}).get("observed_at")
+        observation_continuous = isinstance(previous_observation, (int, float)) and 0 <= observed_at - previous_observation <= 2 * settings.drover_stampede_interval
+        if pending or not observation_continuous:
+            updates["idle_since"] = {}
+        await _update_stampede_state(ng["id"], cluster_id, updates)
+        ng["stampede_state"] = {**(ng.get("stampede_state") or {}), **updates}
         try:
-            pending_summary = [
-                {"namespace": p.get("namespace"), "name": p.get("name"), "resources": p.get("resource_requests", {})}
-                for p in assignments.get(ng_id, [])
-            ]
-            await _update_stampede_state(
-                ng_id,
-                cluster_id,
-                {
-                    "capacity": summaries.get(ng_id, {}),
-                    "pending_assignments": pending_summary,
-                    "blocked_reasons": blocked_summary,
-                },
-            )
-            ng_pending = assignments.get(ng_id, [])
-            if ng_pending:
-                await _scale_up_nodegroup(
-                    cluster_id=cluster_id,
-                    project_id=project_id,
-                    nodegroup=ng,
-                    pending_pods=ng_pending,
-                    node_pods=node_pods,
-                    node_capacities=node_capacities,
-                    s=s,
-                )
-            else:
-                await _scale_down_nodegroup(
-                    cluster_id=cluster_id,
-                    project_id=project_id,
-                    nodegroup=ng,
-                    node_pods=node_pods,
-                    node_capacities=node_capacities,
-                    s=s,
-                )
+            if assignments[ng["id"]] or ng.get("node_count", 0) < ng.get("min_size", 0):
+                await _scale_up_nodegroup(cluster_id, project_id, ng, assignments[ng["id"]], pods, capacities, settings, flavor=flavors.get(ng["flavor_id"]))
+            elif not pending:
+                await _scale_down_nodegroup(cluster_id, project_id, ng, pods, capacities, settings)
         except Exception:
-            _logger.exception("stampede: nodegroup %s reconcile 오류", ng_id)
+            _logger.warning("Stampede decision failed nodegroup_id=%s", ng["id"])
+            await _update_stampede_state(ng["id"], cluster_id, {"idle_since": {}, "last_decision": "decision_failed", "last_blocked_reason": "decision_unavailable"})
 
 
 async def run_all() -> None:
-    """모든 ACTIVE + stampede_enabled 클러스터를 순회해 reconcile 실행."""
-    from drover.services import store as k3s_db
+    from drover.services import store
 
-    s = get_settings()
-    if not s.drover_stampede_enabled:
+    if not get_settings().drover_stampede_enabled:
         return
-
-    try:
-        all_clusters = await k3s_db.list_all_clusters(include_deleted=False)
-    except Exception as e:
-        _logger.warning("stampede: 클러스터 목록 조회 실패: %s", e)
-        return
-
-    active_stampede = [c for c in all_clusters if c.get("status") == "ACTIVE" and c.get("stampede_enabled")]
-
-    if not active_stampede:
-        return
-
-    _logger.info("stampede: reconcile 시작 — %d개 클러스터", len(active_stampede))
-
-    tasks = [reconcile_cluster(c) for c in active_stampede]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for c, r in zip(active_stampede, results, strict=False):
-        if isinstance(r, Exception):
-            _logger.error("stampede: cluster %s reconcile 예외: %s", c.get("id"), r)
+    clusters = [cluster for cluster in await store.list_all_clusters(include_deleted=False) if cluster.get("status") == "ACTIVE" and cluster.get("stampede_enabled")]
+    results = await asyncio.gather(*(reconcile_cluster(cluster) for cluster in clusters), return_exceptions=True)
+    for cluster, result in zip(clusters, results, strict=True):
+        if isinstance(result, Exception):
+            _logger.warning("Stampede reconcile failed cluster_id=%s", cluster["id"])

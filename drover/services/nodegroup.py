@@ -7,9 +7,38 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 
 from drover.db import get_session_factory, is_db_available
-from drover.models.orm import K3sCluster, K3sNodegroup, K3sNodegroupVM
+from drover.models.orm import DroverJob, K3sCluster, K3sNodegroup, K3sNodegroupVM
+from drover.models.schemas import _validate_nodegroup_resource_id
 
 _logger = logging.getLogger(__name__)
+
+
+class NodegroupConflict(ValueError):
+    """A manual mutation conflicts with cluster/job/VM state."""
+
+
+
+
+async def _lock_manual_cluster(session, cluster_id: str) -> K3sCluster | None:
+    cluster = (await session.execute(
+        select(K3sCluster).where(
+            K3sCluster.id == cluster_id, K3sCluster.deleted_at.is_(None)
+        ).with_for_update()
+    )).scalar_one_or_none()
+    if cluster is None:
+        return None
+    if cluster.status != "ACTIVE":
+        raise NodegroupConflict("ACTIVE 상태의 클러스터만 노드그룹을 변경할 수 있습니다.")
+    active = (await session.execute(
+        select(DroverJob.id).where(
+            DroverJob.cluster_id == cluster_id,
+            DroverJob.status.in_(["queued", "running"]),
+            DroverJob.kind != "reconcile",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if active is not None:
+        raise NodegroupConflict("클러스터 변경 작업이 진행 중입니다.")
+    return cluster
 
 
 # ---------------------------------------------------------------------------
@@ -49,10 +78,13 @@ def _validate_scalable_invariants(
     min_size: int = 0,
     max_size: int = 5,
 ) -> None:
-    if role == "server":
-        raise ValueError("커스텀 server 노드그룹은 아직 지원되지 않습니다.")
-    if stampede_enabled and not flavor_id:
-        raise ValueError("Stampede 노드그룹은 flavor_id가 필요합니다.")
+    if role not in {"agent", "server"}:
+        raise ValueError("지원하지 않는 노드그룹 role입니다.")
+    _validate_nodegroup_resource_id(flavor_id)
+    if stampede_enabled and (role != "agent" or not flavor_id):
+        raise ValueError("Stampede는 명시적 flavor_id를 가진 agent 노드그룹만 지원합니다.")
+    if min_size < 0 or max_size < 0 or node_count < 0:
+        raise ValueError("node_count/min_size/max_size는 음수일 수 없습니다.")
     if min_size > max_size:
         raise ValueError("min_size는 max_size보다 클 수 없습니다.")
     if node_count < min_size or node_count > max_size:
@@ -70,7 +102,7 @@ def _deterministic_default_id(cluster_id: str, name: str) -> str:
 async def list_nodegroups(cluster_id: str) -> list[dict]:
     """클러스터의 노드그룹 목록 (삭제되지 않은 것)."""
     if not is_db_available():
-        return []
+        raise RuntimeError("MariaDB unavailable")
 
     factory = get_session_factory()
     async with factory() as session:
@@ -91,7 +123,7 @@ async def list_nodegroups(cluster_id: str) -> list[dict]:
 async def get_nodegroup(cluster_id: str, nodegroup_id: str) -> dict | None:
     """단일 노드그룹 조회."""
     if not is_db_available():
-        return None
+        raise RuntimeError("MariaDB unavailable")
 
     factory = get_session_factory()
     async with factory() as session:
@@ -164,19 +196,21 @@ async def create_default_nodegroups(
         )
 
 
-async def create_nodegroup(cluster_id: str, data: dict) -> dict:
+async def create_nodegroup(
+    cluster_id: str, data: dict, *, project_id: str | None = None,
+    user_id: str | None = None, username: str | None = None,
+) -> dict:
     """노드그룹 생성. DB 미설정 시 RuntimeError."""
     if not is_db_available():
         raise RuntimeError("DB가 설정되지 않아 노드그룹 기능을 사용할 수 없습니다.")
 
     factory = get_session_factory()
     async with factory() as session:
-        # 클러스터 존재 확인
-        stmt = select(K3sCluster).where(K3sCluster.id == cluster_id, K3sCluster.deleted_at.is_(None))
-        result = await session.execute(stmt)
-        cluster = result.scalar_one_or_none()
+        cluster = await _lock_manual_cluster(session, cluster_id)
         if cluster is None:
             raise ValueError(f"클러스터 {cluster_id}를 찾을 수 없습니다.")
+        if project_id is not None and cluster.project_id != project_id:
+            raise ValueError("클러스터를 찾을 수 없습니다.")
 
         # 동일 이름 중복 검사
         dup_stmt = select(K3sNodegroup).where(
@@ -189,12 +223,15 @@ async def create_nodegroup(cluster_id: str, data: dict) -> dict:
             raise ValueError(f"이미 같은 이름의 노드그룹이 존재합니다: {data['name']}")
 
         role = data.get("role", "agent")
+        if role != "agent":
+            raise ValueError("커스텀 server 노드그룹은 아직 지원되지 않습니다.")
         node_count = int(data.get("node_count", 0))
         flavor_id = data.get("flavor_id") or None
         stampede_enabled = bool(data.get("stampede_enabled", False))
         min_size = int(data.get("min_size", 0))
         max_size = int(data.get("max_size", 5))
         _validate_scalable_invariants(role, node_count, flavor_id, stampede_enabled, min_size, max_size)
+        _validate_nodegroup_resource_id(data.get("image_id"))
 
         ng = K3sNodegroup(
             id=str(uuid.uuid4()),
@@ -212,6 +249,13 @@ async def create_nodegroup(cluster_id: str, data: dict) -> dict:
             max_size=int(data.get("max_size", 5)),
         )
         session.add(ng)
+        await session.flush()
+        await session.refresh(ng, ["vms"])
+        if project_id is not None and node_count > 0:
+            await _enqueue_manual_nodegroup_job(
+                session, ng, project_id, {"action": "provision", "nodegroup": _ng_to_dict(ng),
+                                         "add_count": node_count}, user_id, username,
+            )
         await session.commit()
         await session.refresh(ng, ["vms"])
         return _ng_to_dict(ng)
@@ -222,22 +266,36 @@ async def create_nodegroup(cluster_id: str, data: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def update_nodegroup(cluster_id: str, nodegroup_id: str, updates: dict) -> dict | None:
+async def update_nodegroup(
+    cluster_id: str, nodegroup_id: str, updates: dict, *, project_id: str | None = None,
+    user_id: str | None = None, username: str | None = None,
+) -> dict | None:
     """노드그룹 부분 업데이트. 없으면 None."""
     if not is_db_available():
-        return None
+        raise RuntimeError("MariaDB unavailable")
 
     factory = get_session_factory()
     async with factory() as session:
+        cluster = await _lock_manual_cluster(session, cluster_id)
+        if cluster is None or (project_id is not None and cluster.project_id != project_id):
+            return None
         stmt = select(K3sNodegroup).where(
             K3sNodegroup.id == nodegroup_id,
             K3sNodegroup.cluster_id == cluster_id,
             K3sNodegroup.deleted_at.is_(None),
-        )
+        ).with_for_update()
         result = await session.execute(stmt)
         ng = result.scalar_one_or_none()
         if ng is None:
             return None
+        await session.refresh(ng, ["vms"])
+        if int((ng.stampede_state or {}).get("in_flight_count", 0) or 0) > 0:
+            raise NodegroupConflict("Stampede 노드 변경 작업이 진행 중입니다.")
+        has_live_vms = bool(ng.vms) or (ng.role == "server" and bool(cluster.server_vm_id))
+        if "flavor_id" in updates and updates["flavor_id"] != ng.flavor_id and has_live_vms:
+            raise NodegroupConflict("VM이 존재하는 노드그룹의 flavor_id는 변경할 수 없습니다.")
+        if ng.role == "server" and "node_count" in updates and updates["node_count"] != ng.node_count:
+            raise ValueError("server 노드그룹 node_count 변경은 아직 지원되지 않습니다.")
 
         next_role = updates.get("role", ng.role)
         next_count = int(updates.get("node_count", ng.node_count))
@@ -246,6 +304,7 @@ async def update_nodegroup(cluster_id: str, nodegroup_id: str, updates: dict) ->
         next_min = int(updates.get("min_size", ng.min_size if ng.min_size is not None else 0))
         next_max = int(updates.get("max_size", ng.max_size if ng.max_size is not None else 5))
         _validate_scalable_invariants(next_role, next_count, next_flavor, next_stampede, next_min, next_max)
+        _validate_nodegroup_resource_id(updates.get("image_id", ng.image_id))
 
         _allowed = {
             "node_count",
@@ -256,15 +315,94 @@ async def update_nodegroup(cluster_id: str, nodegroup_id: str, updates: dict) ->
             "stampede_enabled",
             "min_size",
             "max_size",
-            "stampede_state",
         }
         for k, v in updates.items():
             if k in _allowed:
                 setattr(ng, k, v)
+        if "node_count" in updates:
+            ng.stampede_state = {**(ng.stampede_state or {}), "desired_count": next_count}
         ng.updated_at = datetime.now(UTC)
+        if project_id is not None and ng.role == "agent" and "node_count" in updates:
+            current = len(ng.vms)
+            payload = None
+            if next_count > current:
+                payload = {"action": "provision", "nodegroup": _ng_to_dict(ng), "add_count": next_count - current}
+            elif next_count < current:
+                payload = {"action": "delete_vms", "nodegroup": _ng_to_dict(ng),
+                           "remove_entries": list(reversed(_ng_to_dict(ng)["vms"]))[:current - next_count]}
+            if payload:
+                await _enqueue_manual_nodegroup_job(session, ng, project_id, payload, user_id, username)
         await session.commit()
         await session.refresh(ng, ["vms"])
         return _ng_to_dict(ng)
+
+
+async def merge_stampede_state(cluster_id: str, nodegroup_id: str, updates: dict) -> dict | None:
+    """Atomically shallow-merge state; absent keys survive concurrent writers."""
+    if not is_db_available():
+        raise RuntimeError("MariaDB unavailable")
+    async with get_session_factory()() as session, session.begin():
+        ng = (await session.execute(
+            select(K3sNodegroup).where(
+                K3sNodegroup.id == nodegroup_id,
+                K3sNodegroup.cluster_id == cluster_id,
+                K3sNodegroup.deleted_at.is_(None),
+            ).with_for_update()
+        )).scalar_one_or_none()
+        if ng is None:
+            return None
+        ng.stampede_state = {**(ng.stampede_state or {}), **updates}
+        ng.updated_at = datetime.now(UTC)
+        return dict(ng.stampede_state)
+
+
+async def _enqueue_manual_nodegroup_job(session, ng, project_id, payload, user_id, username) -> str:
+    from drover.services import jobs
+
+    job_id = await jobs.enqueue_job(
+        cluster_id=ng.cluster_id, project_id=project_id, kind="nodegroup_reconcile", payload=payload,
+        user_id=user_id, username=username, session=session,
+    )
+    if not job_id:
+        raise RuntimeError("Nodegroup job was not persisted")
+    operation_id = (await session.execute(
+        select(DroverJob.operation_id).where(DroverJob.id == job_id)
+    )).scalar_one_or_none()
+    state = dict(ng.stampede_state or {})
+    state.update({"desired_count": ng.node_count, "last_job_id": job_id,
+                  "last_operation_id": operation_id,
+                  "in_flight_count": payload.get("add_count") or len(payload.get("remove_entries") or []),
+                  "last_decision": "manual_scale_up" if payload["action"] == "provision" else "manual_scale_down"})
+    ng.stampede_state = state
+    return job_id
+
+
+async def enqueue_nodegroup_delete(
+    cluster_id: str, nodegroup_id: str, *, project_id: str,
+    user_id: str | None = None, username: str | None = None,
+) -> bool:
+    """Guard and enqueue delete while holding the cluster and group row locks."""
+    if not is_db_available():
+        raise RuntimeError("MariaDB unavailable")
+    async with get_session_factory()() as session, session.begin():
+        cluster = await _lock_manual_cluster(session, cluster_id)
+        if cluster is None or cluster.project_id != project_id:
+            return False
+        ng = (await session.execute(select(K3sNodegroup).where(
+            K3sNodegroup.id == nodegroup_id, K3sNodegroup.cluster_id == cluster_id,
+            K3sNodegroup.deleted_at.is_(None),
+        ).with_for_update())).scalar_one_or_none()
+        if ng is None:
+            return False
+        if ng.is_default:
+            raise ValueError("기본 노드그룹은 삭제할 수 없습니다.")
+        if int((ng.stampede_state or {}).get("in_flight_count", 0) or 0) > 0:
+            raise NodegroupConflict("Stampede 노드 변경 작업이 진행 중입니다.")
+        await session.refresh(ng, ["vms"])
+        payload = {"action": "delete_group", "nodegroup": _ng_to_dict(ng),
+                   "remove_entries": _ng_to_dict(ng)["vms"]}
+        await _enqueue_manual_nodegroup_job(session, ng, project_id, payload, user_id, username)
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +456,20 @@ async def add_nodegroup_vms(nodegroup_id: str, cluster_id: str, vm_entries: list
             )
             session.add(vm)
         await session.commit()
+
+
+async def set_nodegroup_vm_status(nodegroup_id: str, vm_id: str, status: str) -> None:
+    """Persist join/readiness outcome for one tracked VM only."""
+    from sqlalchemy import update
+
+    if status not in {"ACTIVE", "ERROR"}:
+        raise ValueError("VM outcome must be ACTIVE or ERROR")
+    if not is_db_available():
+        raise RuntimeError("MariaDB unavailable")
+    async with get_session_factory()() as session, session.begin():
+        await session.execute(update(K3sNodegroupVM).where(
+            K3sNodegroupVM.nodegroup_id == nodegroup_id, K3sNodegroupVM.vm_id == vm_id,
+        ).values(status=status))
 
 
 async def remove_nodegroup_vms(nodegroup_id: str, vm_ids: list[str]) -> None:

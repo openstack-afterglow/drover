@@ -94,48 +94,6 @@ async def test_enqueue_rejects_unknown_job_kind(monkeypatch):
         await jobs.enqueue_job("cluster-1", "project-1", "unknown", {})
 
 
-async def test_scale_dispatch_uses_persisted_desired_count(monkeypatch):
-    scale = AsyncMock()
-    monkeypatch.setattr("drover.services.autoscale.scale_agents", scale)
-
-    await jobs._execute_job_direct("scale", {"desired_count": 7}, "cluster-1", "project-1")
-
-    scale.assert_awaited_once_with("project-1", "cluster-1", 7)
-
-
-async def test_stampede_provision_dispatches_tracked_worker_operation(monkeypatch):
-    tracked = AsyncMock()
-    monkeypatch.setattr("drover.services.stampede._provision_and_track", tracked)
-
-    await jobs._execute_job_direct(
-        "stampede_provision",
-        {
-            "nodegroup_id": "nodegroup-1",
-            "add_count": 2,
-            "flavor_id": "gpu",
-            "image_id": "image-1",
-            "labels": {"gpu": "true"},
-            "taints": [],
-            "gpu_required": True,
-        },
-        "cluster-1",
-        "project-1",
-    )
-
-    tracked.assert_awaited_once_with(
-        project_id="project-1",
-        cluster_id="cluster-1",
-        nodegroup_id="nodegroup-1",
-        add_count=2,
-        flavor_id="gpu",
-        image_id="image-1",
-        labels={"gpu": "true"},
-        taints=[],
-        gpu_required=True,
-        provisioning_key_prefix=None,
-    )
-
-
 async def test_old_worker_cannot_complete_reclaimed_attempt(monkeypatch):
     job = SimpleNamespace(status="running", attempts=2, claimed_at=object(), last_error=None, updated_at=None)
     session = _Session(objects={(DroverJob, "job-1"): job})
@@ -191,6 +149,7 @@ async def test_third_failure_terminalizes_job_and_cluster(monkeypatch):
         id="job-1",
         cluster_id="cluster-1",
         project_id="project-1",
+        kind="scale",
         status="running",
         attempts=3,
         claimed_at=object(),

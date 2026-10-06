@@ -36,6 +36,8 @@ from drover.models.schemas import (
     K3sProgressMessage,
     K3sProgressStep,
     ScaleK3sClusterRequest,
+    StampedeMutationResponse,
+    StampedeStatusResponse,
 )
 from drover.policy import authorize
 from drover.services import jobs as _jobs
@@ -898,151 +900,156 @@ async def detach_node_interface(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/{cluster_id}/stampede/enable", status_code=200)
-async def enable_stampede(
-    cluster_id: str,
-    conn: openstack.connection.Connection = Depends(get_os_conn),
-    token_info: dict = Depends(get_token_info),
-):
-    """클러스터의 Stampede 오토스케일 모드를 활성화한다."""
+async def _stampede_cluster_access(project_id: str, cluster_id: str, token_info: dict, *, mutation: bool = False) -> dict:
+    from drover.db import is_db_available
 
-    project_id = conn._afterglow_project_id
-    cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
+    authorize("drover:clusters:scale" if mutation else "drover:clusters:get", {"project_id": project_id}, token_info)
+    if not is_db_available():
+        raise HTTPException(status_code=503, detail="MariaDB unavailable")
+    try:
+        cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
+    except (RuntimeError, OperationalError, InterfaceError) as exc:
+        raise HTTPException(status_code=503, detail="MariaDB unavailable") from exc
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
+    return cluster
 
-    if not get_settings().drover_stampede_enabled:
+
+async def _set_stampede_enabled(project_id: str, cluster_id: str, enabled: bool, conn) -> None:
+    from sqlalchemy import select
+
+    from drover.db import get_session_factory, is_db_available
+    from drover.models.orm import K3sCluster, K3sNodegroup
+    from drover.services.nodegroup import _validate_scalable_invariants
+
+    if not is_db_available():
+        raise HTTPException(status_code=503, detail="MariaDB unavailable")
+    try:
+        async with get_session_factory()() as session, session.begin():
+            cluster = (await session.execute(select(K3sCluster).where(
+                K3sCluster.id == cluster_id, K3sCluster.project_id == project_id,
+                K3sCluster.deleted_at.is_(None),
+            ).with_for_update())).scalar_one_or_none()
+            if cluster is None:
+                raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
+            if enabled:
+                if cluster.status != "ACTIVE":
+                    raise HTTPException(status_code=409, detail="ACTIVE 상태의 클러스터만 Stampede를 활성화할 수 있습니다")
+                groups = (await session.execute(select(K3sNodegroup).where(
+                    K3sNodegroup.cluster_id == cluster_id,
+                    K3sNodegroup.deleted_at.is_(None), K3sNodegroup.stampede_enabled.is_(True),
+                ).with_for_update())).scalars().all()
+                if not groups:
+                    raise HTTPException(status_code=422, detail="Stampede가 활성화된 agent 노드그룹이 필요합니다")
+                for group in groups:
+                    try:
+                        _validate_scalable_invariants(group.role, group.node_count, group.flavor_id,
+                                                      True, group.min_size, group.max_size)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail=str(exc)) from exc
+                    for identifier, key in ((group.flavor_id, "k3s.default_agent_flavor"),
+                                            (group.image_id, "k3s.server_image")):
+                        if identifier is None:
+                            continue
+                        try:
+                            selected = await resource_policies.validate_existing_selection(conn, key, identifier)
+                            if selected["id"] != identifier:
+                                raise resource_policies.ResourcePolicyValidationError("Use a resource ID")
+                        except (resource_policies.ResourcePolicyValidationError, ResourceNotFound) as exc:
+                            raise HTTPException(status_code=422, detail="노드그룹 리소스 ID를 사용할 수 없습니다") from exc
+                        except Exception as exc:
+                            raise HTTPException(status_code=503, detail="OpenStack resource validation unavailable") from exc
+            cluster.stampede_enabled = enabled
+            cluster.updated_at = datetime.now(UTC)
+    except (RuntimeError, OperationalError, InterfaceError) as exc:
+        raise HTTPException(status_code=503, detail="MariaDB unavailable") from exc
+
+
+async def _stampede_mutation(cluster_id: str, enabled: bool, conn, token_info: dict) -> dict:
+    project_id = conn._afterglow_project_id
+    await _stampede_cluster_access(project_id, cluster_id, token_info, mutation=True)
+    if enabled and not get_settings().drover_stampede_enabled:
         raise HTTPException(status_code=400, detail="Stampede 기능이 서버에서 비활성화 상태입니다")
-
-    await k3s_cluster.update_cluster_status(project_id, cluster_id, cluster["status"], "")
-    # stampede_enabled 컬럼 갱신
-    from sqlalchemy import select as _select
-
-    from drover.db import get_session_factory, is_db_available
-    from drover.models.orm import K3sCluster
-
-    if is_db_available():
-        factory = get_session_factory()
-        async with factory() as session:
-            stmt = _select(K3sCluster).where(K3sCluster.id == cluster_id)
-            result = await session.execute(stmt)
-            c = result.scalar_one_or_none()
-            if c:
-                c.stampede_enabled = True
-                await session.commit()
-
-    await invalidate(f"afterglow:k3s:{project_id}:cluster:{cluster_id}")
-    await rec(
-        token_info,
-        conn,
-        resource_type="k3s_cluster",
-        action="k3s.stampede_enable",
-        status="success",
-        resource_id=cluster_id,
-    )
-    return {"message": "Stampede 모드가 활성화되었습니다", "cluster_id": cluster_id}
+    await _set_stampede_enabled(project_id, cluster_id, enabled, conn)
+    # MariaDB is authoritative. Redis cache/audit outages cannot undo this commit.
+    try:
+        await invalidate(f"afterglow:k3s:{project_id}:cluster:{cluster_id}")
+        await rec(token_info, conn, resource_type="k3s_cluster",
+                  action="k3s.stampede_enable" if enabled else "k3s.stampede_disable",
+                  status="success", resource_id=cluster_id)
+    except Exception:
+        _logger.warning("Stampede mutation committed; auxiliary cache/audit unavailable")
+    return {"message": "Stampede 모드가 활성화되었습니다" if enabled else "Stampede 모드가 비활성화되었습니다",
+            "cluster_id": cluster_id, "stampede_enabled": enabled}
 
 
-@router.post("/{cluster_id}/stampede/disable", status_code=200)
-async def disable_stampede(
-    cluster_id: str,
-    conn: openstack.connection.Connection = Depends(get_os_conn),
-    token_info: dict = Depends(get_token_info),
-):
-    """클러스터의 Stampede 오토스케일 모드를 비활성화한다."""
-    project_id = conn._afterglow_project_id
-    cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
-    if not cluster:
-        raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
-
-    from sqlalchemy import select as _select
-
-    from drover.db import get_session_factory, is_db_available
-    from drover.models.orm import K3sCluster
-
-    if is_db_available():
-        factory = get_session_factory()
-        async with factory() as session:
-            stmt = _select(K3sCluster).where(K3sCluster.id == cluster_id)
-            result = await session.execute(stmt)
-            c = result.scalar_one_or_none()
-            if c:
-                c.stampede_enabled = False
-                await session.commit()
-
-    await invalidate(f"afterglow:k3s:{project_id}:cluster:{cluster_id}")
-    await rec(
-        token_info,
-        conn,
-        resource_type="k3s_cluster",
-        action="k3s.stampede_disable",
-        status="success",
-        resource_id=cluster_id,
-    )
-    return {"message": "Stampede 모드가 비활성화되었습니다", "cluster_id": cluster_id}
+@router.post("/{cluster_id}/stampede/enable", response_model=StampedeMutationResponse)
+async def enable_stampede(cluster_id: str, conn=Depends(get_os_conn), token_info: dict = Depends(get_token_info)):
+    return await _stampede_mutation(cluster_id, True, conn, token_info)
 
 
-@router.get("/{cluster_id}/stampede")
-async def get_stampede_status(
-    cluster_id: str,
-    conn: openstack.connection.Connection = Depends(get_os_conn),
-    token_info: dict = Depends(get_token_info),
-):
-    """클러스터의 Stampede 오토스케일 상태를 조회한다."""
+@router.post("/{cluster_id}/stampede/disable", response_model=StampedeMutationResponse)
+async def disable_stampede(cluster_id: str, conn=Depends(get_os_conn), token_info: dict = Depends(get_token_info)):
+    # Disabling stops new planner decisions; an already queued operation completes.
+    return await _stampede_mutation(cluster_id, False, conn, token_info)
+
+
+@router.get("/{cluster_id}/stampede", response_model=StampedeStatusResponse)
+@router.get("/{cluster_id}/stampede/status", response_model=StampedeStatusResponse)
+async def get_stampede_status(cluster_id: str, conn=Depends(get_os_conn), token_info: dict = Depends(get_token_info)):
+    """Return DB-backed sizing and observations, never infer Kubernetes readiness."""
     from drover.services import nodegroup as _k3s_ng
 
-    project_id = conn._afterglow_project_id
-    cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
-    if not cluster:
-        raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
-
-    all_ngs = await _k3s_ng.list_nodegroups(cluster_id)
+    cluster = await _stampede_cluster_access(conn._afterglow_project_id, cluster_id, token_info)
+    try:
+        all_ngs = await _k3s_ng.list_nodegroups(cluster_id)
+        active_jobs = await _jobs.list_active_mutation_jobs(cluster_id)
+    except (RuntimeError, OperationalError, InterfaceError) as exc:
+        raise HTTPException(status_code=503, detail="MariaDB unavailable") from exc
     stampede_ngs = []
     for ng in all_ngs:
         state = ng.get("stampede_state") or {}
-        stampede_ngs.append(
-            {
-                "id": ng["id"],
-                "name": ng["name"],
-                "role": ng.get("role"),
-                "flavor_id": ng.get("flavor_id"),
-                "stampede_enabled": ng["stampede_enabled"],
-                "min_size": ng["min_size"],
-                "max_size": ng["max_size"],
-                "node_count": ng["node_count"],
-                "in_flight": int(state.get("in_flight_count", 0) or 0),
-                "capacity": state.get("capacity") or {},
-                "pending_assignments": state.get("pending_assignments") or [],
-                "blocked_reasons": state.get("blocked_reasons") or [],
-                "last_decision": state.get("last_decision") or "",
-                "last_blocked_reason": state.get("last_blocked_reason") or "",
-                "flavor_summary": state.get("flavor_summary") or {},
-                "quota_state": state.get("quota_state") or {},
-                "stampede_state": state,
-            }
-        )
-
+        group_jobs = [job for job in active_jobs if job.get("nodegroup_id") == ng["id"]]
+        stampede_ngs.append({
+            "id": ng["id"], "name": ng["name"], "role": ng.get("role", "agent"),
+            "flavor_id": ng.get("flavor_id"), "stampede_enabled": ng["stampede_enabled"],
+            "min_size": ng["min_size"], "max_size": ng["max_size"], "node_count": ng["node_count"],
+            "desired_count": ng["node_count"], "tracked_count": len(ng.get("vms") or []),
+            "ready_count": state.get("ready_count"), "observed_at": state.get("observed_at"),
+            "in_flight": int(state.get("in_flight_count", 0) or 0),
+            "last_operation_id": state.get("last_operation_id"), "last_job_id": state.get("last_job_id"),
+            "active_operation_ids": [job["operation_id"] for job in group_jobs if job.get("operation_id")],
+            "capacity": state.get("capacity") or {}, "pending_assignments": state.get("pending_assignments") or [],
+            "blocked_reasons": state.get("blocked_reasons") or [], "last_decision": state.get("last_decision") or "",
+            "last_blocked_reason": state.get("last_blocked_reason") or "",
+            "flavor_summary": state.get("flavor_summary") or {}, "quota_state": state.get("quota_state") or {},
+            "stampede_state": state,
+        })
+    settings = get_settings()
     return {
-        "cluster_id": cluster_id,
-        "stampede_enabled": bool(cluster.get("stampede_enabled", False)),
-        "global_stampede_enabled": get_settings().drover_stampede_enabled,
+        "cluster_id": cluster_id, "stampede_enabled": bool(cluster.get("stampede_enabled", False)),
+        "global_stampede_enabled": settings.drover_stampede_enabled,
+        "policy": {"interval": settings.drover_stampede_interval,
+                   "scale_down_window": settings.drover_stampede_scale_down_window,
+                   "scale_up_cooldown": settings.drover_stampede_scale_up_cooldown,
+                   "scale_down_cooldown": settings.drover_stampede_scale_down_cooldown,
+                   "scale_down_threshold": settings.drover_stampede_scale_down_threshold,
+                   "resource_headroom_factor": settings.drover_stampede_resource_headroom_factor},
+        "active_operation_ids": [job["operation_id"] for job in active_jobs if job.get("operation_id")],
         "nodegroups": stampede_ngs,
     }
 
 
-@router.get("/{cluster_id}/stampede/events")
+@router.get("/{cluster_id}/stampede/events", response_model=list[dict])
 async def get_stampede_events(
-    cluster_id: str,
-    limit: int = Query(default=50, ge=1, le=200),
-    conn: openstack.connection.Connection = Depends(get_os_conn),
-    token_info: dict = Depends(get_token_info),
+    cluster_id: str, limit: int = Query(default=50, ge=1, le=200),
+    conn=Depends(get_os_conn), token_info: dict = Depends(get_token_info),
 ):
-    """Stampede 스케일 이벤트 이력 조회 (최신순)."""
-    project_id = conn._afterglow_project_id
-    cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
-    if not cluster:
-        raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
-
+    """Best-effort Redis history (newest first), not a durable operation journal."""
     from drover.services.activity import list_stampede_events
 
-    return await list_stampede_events(cluster_id, limit)
+    await _stampede_cluster_access(conn._afterglow_project_id, cluster_id, token_info)
+    try:
+        return await list_stampede_events(cluster_id, limit)
+    except Exception:
+        return []

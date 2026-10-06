@@ -36,7 +36,14 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - Active GPU quota 소유권의 Afterglow 단독 이관에 따른 Drover legacy `gpu_quotas` 테이블의 소스 은퇴(Source Table Retirement) 절차
    - 마이그레이션 데이터 감사(Audit), Afterglow 권한 롤아웃 검증 및 물리적 `DROP TABLE` 전제 조건 체크리스트
 
-5. **[Drover 0.2.23 릴리스 노트](release-0.2.23.md)**
+5. **[Drover 0.4.0 릴리스 노트](release-0.4.0.md)**
+   - Pod 요청/Node allocatable 계산, GPU 준비성, 원자적 예약/fencing, 300–600초 안정화 및 drain 축소
+   - Afterglow 상태/이벤트 API, 부분 삭제 재시도와 실제 배포 검증 범위
+
+6. **[Drover 0.3.0 및 0.3.1 준비 기록](release-0.3.0.md)**
+   - 구조화 요청/job 로그, opt-in `LOG_LEVEL=DEBUG`, Redis 5 종료 API 수정과 당시 검증 기록
+
+7. **[Drover 0.2.23 릴리스 노트](release-0.2.23.md)**
    - v0.2.21 이후 패키지 통합, 인증서 회전 및 CI 개선, FastAPI/Starlette 보안 갱신
    - root wheel·Kolla 이미지 태그와 미실행 빌드·배포 검증 경계
 ---

@@ -182,6 +182,30 @@ if __name__ == "__main__":
   - `GET /v1/operations/{operation_id}`: 작업의 최종 status (`QUEUED`, `RUNNING`, `WAITING_CALLBACK`, `SUCCEEDED`, `FAILED`, `CANCELLED`) 확인
   - `GET /v1/operations/{operation_id}/events?since_sequence=N`: 해당 작업의 시퀀스별 상세 진행 로그 복구 수집
 
+
+### 5.4 Stampede 오토스케일링 상태 및 이벤트 연동 사양 (Autoscaling UI Integration)
+Afterglow 대시보드 및 BFF에서 테넌트 클러스터의 오토스케일링 설정, 마지막으로 관측한 용량, 스케줄링 결정 및 변경 이력을 표시하기 위한 연동 사양입니다. 상태 GET은 Kubernetes를 새로 조회하지 않으므로 `observed_at`으로 stale 관측을 구분해야 합니다.
+
+1. **오토스케일링 모드 전환**:
+   - `POST /v1/clusters/{cluster_id}/stampede/enable`: 클러스터 활성화 (클러스터 `ACTIVE` 상태 및 Stampede 활성 agent 노드그룹 필요).
+   - `POST /v1/clusters/{cluster_id}/stampede/disable`: 클러스터 비활성화 (이미 큐에 진입한 내구성 작업은 완료까지 유지).
+
+2. **종합 상태 및 노드그룹 메트릭 조회 (`GET /v1/clusters/{cluster_id}/stampede`)**:
+   - `policy`: 클러스터에 적용된 주기(`interval`), 유휴 안정화 윈도우(`scale_down_window`, 300–600초), 쿨다운(`scale_up_cooldown`, `scale_down_cooldown`), 저사용량 임계값(`scale_down_threshold`), 헤드룸 계수(`resource_headroom_factor`).
+   - `active_operation_ids`: 현재 노드그룹에서 실행 중인 비동기 오퍼레이션 ID 목록.
+   - `nodegroups`: 노드그룹별 정밀 상태 배열:
+     - `node_count`/`desired_count` (예약한 목표 수량), `tracked_count` (MariaDB에 추적 중인 VM 수; 현재 Nova 존재 여부의 실시간 보장이 아님), `ready_count` (마지막 관측에서 K3s Ready인 노드 수; 미관측 시 null), `in_flight` (현재 진행 중인 증설 수량). `ready_count`는 GPU 준비성을 뜻하지 않습니다. GPU는 `capacity.allocatable.gpu`와 `stampede_state.ready_nodes`/`failed_nodes`, 최종 operation 상태를 함께 확인합니다.
+     - `capacity`: allocatable / requested / free 리소스 요약 (CPU millicores, RAM bytes, NVIDIA GPU slots, Pod slots).
+     - `pending_assignments`: 노드그룹에 배정된 미스케줄 Pod 목록 및 필요 리소스.
+     - `blocked_reasons`: Pending Pod 분류 사유 (`pvc_unbound`, `not_resource_shortage`, `unsupported_pod_affinity`, `no_matching_nodegroup` 등). flavor·quota·cooldown 등 노드그룹 결정 차단은 `last_blocked_reason`으로 표시합니다.
+     - `last_decision`: 최근 스케줄러 동작 (`scale_up_queued`, `scale_up_complete`, `scale_down_queued`, `scale_down_complete`, `stabilizing`, `within_capacity`, `observation_failed` 등).
+     - `last_blocked_reason`: 최근 차단 상세 사유 (`gpu_not_allocatable`, `scale_down_cooldown`, `min_size_reached` 등).
+     - `quota_state.allowed`는 admission 단계의 결과입니다. Nova quota나 GPU 호스트의 현재 여유를 예약·보장하지 않으며, 이후 provisioning 실패는 operation 상태로 확인합니다.
+
+3. **이벤트 타임라인 (`GET /v1/clusters/{cluster_id}/stampede/events?limit=50`)**:
+   - Redis 기반 보조 Activity 피드로, 스케일링 시작(`started`), 완료(`success`), 실패(`failed`), 보류(`skipped`) 이벤트와 상세 메타데이터(노드명, flavor, Pod 수 등)를 역순(최신순)으로 제공합니다.
+   - Redis 장애 시 빈 목록을 반환할 수 있습니다. 이력의 정본은 `last_operation_id` 및 `active_operation_ids`로 조회하는 `/v1/operations/{operation_id}`와 `/events`입니다.
+
 ---
 
 ## 6. 헬스 체크, 디스커버리 및 요청 상관관계 (Correlation)

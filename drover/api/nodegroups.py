@@ -3,23 +3,49 @@
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from openstack.exceptions import ResourceNotFound
+from sqlalchemy.exc import InterfaceError, OperationalError
 
-from drover.auth import get_token_info
+from drover.auth import get_os_conn, get_token_info
+from drover.db import is_db_available
 from drover.models.schemas import CreateK3sNodegroupRequest, K3sNodegroupInfo, UpdateK3sNodegroupRequest
-from drover.services import jobs as _jobs
+from drover.policy import authorize
 from drover.services import nodegroup as _svc
+from drover.services import resource_policies
 from drover.services import store as k3s_db
 
 router = APIRouter()
 _logger = logging.getLogger(__name__)
 
 
-async def _assert_cluster_access(cluster_id: str, token_info: dict) -> None:
-    """클러스터가 현재 프로젝트에 속하는지 확인."""
+async def _assert_cluster_access(cluster_id: str, token_info: dict, *, mutation: bool = False) -> dict:
+    """Apply the cluster policy and project boundary before reading group state."""
     project_id = token_info.get("project_id") or ""
-    cluster = await k3s_db.get_cluster(project_id, cluster_id)
+    authorize("drover:clusters:scale" if mutation else "drover:clusters:get", {"project_id": project_id}, token_info)
+    if not is_db_available():
+        raise HTTPException(status_code=503, detail="MariaDB unavailable")
+    try:
+        cluster = await k3s_db.get_cluster(project_id, cluster_id)
+    except (RuntimeError, OperationalError, InterfaceError) as exc:
+        raise HTTPException(status_code=503, detail="MariaDB unavailable") from exc
     if cluster is None:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다.")
+    return cluster
+
+
+async def _validate_resources(conn, updates: dict) -> None:
+    for field, key in (("flavor_id", "k3s.default_agent_flavor"), ("image_id", "k3s.server_image")):
+        identifier = updates.get(field)
+        if identifier is None:
+            continue
+        try:
+            selection = await resource_policies.validate_existing_selection(conn, key, identifier)
+            if selection["id"] != identifier:
+                raise resource_policies.ResourcePolicyValidationError("Use the resource ID, not its name")
+        except (resource_policies.ResourcePolicyValidationError, ResourceNotFound) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid {field}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="OpenStack resource validation unavailable") from exc
 
 
 
@@ -28,14 +54,20 @@ async def _assert_cluster_access(cluster_id: str, token_info: dict) -> None:
 async def list_nodegroups(cluster_id: str, token_info: dict = Depends(get_token_info)):
     """클러스터의 노드그룹 목록 조회."""
     await _assert_cluster_access(cluster_id, token_info)
-    return await _svc.list_nodegroups(cluster_id)
+    try:
+        return await _svc.list_nodegroups(cluster_id)
+    except (RuntimeError, OperationalError, InterfaceError) as exc:
+        raise HTTPException(status_code=503, detail="MariaDB unavailable") from exc
 
 
 @router.get("/{cluster_id}/nodegroups/{nodegroup_id}", response_model=K3sNodegroupInfo)
 async def get_nodegroup(cluster_id: str, nodegroup_id: str, token_info: dict = Depends(get_token_info)):
     """노드그룹 단건 조회."""
     await _assert_cluster_access(cluster_id, token_info)
-    ng = await _svc.get_nodegroup(cluster_id, nodegroup_id)
+    try:
+        ng = await _svc.get_nodegroup(cluster_id, nodegroup_id)
+    except (RuntimeError, OperationalError, InterfaceError) as exc:
+        raise HTTPException(status_code=503, detail="MariaDB unavailable") from exc
     if not ng:
         raise HTTPException(status_code=404, detail="노드그룹을 찾을 수 없습니다.")
     return ng
@@ -46,29 +78,23 @@ async def create_nodegroup(
     cluster_id: str,
     req: CreateK3sNodegroupRequest,
     token_info: dict = Depends(get_token_info),
+    conn=Depends(get_os_conn),
 ):
-    """노드그룹 생성. agent 그룹은 node_count > 0이면 VM 프로비저닝을 시작한다."""
-    await _assert_cluster_access(cluster_id, token_info)
+    """Configure an agent group and enqueue its requested initial capacity."""
+    await _assert_cluster_access(cluster_id, token_info, mutation=True)
+    data = req.model_dump()
+    await _validate_resources(conn, data)
     try:
-        ng = await _svc.create_nodegroup(cluster_id, req.model_dump())
-        if ng["role"] == "agent" and ng.get("node_count", 0) > 0:
-            await _jobs.enqueue_job(
-                cluster_id=cluster_id,
-                project_id=token_info.get("project_id") or "",
-                kind="nodegroup_reconcile",
-                payload={
-                    "action": "provision",
-                    "nodegroup": ng,
-                    "add_count": int(ng.get("node_count", 0)),
-                },
-                user_id=token_info.get("user_id"),
-                username=token_info.get("username"),
-            )
-        return ng
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        return await _svc.create_nodegroup(
+            cluster_id, data, project_id=token_info.get("project_id") or "",
+            user_id=token_info.get("user_id"), username=token_info.get("username"),
+        )
+    except _svc.NodegroupConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (RuntimeError, OperationalError, InterfaceError) as exc:
+        raise HTTPException(status_code=503, detail="Nodegroup mutation storage unavailable") from exc
 
 
 @router.patch("/{cluster_id}/nodegroups/{nodegroup_id}", response_model=K3sNodegroupInfo)
@@ -77,72 +103,45 @@ async def update_nodegroup(
     nodegroup_id: str,
     req: UpdateK3sNodegroupRequest,
     token_info: dict = Depends(get_token_info),
+    conn=Depends(get_os_conn),
 ):
-    """노드그룹 수정. agent node_count 변경은 VM 프로비저닝/삭제를 시작한다."""
-    await _assert_cluster_access(cluster_id, token_info)
-    before = await _svc.get_nodegroup(cluster_id, nodegroup_id)
-    if not before:
-        raise HTTPException(status_code=404, detail="노드그룹을 찾을 수 없습니다.")
-    updates = {k: v for k, v in req.model_dump().items() if v is not None}
-    if before.get("role") == "server" and "node_count" in updates and updates["node_count"] != before.get("node_count"):
-        raise HTTPException(status_code=422, detail="server 노드그룹 node_count 변경은 아직 지원되지 않습니다.")
+    """Merge config against locked DB state, then enqueue manual sizing work."""
+    await _assert_cluster_access(cluster_id, token_info, mutation=True)
+    updates = {k: v for k, v in req.model_dump(exclude_unset=True).items() if v is not None}
     try:
-        ng = await _svc.update_nodegroup(cluster_id, nodegroup_id, updates)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    if not ng:
-        raise HTTPException(status_code=404, detail="노드그룹을 찾을 수 없습니다.")
-    if ng["role"] == "agent" and "node_count" in updates:
-        desired = int(ng.get("node_count", 0))
-        current = len(before.get("vms") or [])
-        project_id = token_info.get("project_id") or ""
-        if desired > current:
-            await _jobs.enqueue_job(
-                cluster_id=cluster_id,
-                project_id=project_id,
-                kind="nodegroup_reconcile",
-                payload={"action": "provision", "nodegroup": ng, "add_count": desired - current},
-                user_id=token_info.get("user_id"),
-                username=token_info.get("username"),
-            )
-        elif desired < current:
-            remove_entries = list(reversed(before.get("vms") or []))[: current - desired]
-            await _jobs.enqueue_job(
-                cluster_id=cluster_id,
-                project_id=project_id,
-                kind="nodegroup_reconcile",
-                payload={"action": "delete_vms", "nodegroup": ng, "remove_entries": remove_entries},
-                user_id=token_info.get("user_id"),
-                username=token_info.get("username"),
-            )
-    return ng
+        before = await _svc.get_nodegroup(cluster_id, nodegroup_id)
+        if not before:
+            raise HTTPException(status_code=404, detail="노드그룹을 찾을 수 없습니다.")
+        await _validate_resources(conn, updates)
+        ng = await _svc.update_nodegroup(
+            cluster_id, nodegroup_id, updates, project_id=token_info.get("project_id") or "",
+            user_id=token_info.get("user_id"), username=token_info.get("username"),
+        )
+        if not ng:
+            raise HTTPException(status_code=404, detail="노드그룹을 찾을 수 없습니다.")
+        return ng
+    except _svc.NodegroupConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (RuntimeError, OperationalError, InterfaceError) as exc:
+        raise HTTPException(status_code=503, detail="Nodegroup mutation storage unavailable") from exc
 
 
 @router.delete("/{cluster_id}/nodegroups/{nodegroup_id}", status_code=204)
-async def delete_nodegroup(
-    cluster_id: str,
-    nodegroup_id: str,
-    token_info: dict = Depends(get_token_info),
-):
-    """Delete a non-default nodegroup and its VMs through the durable worker."""
-    await _assert_cluster_access(cluster_id, token_info)
-    nodegroup = await _svc.get_nodegroup(cluster_id, nodegroup_id)
-    if not nodegroup:
-        raise HTTPException(status_code=404, detail="노드그룹을 찾을 수 없습니다.")
-    if nodegroup.get("is_default"):
-        raise HTTPException(
-            status_code=422,
-            detail="기본 노드그룹(default-server / default-agent)은 삭제할 수 없습니다.",
+async def delete_nodegroup(cluster_id: str, nodegroup_id: str, token_info: dict = Depends(get_token_info)):
+    """Delete a non-default group through the durable worker, not while scaling."""
+    await _assert_cluster_access(cluster_id, token_info, mutation=True)
+    try:
+        deleted = await _svc.enqueue_nodegroup_delete(
+            cluster_id, nodegroup_id, project_id=token_info.get("project_id") or "",
+            user_id=token_info.get("user_id"), username=token_info.get("username"),
         )
-    await _jobs.enqueue_job(
-        cluster_id=cluster_id,
-        project_id=token_info.get("project_id") or "",
-        kind="nodegroup_reconcile",
-        payload={
-            "action": "delete_group",
-            "nodegroup": nodegroup,
-            "remove_entries": nodegroup.get("vms") or [],
-        },
-        user_id=token_info.get("user_id"),
-        username=token_info.get("username"),
-    )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="노드그룹을 찾을 수 없습니다.")
+    except _svc.NodegroupConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (RuntimeError, OperationalError, InterfaceError) as exc:
+        raise HTTPException(status_code=503, detail="Nodegroup mutation storage unavailable") from exc

@@ -7,8 +7,10 @@ kubeconfig의 클라이언트 인증서를 사용해 K8s API 서버에 직접 �
 import base64
 import contextlib
 import logging
+import re
 import ssl
 import tempfile
+from decimal import ROUND_CEILING, Decimal, localcontext
 
 import httpx
 import yaml
@@ -955,356 +957,351 @@ async def scale_deployment(cluster_id: str, namespace: str, name: str, replicas:
 
 
 # ---------------------------------------------------------------------------
-# Stampede 오토스케일 전용 함수 (admin kubeconfig, K3sApiError 미사용)
+# Stampede 오토스케일 전용 함수 (admin kubeconfig, observation failures propagate)
 # ---------------------------------------------------------------------------
 
 
+_QUANTITY = re.compile(r"([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))([eE][+-]?[0-9]+|[numkKMGTPE]|[KMGTPE]i)?")
+_DECIMAL_SUFFIXES = {"n": -9, "u": -6, "m": -3, "k": 3, "K": 3, "M": 6, "G": 9, "T": 12, "P": 15, "E": 18}
+
+
+def _parse_quantity(value: str) -> Decimal:
+    """Parse Kubernetes quantities exactly; invalid/negative values fail closed."""
+    match = _QUANTITY.fullmatch(str(value).strip())
+    if match is None:
+        raise ValueError(f"Invalid Kubernetes quantity: {value!r}")
+    number, suffix = match.groups()
+    with localcontext() as ctx:
+        ctx.prec = max(64, len(number) + 32)
+        result = Decimal(number)
+        if suffix:
+            if suffix.endswith("i"):
+                result *= 1024 ** ("KMGTPE".index(suffix[0]) + 1)
+            elif suffix in _DECIMAL_SUFFIXES:
+                result *= Decimal(10) ** _DECIMAL_SUFFIXES[suffix]
+            else:
+                result *= Decimal(10) ** int(suffix[1:])
+        if result < 0 or not result.is_finite():
+            raise ValueError(f"Invalid Kubernetes quantity: {value!r}")
+        return result
+
+
+def _ceil_quantity(value: Decimal) -> int:
+    return int(value.to_integral_value(rounding=ROUND_CEILING))
+
+
 def _parse_cpu_millicores(s: str) -> int:
-    """K8s CPU 수량 문자열 → 밀리코어(int). 예: '500m'→500, '2'→2000."""
-    if not s:
-        return 0
-    s = s.strip()
-    if s.endswith("m"):
-        return int(s[:-1])
-    return int(float(s) * 1000)
+    return _ceil_quantity(_parse_quantity(s) * 1000)
 
 
 def _parse_memory_bytes(s: str) -> int:
-    """K8s 메모리 수량 문자열 → 바이트(int). 예: '512Mi'→536870912."""
-    if not s:
-        return 0
-    s = s.strip()
-    _suffixes = {
-        "Ki": 1024,
-        "Mi": 1024**2,
-        "Gi": 1024**3,
-        "Ti": 1024**4,
-        "K": 1000,
-        "M": 1000**2,
-        "G": 1000**3,
-        "T": 1000**4,
+    return _ceil_quantity(_parse_quantity(s))
+
+
+def _resource_dict(quantities: dict[str, Decimal], *, pods: int = 0) -> dict:
+    """Keep nonstandard keys separate: never equate MIG/RDMA with NVIDIA GPUs."""
+    return {
+        "cpu_m": _ceil_quantity(quantities.get("cpu", Decimal(0)) * 1000),
+        "memory_bytes": _ceil_quantity(quantities.get("memory", Decimal(0))),
+        "gpu": _ceil_quantity(quantities.get("nvidia.com/gpu", Decimal(0))),
+        "pods": pods,
+        "extended_resources": {
+            key: _ceil_quantity(value)
+            for key, value in quantities.items()
+            if key not in {"cpu", "memory", "nvidia.com/gpu", "pods"}
+        },
     }
-    for suffix, mul in _suffixes.items():
-        if s.endswith(suffix):
-            return int(float(s[: -len(suffix)]) * mul)
-    return int(s)
+
+
+def _container_requests(container: dict) -> dict[str, Decimal]:
+    resources = container.get("resources") or {}
+    # Kubernetes defaults a request to its limit only if that request is absent.
+    values = dict(resources.get("limits") or {})
+    values.update(resources.get("requests") or {})
+    return {key: _parse_quantity(value) for key, value in values.items()}
+
+
+def _add_requests(target: dict[str, Decimal], values: dict[str, Decimal]) -> None:
+    for key, value in values.items():
+        target[key] = target.get(key, Decimal(0)) + value
+
+
+def _max_requests(target: dict[str, Decimal], values: dict[str, Decimal]) -> None:
+    for key, value in values.items():
+        target[key] = max(target.get(key, Decimal(0)), value)
+
+
+def _effective_pod_requests(spec: dict) -> dict:
+    """Scheduler demand: max(apps + sidecars, each init + preceding sidecars) + overhead."""
+    with localcontext() as ctx:
+        ctx.prec = 64
+        apps: dict[str, Decimal] = {}
+        sidecars: dict[str, Decimal] = {}
+        init_peak: dict[str, Decimal] = {}
+        for container in spec.get("containers") or []:
+            _add_requests(apps, _container_requests(container))
+        for container in spec.get("initContainers") or []:
+            requests = _container_requests(container)
+            if container.get("restartPolicy") == "Always":
+                _add_requests(sidecars, requests)
+                stage = sidecars
+            else:
+                stage = dict(sidecars)
+                _add_requests(stage, requests)
+            _max_requests(init_peak, stage)
+        _add_requests(apps, sidecars)
+        _max_requests(apps, init_peak)
+        # Pod-level requests cannot make the observation smaller than container demand.
+        _max_requests(apps, _container_requests(spec))
+        _add_requests(apps, {key: _parse_quantity(value) for key, value in (spec.get("overhead") or {}).items()})
+        return _resource_dict(apps, pods=1)
+
+
+def _stampede_pod_metadata(item: dict) -> dict:
+    meta = item.get("metadata") or {}
+    spec = item.get("spec") or {}
+    annotations = meta.get("annotations") or {}
+    owners = meta.get("ownerReferences") or []
+    volumes = spec.get("volumes") or []
+    is_daemonset = any(owner.get("kind") == "DaemonSet" for owner in owners)
+    is_mirror = "kubernetes.io/config.mirror" in annotations
+    has_controller = any(owner.get("controller") is True for owner in owners)
+    has_local_storage = any("emptyDir" in volume or "hostPath" in volume for volume in volumes)
+    protected = (
+        str(annotations.get("cluster-autoscaler.kubernetes.io/safe-to-evict", "")).lower() == "false"
+        or str(annotations.get("cluster-autoscaler.kubernetes.io/scale-down-disabled", "")).lower() == "true"
+        or spec.get("priorityClassName") in {"system-cluster-critical", "system-node-critical"}
+        or spec.get("priority", 0) >= 2000000000
+        or meta.get("namespace", "default") == "kube-system"
+    )
+    return {
+        "name": meta["name"],
+        "namespace": meta.get("namespace", "default"),
+        "uid": meta.get("uid", ""),
+        "node_name": spec.get("nodeName") or "",
+        "node_selector": spec.get("nodeSelector") or {},
+        "tolerations": spec.get("tolerations") or [],
+        "affinity": spec.get("affinity") or {},
+        "topology_spread_constraints": spec.get("topologySpreadConstraints") or [],
+        "host_ports": [
+            {"host_ip": port.get("hostIP", ""), "port": port["hostPort"], "protocol": port.get("protocol", "TCP")}
+            for container in (spec.get("containers") or []) + (spec.get("initContainers") or [])
+            for port in container.get("ports") or []
+            if port.get("hostPort", 0) > 0
+        ],
+        "scheduler_name": spec.get("schedulerName") or "default-scheduler",
+        "is_daemonset": is_daemonset,
+        "is_mirror": is_mirror,
+        "has_controller": has_controller,
+        "safe_to_evict": has_controller and not (is_daemonset or is_mirror or protected or has_local_storage),
+        "has_local_storage": has_local_storage,
+        "has_pvc": any("persistentVolumeClaim" in volume for volume in volumes),
+        "deleting": bool(meta.get("deletionTimestamp")),
+    }
+
+
+async def _stampede_list_items(client, server_url: str, resource: str, *, params: dict | None = None, deadline: float | None = None) -> list[dict]:
+    """A failed, malformed or incomplete list is never an empty-cluster observation."""
+    import time
+
+    query = dict(params or {})
+    items = []
+    seen_tokens = set()
+    while True:
+        request_args = {"headers": {"Accept": "application/json"}}
+        if query:
+            request_args["params"] = query
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Kubernetes observation deadline expired")
+            request_args["timeout"] = min(15.0, remaining)
+        resp = await client.get(f"{server_url}/api/v1/{resource}", **request_args)
+        if resp.status_code != 200:
+            _raise_k8s_error(resp, f"Stampede list {resource}")
+        body = resp.json()
+        page = body["items"]
+        if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
+            raise ValueError("Malformed Kubernetes list")
+        items.extend(page)
+        token = (body.get("metadata") or {}).get("continue")
+        if not token:
+            return items
+        if token in seen_tokens:
+            raise ValueError("Repeated Kubernetes continuation token")
+        seen_tokens.add(token)
+        query["continue"] = token
 
 
 async def list_unschedulable_pods(cluster_id: str) -> list[dict]:
-    """전체 네임스페이스에서 Unschedulable Pending pod 목록 반환 (admin kubeconfig).
-
-    반환 구조:
-      {name, namespace, node_selector, resource_requests{cpu_m, memory_bytes, gpu},
-       tolerations, affinity, message}
-    """
-    try:
-        kubeconfig_yaml = await k3s_db.get_kubeconfig_admin(cluster_id)
-        if not kubeconfig_yaml:
-            return []
-        cert_pem, key_pem, server_url = _parse_kubeconfig(kubeconfig_yaml)
-        ssl_ctx = _make_ssl_context(cert_pem, key_pem)
-        async with httpx.AsyncClient(verify=ssl_ctx, timeout=15.0) as client:
-            resp = await client.get(
-                f"{server_url}/api/v1/pods",
-                params={"fieldSelector": "status.phase=Pending"},
-                headers={"Accept": "application/json"},
-            )
-            if resp.status_code != 200:
-                _logger.warning("list_unschedulable_pods HTTP %d: %s", resp.status_code, resp.text[:200])
-                return []
-            items = resp.json().get("items", [])
-    except Exception as e:
-        _logger.warning("list_unschedulable_pods 오류 (cluster=%s): %s", cluster_id, e)
-        return []
-
+    """Unschedulable Pending demand, using the same requests as assigned usage."""
+    async with _kube_client(cluster_id) as (client, server_url):
+        items = await _stampede_list_items(client, server_url, "pods", params={"fieldSelector": "status.phase=Pending"})
     result = []
     for item in items:
-        meta = item.get("metadata", {})
-        spec = item.get("spec", {})
-        status = item.get("status", {})
-
-        # PodScheduled=False, reason=Unschedulable 조건 확인
-        conditions = status.get("conditions", [])
-        unschedulable = False
-        msg = ""
-        for cond in conditions:
-            if cond.get("type") == "PodScheduled" and cond.get("status") == "False":
-                if cond.get("reason") == "Unschedulable":
-                    unschedulable = True
-                    msg = cond.get("message", "")
-                break
-        if not unschedulable:
+        status = item.get("status") or {}
+        if status.get("phase") != "Pending":
             continue
-
-        # resource requests 집계 (모든 컨테이너 합산)
-        cpu_m = 0
-        memory_bytes = 0
-        gpu = 0
-        for container in spec.get("containers", []) + spec.get("initContainers", []):
-            req = container.get("resources", {}).get("requests", {})
-            cpu_m += _parse_cpu_millicores(req.get("cpu", "0"))
-            memory_bytes += _parse_memory_bytes(req.get("memory", "0"))
-            gpu += int(req.get("nvidia.com/gpu", 0))
-
-        result.append(
-            {
-                "name": meta.get("name", ""),
-                "namespace": meta.get("namespace", "default"),
-                "node_selector": spec.get("nodeSelector") or {},
-                "resource_requests": {"cpu_m": cpu_m, "memory_bytes": memory_bytes, "gpu": gpu},
-                "tolerations": spec.get("tolerations") or [],
-                "affinity": spec.get("affinity") or {},
-                "message": msg,
-                "node_name": spec.get("nodeName") or "",
-            }
-        )
+        for condition in status.get("conditions") or []:
+            if condition.get("type") == "PodScheduled" and condition.get("status") == "False" and condition.get("reason") == "Unschedulable":
+                result.append({
+                    **_stampede_pod_metadata(item),
+                    "resource_requests": _effective_pod_requests(item.get("spec") or {}),
+                    "message": condition.get("message", ""),
+                })
+                break
     return result
 
 
 async def get_node_capacity(cluster_id: str) -> list[dict]:
-    """전체 노드의 capacity/allocatable/Ready 상태 반환 (admin kubeconfig).
-
-    반환 구조:
-      {name, allocatable{cpu_m, memory_bytes, gpu}, labels, taints, ready}
-    """
-    try:
-        kubeconfig_yaml = await k3s_db.get_kubeconfig_admin(cluster_id)
-        if not kubeconfig_yaml:
-            return []
-        cert_pem, key_pem, server_url = _parse_kubeconfig(kubeconfig_yaml)
-        ssl_ctx = _make_ssl_context(cert_pem, key_pem)
-        async with httpx.AsyncClient(verify=ssl_ctx, timeout=15.0) as client:
-            resp = await client.get(
-                f"{server_url}/api/v1/nodes",
-                headers={"Accept": "application/json"},
-            )
-            if resp.status_code != 200:
-                _logger.warning("get_node_capacity HTTP %d", resp.status_code)
-                return []
-            items = resp.json().get("items", [])
-    except Exception as e:
-        _logger.warning("get_node_capacity 오류 (cluster=%s): %s", cluster_id, e)
-        return []
-
+    """Node allocatable capacity and scheduling metadata; failures propagate."""
+    async with _kube_client(cluster_id) as (client, server_url):
+        items = await _stampede_list_items(client, server_url, "nodes")
     result = []
     for item in items:
-        meta = item.get("metadata", {})
-        status = item.get("status", {})
-        spec = item.get("spec", {})
-        allocatable = status.get("allocatable", {})
-
-        ready = False
-        for cond in status.get("conditions", []):
-            if cond.get("type") == "Ready" and cond.get("status") == "True":
-                ready = True
-                break
-
-        result.append(
-            {
-                "name": meta.get("name", ""),
-                "allocatable": {
-                    "cpu_m": _parse_cpu_millicores(allocatable.get("cpu", "0")),
-                    "memory_bytes": _parse_memory_bytes(allocatable.get("memory", "0")),
-                    "gpu": int(allocatable.get("nvidia.com/gpu", 0)),
-                },
-                "labels": meta.get("labels") or {},
-                "taints": spec.get("taints") or [],
-                "ready": ready,
-            }
-        )
+        meta = item.get("metadata") or {}
+        status = item.get("status") or {}
+        spec = item.get("spec") or {}
+        quantities = {key: _parse_quantity(value) for key, value in (status.get("allocatable") or {}).items()}
+        result.append({
+            "name": meta["name"],
+            "allocatable": _resource_dict(quantities, pods=_ceil_quantity(quantities.get("pods", Decimal(0)))),
+            "labels": meta.get("labels") or {},
+            "taints": spec.get("taints") or [],
+            "ready": any(cond.get("type") == "Ready" and cond.get("status") == "True" for cond in status.get("conditions") or []),
+            "unschedulable": bool(spec.get("unschedulable")),
+            "removal_vm_id": (meta.get("annotations") or {}).get(REMOVAL_VM_ANNOTATION),
+        })
     return result
 
 
 async def get_pod_resource_usage(cluster_id: str) -> list[dict]:
-    """전체 Running pod의 resource requests 반환 (admin kubeconfig).
-
-    반환 구조:
-      {node, namespace, name, cpu_m, memory_bytes, gpu, is_daemonset, is_mirror}
-    """
-    try:
-        kubeconfig_yaml = await k3s_db.get_kubeconfig_admin(cluster_id)
-        if not kubeconfig_yaml:
-            return []
-        cert_pem, key_pem, server_url = _parse_kubeconfig(kubeconfig_yaml)
-        ssl_ctx = _make_ssl_context(cert_pem, key_pem)
-        async with httpx.AsyncClient(verify=ssl_ctx, timeout=15.0) as client:
-            resp = await client.get(
-                f"{server_url}/api/v1/pods",
-                params={"fieldSelector": "status.phase=Running"},
-                headers={"Accept": "application/json"},
-            )
-            if resp.status_code != 200:
-                return []
-            items = resp.json().get("items", [])
-    except Exception as e:
-        _logger.warning("get_pod_resource_usage 오류 (cluster=%s): %s", cluster_id, e)
-        return []
-
+    """All assigned live pods consume capacity, including Pending and terminating."""
+    async with _kube_client(cluster_id) as (client, server_url):
+        items = await _stampede_list_items(client, server_url, "pods")
     result = []
     for item in items:
-        meta = item.get("metadata", {})
-        spec = item.get("spec", {})
-        node_name = spec.get("nodeName", "")
-        if not node_name:
+        spec = item.get("spec") or {}
+        if not spec.get("nodeName") or (item.get("status") or {}).get("phase") in {"Succeeded", "Failed"}:
             continue
-        cpu_m = 0
-        memory_bytes = 0
-        gpu = 0
-        for container in spec.get("containers", []) + spec.get("initContainers", []):
-            req = container.get("resources", {}).get("requests", {})
-            cpu_m += _parse_cpu_millicores(req.get("cpu", "0"))
-            memory_bytes += _parse_memory_bytes(req.get("memory", "0"))
-            gpu += int(req.get("nvidia.com/gpu", 0))
-        owners = meta.get("ownerReferences") or []
-        is_daemonset = any(owner.get("kind") == "DaemonSet" for owner in owners if isinstance(owner, dict))
-        is_mirror = "kubernetes.io/config.mirror" in (meta.get("annotations") or {})
-        result.append(
-            {
-                "node": node_name,
-                "namespace": meta.get("namespace", "default"),
-                "name": meta.get("name", ""),
-                "cpu_m": cpu_m,
-                "memory_bytes": memory_bytes,
-                "gpu": gpu,
-                "is_daemonset": is_daemonset,
-                "is_mirror": is_mirror,
-            }
-        )
+        requests = _effective_pod_requests(spec)
+        result.append({
+            **_stampede_pod_metadata(item),
+            "node": spec["nodeName"],
+            **requests,
+            "resource_requests": requests,
+        })
     return result
 
 
-async def cordon_node(cluster_id: str, node_name: str) -> bool:
-    """노드를 cordon(스케줄 불가)으로 설정한다 (admin kubeconfig).
+REMOVAL_VM_ANNOTATION = "drover.io/removing-vm-id"
 
-    Returns: True=성공, False=실패
-    """
+
+async def _set_node_unschedulable(cluster_id: str, node_name: str, unschedulable: bool, removal_vm_id: str | None) -> bool:
     try:
-        kubeconfig_yaml = await k3s_db.get_kubeconfig_admin(cluster_id)
-        if not kubeconfig_yaml:
-            return False
-        cert_pem, key_pem, server_url = _parse_kubeconfig(kubeconfig_yaml)
-        ssl_ctx = _make_ssl_context(cert_pem, key_pem)
-        patch_body = {"spec": {"unschedulable": True}}
-        async with httpx.AsyncClient(verify=ssl_ctx, timeout=10.0) as client:
+        async with _kube_client(cluster_id) as (client, server_url):
             resp = await client.patch(
                 f"{server_url}/api/v1/nodes/{node_name}",
-                json=patch_body,
+                # Merge-patch null removes the annotation together with the cordon.
+                json={"metadata": {"annotations": {REMOVAL_VM_ANNOTATION: removal_vm_id}}, "spec": {"unschedulable": unschedulable}},
                 headers={
                     "Content-Type": "application/merge-patch+json",
                     "Accept": "application/json",
                 },
             )
             if resp.status_code in (200, 201):
-                _logger.info("stampede: node %s cordoned", node_name)
                 return True
-            _logger.warning("stampede: cordon %s 실패 HTTP %d: %s", node_name, resp.status_code, resp.text[:200])
+            _logger.warning("stampede: node scheduling patch failed HTTP %d", resp.status_code)
             return False
-    except Exception as e:
-        _logger.warning("stampede: cordon %s 오류: %s", node_name, e)
+    except Exception:
+        _logger.warning("stampede: node scheduling patch failed")
         return False
 
 
-async def drain_node(cluster_id: str, node_name: str, *, timeout: float = 120.0) -> bool:
-    """노드를 drain한다 (DaemonSet/mirror pod 제외, PDB 존중, admin kubeconfig).
+async def cordon_node(cluster_id: str, node_name: str, *, removal_vm_id: str) -> bool:
+    """Prevent scheduling for one VM removal; False means callers must not proceed."""
+    return await _set_node_unschedulable(cluster_id, node_name, True, removal_vm_id)
 
-    Returns: True=drain 완료, False=timeout 또는 오류 (호출자가 강제 삭제 진행)
+
+async def uncordon_node(cluster_id: str, node_name: str) -> bool:
+    """Restore scheduling after an aborted drain, returning False on failure."""
+    return await _set_node_unschedulable(cluster_id, node_name, False, None)
+
+
+async def drain_node(cluster_id: str, node_name: str, *, timeout: float = 120.0) -> bool:
+    """Evict managed, unprotected pods respecting PDBs, then wait until absent.
+
+    DaemonSet/mirror and terminal pods are ignored. Any other unsafe pod blocks
+    the entire drain before eviction. False is never permission to force-delete.
     """
     import asyncio
     import time
 
+    deadline = time.monotonic() + timeout
+    accepted: set[tuple[str, str, str]] = set()
+    attempts: dict[tuple[str, str, str], int] = {}
     try:
-        kubeconfig_yaml = await k3s_db.get_kubeconfig_admin(cluster_id)
-        if not kubeconfig_yaml:
-            return False
-        cert_pem, key_pem, server_url = _parse_kubeconfig(kubeconfig_yaml)
-        ssl_ctx = _make_ssl_context(cert_pem, key_pem)
-    except Exception as e:
-        _logger.warning("stampede: drain %s kubeconfig 오류: %s", node_name, e)
-        return False
-
-    async with httpx.AsyncClient(verify=ssl_ctx, timeout=15.0) as client:
-        # 노드의 모든 pod 조회
-        try:
-            resp = await client.get(
-                f"{server_url}/api/v1/pods",
-                params={"fieldSelector": f"spec.nodeName={node_name}"},
-                headers={"Accept": "application/json"},
-            )
-            if resp.status_code != 200:
-                _logger.warning("stampede: drain %s pod 조회 실패 HTTP %d", node_name, resp.status_code)
-                return False
-            items = resp.json().get("items", [])
-        except Exception as e:
-            _logger.warning("stampede: drain %s pod 조회 오류: %s", node_name, e)
-            return False
-
-        # 제외 대상 필터링: DaemonSet pod / mirror pod / 이미 종료된 pod
-        evict_pods = []
-        for item in items:
-            meta = item.get("metadata", {})
-            annotations = meta.get("annotations") or {}
-            owner_refs = meta.get("ownerReferences") or []
-            phase = item.get("status", {}).get("phase", "")
-
-            # 이미 종료된 pod 제외
-            if phase in ("Succeeded", "Failed"):
-                continue
-            # mirror pod 제외 (static pod)
-            if "kubernetes.io/config.mirror" in annotations:
-                continue
-            # DaemonSet pod 제외
-            is_daemonset = any(ref.get("kind") == "DaemonSet" for ref in owner_refs)
-            if is_daemonset:
-                continue
-
-            evict_pods.append(
-                {
-                    "name": meta.get("name", ""),
-                    "namespace": meta.get("namespace", "default"),
-                }
-            )
-
-        if not evict_pods:
-            _logger.info("stampede: drain %s — evict 대상 없음 (빈 노드)", node_name)
-            return True
-
-        _logger.info("stampede: drain %s — %d개 pod eviction 시작", node_name, len(evict_pods))
-        deadline = time.monotonic() + timeout
-
-        for pod in evict_pods:
-            if time.monotonic() >= deadline:
-                _logger.warning("stampede: drain %s — timeout 초과", node_name)
-                return False
-            ns = pod["namespace"]
-            name = pod["name"]
-            eviction_body = {
-                "apiVersion": "policy/v1",
-                "kind": "Eviction",
-                "metadata": {"name": name, "namespace": ns},
-            }
-            retry = 0
-            while time.monotonic() < deadline:
-                try:
-                    r = await client.post(
-                        f"{server_url}/api/v1/namespaces/{ns}/pods/{name}/eviction",
-                        json=eviction_body,
-                        headers={"Accept": "application/json"},
-                    )
-                    if r.status_code in (200, 201, 404):
-                        # 성공 또는 이미 없음
-                        break
-                    if r.status_code == 429:
-                        # PDB 위반 — 백오프 재시도
-                        wait = min(5 * (2**retry), 30)
-                        _logger.info("stampede: drain %s/%s PDB 위반, %ds 후 재시도", ns, name, wait)
-                        await asyncio.sleep(wait)
-                        retry += 1
+        async with asyncio.timeout(timeout), _kube_client(cluster_id) as (client, server_url):
+            while True:
+                items = await _stampede_list_items(
+                    client, server_url, "pods",
+                    params={"fieldSelector": f"spec.nodeName={node_name}"},
+                    deadline=deadline,
+                )
+                live = []
+                for item in items:
+                    if (item.get("status") or {}).get("phase") in {"Succeeded", "Failed"}:
                         continue
-                    _logger.warning("stampede: evict %s/%s HTTP %d: %s", ns, name, r.status_code, r.text[:100])
-                    break
-                except Exception as e:
-                    _logger.warning("stampede: evict %s/%s 오류: %s", ns, name, e)
-                    break
+                    pod = _stampede_pod_metadata(item)
+                    if pod["is_daemonset"] or pod["is_mirror"]:
+                        continue
+                    if not pod["safe_to_evict"]:
+                        _logger.info("stampede: drain blocked by protected/unmanaged pod")
+                        return False
+                    live.append(pod)
+                if not live:
+                    return True
 
-        _logger.info("stampede: drain %s 완료", node_name)
-        return True
+                wait_seconds = 2.0
+                for pod in live:
+                    identity = (pod["namespace"], pod["name"], pod["uid"])
+                    # An accepted eviction and a deletionTimestamp still consume
+                    # the node until a subsequent authoritative list says gone.
+                    if pod["deleting"] or identity in accepted:
+                        continue
+                    count = attempts.get(identity, 0)
+                    if count >= 5:
+                        return False
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    body = {
+                        "apiVersion": "policy/v1",
+                        "kind": "Eviction",
+                        "metadata": {"name": pod["name"], "namespace": pod["namespace"]},
+                    }
+                    if pod["uid"]:
+                        body["deleteOptions"] = {"preconditions": {"uid": pod["uid"]}}
+                    resp = await client.post(
+                        f"{server_url}/api/v1/namespaces/{pod['namespace']}/pods/{pod['name']}/eviction",
+                        json=body,
+                        headers={"Accept": "application/json"},
+                        timeout=min(15.0, remaining),
+                    )
+                    attempts[identity] = count + 1
+                    if resp.status_code in (200, 201, 202, 404):
+                        accepted.add(identity)
+                    elif resp.status_code == 429:
+                        if count + 1 >= 5:
+                            return False
+                        wait_seconds = max(wait_seconds, min(5.0 * 2**count, 30.0))
+                    else:
+                        _logger.warning("stampede: eviction failed HTTP %d", resp.status_code)
+                        return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                await asyncio.sleep(min(wait_seconds, remaining))
+    except Exception:
+        _logger.warning("stampede: drain failed or timed out")
+        return False

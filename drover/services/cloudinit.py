@@ -597,6 +597,7 @@ def _build_agent_ignition(
     ssh_public_key: str,
     extra_agent_args: list[str],
     primary_network_id: str,
+    gpu_bootstrap: str = "",
 ) -> str:
     """FCOS k3s 에이전트 노드 Ignition JSON 생성."""
     template_vars = dict(
@@ -605,6 +606,7 @@ def _build_agent_ignition(
         server_ip=server_ip,
         node_token=node_token,
         extra_agent_args=extra_agent_args,
+        gpu_bootstrap=gpu_bootstrap,
     )
     join_sh = _jinja.get_template("k3s_agent_fcos_join.sh.j2").render(**template_vars)
 
@@ -771,6 +773,7 @@ def generate_agent_userdata(
     primary_network_id: str,
     extra_agent_args: list[str] | None = None,
     os_type: str = OS_TYPE_UBUNTU,
+    gpu_required: bool = False,
     # 하위호환 파라미터 (deprecated)
     occm_enabled: bool = False,
 ) -> UserdataResult:
@@ -787,6 +790,12 @@ def generate_agent_userdata(
     agent_args = list(extra_agent_args or [])
     if occm_enabled and "--kubelet-arg=cloud-provider=external" not in agent_args:
         agent_args.append("--kubelet-arg=cloud-provider=external")
+    gpu_bootstrap = ""
+    if gpu_required:
+        from drover.services import gpu
+
+        agent_args = gpu.agent_args(agent_args)
+        gpu_bootstrap = gpu.bootstrap_script(os_type)
 
     if os_type == OS_TYPE_FCOS:
         ign_str = _build_agent_ignition(
@@ -797,6 +806,7 @@ def generate_agent_userdata(
             node_token=node_token,
             ssh_public_key=ssh_public_key or "",
             extra_agent_args=agent_args,
+            gpu_bootstrap=gpu_bootstrap,
         )
         json.loads(ign_str)
         verify_no_service_password(ign_str)
@@ -812,6 +822,7 @@ def generate_agent_userdata(
         node_token=node_token,
         ssh_public_key=ssh_public_key or "",
         extra_agent_args=agent_args,
+        gpu_bootstrap=gpu_bootstrap,
         pod_route_files=_k3s_pod_route_files("k3s-agent.service", OS_TYPE_UBUNTU),
     )
     yaml_str = _jinja.get_template("k3s_agent.yaml.j2").render(**template_vars)

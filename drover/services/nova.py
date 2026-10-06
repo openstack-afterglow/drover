@@ -7,11 +7,32 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import openstack
+    from openstack.compute.v2.server import Server
 
 from drover.models.openstack import FlavorInfo, InstanceInfo, IpAddress
 from drover.services.image_refs import image_reference_fields
 
 _logger = logging.getLogger(__name__)
+
+
+def is_server_deleting(server: Server) -> bool:
+    """Nova has already accepted deletion; Kubernetes readiness no longer gates cleanup."""
+    return server.task_state == "deleting" or server.status in ("DELETING", "SOFT_DELETED", "DELETED")
+
+
+def observe_server(conn: openstack.connection.Connection, server_id: str) -> Server | None:
+    """ID-only lookup where only Nova 404 means absent.
+
+    ``find_server`` is unsafe here: the SDK swallows 403/400 on GET and falls back to a
+    name-filtered list, so a denied UUID lookup could look like an absent server.
+    """
+    from openstack import exceptions
+
+    try:
+        return conn.compute.get_server(server_id)
+    except exceptions.NotFoundException:
+        return None
+
 
 
 def list_flavors(conn: openstack.connection.Connection) -> list[FlavorInfo]:
@@ -66,7 +87,10 @@ def create_server(
     delete_boot_volume_on_termination: bool = False,
     security_groups: list[str] | None = None,
     config_drive: bool = False,
-) -> InstanceInfo:
+    *,
+    wait: bool = True,
+) -> InstanceInfo | Server:
+    """Create a server; nonwaiting calls return the sparse accepted SDK resource."""
     body = {
         "name": name,
         "flavorRef": flavor_id,
@@ -99,6 +123,8 @@ def create_server(
         body["security_groups"] = [{"name": sg} for sg in security_groups]
 
     s = conn.compute.create_server(**body)
+    if not wait:
+        return s
     s = conn.compute.wait_for_server(s, status="ACTIVE", wait=600)
     return _server_to_info(s)
 
@@ -367,7 +393,7 @@ def wait_server_deleted(conn: openstack.connection.Connection, server_id: str, t
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        srv = conn.compute.find_server(server_id, ignore_missing=True)
+        srv = observe_server(conn, server_id)
         if srv is None:
             return
         time.sleep(3)
@@ -382,7 +408,7 @@ def delete_server_safe(
     """프로젝트 및 Drover 소유권 검증 후 서버 VM을 안전하게 삭제."""
     from drover.services.inventory import validate_resource_ownership
 
-    srv = conn.compute.find_server(server_id, ignore_missing=True)
+    srv = observe_server(conn, server_id)
     if srv is None:
         return
     if not validate_resource_ownership(srv, expected_project_id, expected_cluster_id, "server"):

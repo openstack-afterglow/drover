@@ -9,11 +9,12 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import exists, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from drover.db import get_session_factory
 from drover.logging import safe_metadata
-from drover.models.orm import DroverJob, DroverOperation, K3sCluster
+from drover.models.orm import DroverJob, DroverOperation, K3sCluster, K3sNodegroup, K3sNodegroupVM
 from drover.services import operations
 
 _logger = logging.getLogger("drover.jobs")
@@ -63,15 +64,14 @@ async def enqueue_job(
     idempotency_key: str | None = None,
     request_hash: str | None = None,
     op_kind: str | None = None,
+    *,
+    session: AsyncSession | None = None,
 ) -> str:
-    """Persist a job and link or create its operation in a single transaction."""
+    """Persist a job/operation, optionally inside the caller's state transaction."""
     if kind not in _SUPPORTED_KINDS:
         raise ValueError(f"unsupported Drover job kind: {kind}")
-    factory = get_session_factory()
-    if factory is None:
-        raise RuntimeError("Database unavailable for durable job enqueue")
 
-    async with factory() as session, session.begin():
+    async def persist() -> str:
         target_op_id = operation_id
         if not target_op_id:
             mapped_op_kind = op_kind or JOB_TO_OP_KIND.get(kind, "create")
@@ -90,7 +90,6 @@ async def enqueue_job(
                     status="QUEUED",
                 )
                 target_op_id = new_op.id
-
         job = DroverJob(
             id=str(uuid.uuid4()),
             cluster_id=cluster_id,
@@ -113,7 +112,119 @@ async def enqueue_job(
                 message=f"Job {kind} enqueued",
                 payload_json={"job_id": job.id, "kind": kind, "request_id": request_id},
             )
-    return job.id
+        return job.id
+
+    if session is not None:
+        return await persist()
+    factory = get_session_factory()
+    if factory is None:
+        raise RuntimeError("Database unavailable for durable job enqueue")
+    async with factory() as session, session.begin():
+        return await persist()
+
+
+async def enqueue_stampede_job(
+    cluster_id: str,
+    project_id: str,
+    nodegroup_id: str,
+    *,
+    direction: str,
+    requested_count: int,
+    payload: dict,
+    expected_node_count: int,
+) -> dict | None:
+    """Fence a sizing decision and persist count, reservation, operation and job together."""
+    if direction not in {"up", "down"} or requested_count <= 0:
+        raise ValueError("invalid Stampede sizing decision")
+    factory = get_session_factory()
+    if factory is None:
+        raise RuntimeError("Database unavailable for Stampede reservation")
+    async with factory() as session, session.begin():
+        cluster = await session.get(K3sCluster, cluster_id, with_for_update=True)
+        if (
+            cluster is None
+            or cluster.project_id != project_id
+            or cluster.deleted_at is not None
+            or cluster.status != "ACTIVE"
+            or not cluster.stampede_enabled
+        ):
+            return None
+        ng = await session.get(K3sNodegroup, nodegroup_id, with_for_update=True)
+        if (
+            ng is None
+            or ng.cluster_id != cluster_id
+            or ng.deleted_at is not None
+            or ng.role != "agent"
+            or not ng.stampede_enabled
+            or not ng.flavor_id
+            or ng.node_count != expected_node_count
+        ):
+            return None
+        busy = await session.scalar(
+            select(DroverJob.id).where(
+                DroverJob.cluster_id == cluster_id,
+                DroverJob.status.in_(["queued", "running"]),
+                DroverJob.kind != "reconcile",
+            ).limit(1)
+        )
+        if busy:
+            return None
+        state = dict(ng.stampede_state or {})
+        if state.get("in_flight_count", 0):
+            return None
+        now = _now()
+        job_payload = dict(payload)
+        if direction == "up":
+            count = min(requested_count, max(0, ng.max_size - ng.node_count))
+            if count <= 0:
+                return None
+            ng.node_count += count
+            kind = "stampede_provision"
+            job_payload.update(
+                nodegroup_id=nodegroup_id,
+                add_count=count,
+                flavor_id=ng.flavor_id,
+                image_id=ng.image_id,
+                labels=ng.labels,
+                taints=ng.taints,
+            )
+            state.update(in_flight_count=count, in_flight_since=now.timestamp(), last_scale_up=now.timestamp())
+        else:
+            entries = job_payload.get("remove_entries") or []
+            if len(entries) != 1 or requested_count != 1 or ng.node_count <= ng.min_size:
+                return None
+            vm = await session.scalar(
+                select(K3sNodegroupVM).where(
+                    K3sNodegroupVM.nodegroup_id == nodegroup_id,
+                    K3sNodegroupVM.vm_id == entries[0].get("vm_id"),
+                    K3sNodegroupVM.name == entries[0].get("name"),
+                )
+            )
+            if vm is None:
+                return None
+            count = 1
+            ng.node_count -= count
+            kind = "nodegroup_reconcile"
+            job_payload.update(action="delete_vms", nodegroup={"id": nodegroup_id})
+            state.update(last_scale_down=now.timestamp(), deleting_nodes=[vm.name])
+        op = await operations.create_or_get_operation(
+            session, project_id=project_id, cluster_id=cluster_id, kind="nodegroup_reconcile"
+        )
+        job_payload["stampede"] = True
+        job_id = await enqueue_job(
+            cluster_id, project_id, kind, job_payload,
+            user_id="stampede-system", username="Stampede", operation_id=op.id, session=session,
+        )
+        state.update(
+            idle_since={},
+            last_decision=f"scale_{direction}_queued",
+            last_blocked_reason="",
+            last_job_id=job_id,
+            last_operation_id=op.id,
+        )
+        ng.stampede_state = state
+        ng.updated_at = now
+        return {"job_id": job_id, "operation_id": op.id, "count": count}
 
 
 async def _execute_job_direct(
@@ -162,6 +273,11 @@ async def _execute_job_direct(
         nodegroup = payload.get("nodegroup") or {}
         action = payload.get("action")
         op_id = operation_id or payload.pop("_operation_id", None)
+        if payload.get("stampede") and action == "delete_vms":
+            from drover.services.stampede import _delete_and_track
+
+            await _delete_and_track(project_id, cluster_id, payload, op_id)
+            return
         metric = payload.get("triggering_metric", "manual")
         if action == "provision":
             await autoscale.provision_nodegroup_and_reconcile(
@@ -205,6 +321,7 @@ async def _execute_job_direct(
             labels=payload.get("labels"),
             taints=payload.get("taints"),
             gpu_required=bool(payload.get("gpu_required")),
+            gpu_count=int(payload.get("gpu_count", 0)),
             provisioning_key_prefix=payload.get("provisioning_key_prefix"),
             **kwargs,
         )
@@ -226,7 +343,41 @@ async def _execute_job_direct(
         raise ValueError(f"unsupported Drover job kind: {kind}")
 
 
+async def _settle_stampede_job(session: AsyncSession, job: DroverJob, error: str = "") -> None:
+    payload = job.payload_json or {}
+    if job.kind not in {"stampede_provision", "nodegroup_reconcile"}:
+        return
+    ng_id = payload.get("nodegroup_id") or (payload.get("nodegroup") or {}).get("id")
+    if not ng_id:
+        return
+    ng = await session.get(K3sNodegroup, ng_id, with_for_update=True)
+    if ng is None or ng.cluster_id != job.cluster_id:
+        return
+    state = dict(ng.stampede_state or {})
+    if state.get("last_job_id") != job.id:
+        return
+    vms = (await session.scalars(select(K3sNodegroupVM).where(K3sNodegroupVM.nodegroup_id == ng_id))).all()
+    ng.node_count = len(vms)
+    direction = "up" if job.kind == "stampede_provision" or payload.get("action") == "provision" else "down"
+    state.update(
+        in_flight_count=0, in_flight_since=0, deleting_nodes=[], idle_since={},
+        last_decision=f"scale_{direction}_{'failed' if error else 'complete'}",
+        last_blocked_reason=error or "",
+        tracked_count=len(vms),
+    )
+    state[f"last_scale_{direction}"] = _now().timestamp()
+    if error:
+        for vm in vms:
+            if vm.status == "CREATING":
+                vm.status = "ERROR"
+    ng.stampede_state = state
+    ng.updated_at = _now()
+
+
 async def _mark_cluster_failed(session, job: DroverJob, error: str) -> None:
+    if job.kind in {"stampede_provision", "nodegroup_reconcile"}:
+        await _settle_stampede_job(session, job, error)
+        return
     cluster = await session.get(K3sCluster, job.cluster_id, with_for_update=True)
     if cluster is not None and cluster.project_id == job.project_id and cluster.deleted_at is None:
         cluster.status = "ERROR"
@@ -363,6 +514,7 @@ async def _complete(job_id: str, *, attempt: int) -> bool:
         job.claimed_at = None
         job.last_error = None
         job.updated_at = _now()
+        await _settle_stampede_job(session, job)
 
         op_id = getattr(job, "operation_id", None)
         if op_id:
@@ -550,6 +702,20 @@ async def claim_and_run_jobs() -> int:
     while processed < _BATCH_SIZE and await process_one_job():
         processed += 1
     return processed
+
+
+async def list_active_mutation_jobs(cluster_id: str) -> list[dict]:
+    factory = get_session_factory()
+    if factory is None:
+        raise RuntimeError("Database unavailable for active job query")
+    async with factory() as session:
+        jobs = (await session.scalars(select(DroverJob).where(
+            DroverJob.cluster_id == cluster_id,
+            DroverJob.status.in_(["queued", "running"]), DroverJob.kind != "reconcile",
+        ))).all()
+        return [{"id": job.id, "kind": job.kind, "status": job.status,
+                 "operation_id": job.operation_id,
+                 "nodegroup_id": (job.payload_json or {}).get("nodegroup_id") or ((job.payload_json or {}).get("nodegroup") or {}).get("id")} for job in jobs]
 
 
 async def get_job(job_id: str) -> dict | None:

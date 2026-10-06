@@ -163,21 +163,101 @@ LOG_LEVEL=DEBUG drover-worker
 - **응답 (204 No Content)**
 
 ### `POST /v1/clusters/{cluster_id}/stampede/enable`
-- **설명**: Stampede 동적 오토스케일링 활성화.
-- **응답 (200 OK)**: `{"message": "Stampede가 활성화되었습니다", ...}`
+- **설명**: 클러스터의 Stampede 오토스케일링 모드를 활성화합니다.
+- **선행 조건**: 클러스터 상태가 `ACTIVE`여야 하며, `stampede_enabled=true`인 agent 노드그룹(유효한 flavor_id 및 min_size <= node_count <= max_size)이 최소 1개 이상 존재해야 합니다.
+- **응답 (200 OK - `StampedeMutationResponse`)**:
+  ```json
+  {
+    "message": "Stampede 모드가 활성화되었습니다",
+    "cluster_id": "cluster-uuid",
+    "stampede_enabled": true
+  }
+  ```
+- **오류 응답**:
+  - `400 Bad Request`: 서버 전역 `drover_stampede_enabled` 비활성화 상태
+  - `404 Not Found`: 클러스터 없음 또는 프로젝트 불일치
+  - `409 Conflict`: 클러스터가 `ACTIVE` 상태가 아님
+  - `422 Unprocessable Entity`: 활성화 가능한 agent 노드그룹 없음 또는 sizing 불변식 위반
+  - `503 Service Unavailable`: MariaDB 정본 접근 불가
 
 ### `POST /v1/clusters/{cluster_id}/stampede/disable`
-- **설명**: Stampede 동적 오토스케일링 비활성화.
-- **응답 (200 OK)**: `{"message": "Stampede가 비활성화되었습니다", ...}`
+- **설명**: 클러스터의 Stampede 오토스케일링 모드를 비활성화합니다. 이미 큐에 등록된 내구성 작업은 완료까지 유지됩니다.
+- **응답 (200 OK - `StampedeMutationResponse`)**:
+  ```json
+  {
+    "message": "Stampede 모드가 비활성화되었습니다",
+    "cluster_id": "cluster-uuid",
+    "stampede_enabled": false
+  }
+  ```
 
-### `GET /v1/clusters/{cluster_id}/stampede`
-- **설명**: Stampede 오토스케일링 상태 조회.
-- **응답 (200 OK)**: Stampede 상태 객체
+### `GET /v1/clusters/{cluster_id}/stampede` 및 `GET /v1/clusters/{cluster_id}/stampede/status`
+- **설명**: MariaDB에 저장한 마지막 Kubernetes 관측과 내구성 작업 상태를 조회합니다. GET 자체는 Kubernetes/Nova를 새로 조회하지 않습니다. `observed_at`을 확인하고, 미관측 `ready_count=null`을 0 또는 GPU-ready로 해석하지 않습니다.
+- **응답 (200 OK - `StampedeStatusResponse`)**:
+  ```json
+  {
+    "cluster_id": "cluster-uuid",
+    "stampede_enabled": true,
+    "global_stampede_enabled": true,
+    "policy": {
+      "interval": 60,
+      "scale_down_window": 600,
+      "scale_up_cooldown": 120,
+      "scale_down_cooldown": 300,
+      "scale_down_threshold": 0.5,
+      "resource_headroom_factor": 0.3
+    },
+    "active_operation_ids": [],
+    "nodegroups": [
+      {
+        "id": "ng-uuid",
+        "name": "gpu-workers",
+        "role": "agent",
+        "flavor_id": "gpu-flavor-uuid",
+        "stampede_enabled": true,
+        "min_size": 1,
+        "max_size": 5,
+        "node_count": 2,
+        "desired_count": 2,
+        "tracked_count": 2,
+        "ready_count": 2,
+        "in_flight": 0,
+        "observed_at": 1728244800.0,
+        "last_operation_id": "op-uuid-1",
+        "last_job_id": "job-uuid-1",
+        "active_operation_ids": [],
+        "capacity": {
+          "allocatable": {"cpu_m": 4000, "memory_bytes": 16777216000, "gpu": 2, "pods": 220},
+          "requested": {"cpu_m": 1200, "memory_bytes": 4194304000, "gpu": 1, "pods": 12},
+          "free": {"cpu_m": 2800, "memory_bytes": 12582912000, "gpu": 1, "pods": 208},
+          "nodes": []
+        },
+        "pending_assignments": [],
+        "blocked_reasons": [],
+        "last_decision": "within_capacity",
+        "last_blocked_reason": "",
+        "flavor_summary": {
+          "id": "gpu-flavor-uuid",
+          "name": "m1.gpu",
+          "vcpus_m": 4000,
+          "ram_bytes": 16777216000,
+          "gpu": 1,
+          "estimated_allocatable": {"cpu_m": 2800, "memory_bytes": 11744051200, "gpu": 1, "pods": 110}
+        },
+        "quota_state": {"allowed": true},
+        "stampede_state": {}
+      }
+    ]
+  }
+  ```
+- `ready_count`는 K3s Ready 수이고 GPU-ready 수가 아닙니다. `capacity.allocatable.gpu`, `stampede_state.ready_nodes`/`failed_nodes` 및 최종 operation 상태를 함께 확인합니다. `tracked_count`는 DB 추적 row 수입니다.
+- `quota_state.allowed`는 admission 결과일 뿐, 현재 Nova quota/GPU 호스트 여유를 보장하지 않습니다. `blocked_reasons`는 Pending Pod 분류이고 flavor/cooldown/min-max 등 결정 차단은 `last_blocked_reason`에 기록합니다.
 
 ### `GET /v1/clusters/{cluster_id}/stampede/events`
-- **설명**: Stampede 스케일링 이벤트 이력 조회.
+- **설명**: Redis 기반 Stampede 스케일링 이벤트 최신 이력을 역순(최신순)으로 조회합니다 (내구성 저널이 아닌 보조적 Activity 피드).
 - **쿼리 파라미터**: `limit` (int, 1~200, 기본값: 50)
-- **응답 (200 OK)**: Stampede 이벤트 목록
+- **응답 (200 OK)**: `list[dict]` (타임스탬프, action `scale_up`/`scale_down`/`blocked`, status `success`/`failed`/`started`/`skipped`, 메타데이터)
+- Redis 장애 시 빈 목록이 반환될 수 있습니다. 내구성 진행/오류의 정본은 `last_operation_id` 또는 `active_operation_ids`로 조회하는 `/v1/operations/{operation_id}` 및 `/events`입니다.
 
 ---
 

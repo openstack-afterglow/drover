@@ -6,7 +6,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: `drover==0.3.1`, `drover-sdk==0.2.21` (별도 SDK 버전)
+- 패키지: `drover==0.4.0`, `drover-sdk==0.2.21` (별도 SDK 버전)
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -19,12 +19,12 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 | 내구성 cluster create와 operation ID | implemented | source-reviewed, test-defined | 외부 operation ID/idempotency 계약은 create API에만 있다 | `drover/api/clusters.py:create_k3s_cluster_async`, `drover/services/jobs.py:enqueue_job`, `tests/test_durable_create.py` |
 | lease worker와 retry/attempt fence | implemented | source-reviewed, test-defined | 최대 3회 시도 후 실패하며 원격 API의 모든 작업을 되돌린다고 보장하지 않는다 | `drover/services/jobs.py:_claim_one`, `process_one_job`, `tests/test_jobs.py` |
 | cloud-init callback 및 HA/agent handoff | implemented | source-reviewed, test-defined | callback 만료/실패는 cluster를 `ERROR`로 만들며 callback token은 Redis 일회성이다 | `drover/api/callback.py:k3s_callback`, `drover/services/provisioner.py`, `tests/test_k3s_callback.py` |
-| nodegroup·Stampede autoscale | implemented | source-reviewed, test-defined | `min_size`/`max_size`와 cooldown 범위 안에서만 동작하며 외부 GPU admission에 의존한다 | `drover/services/autoscale.py`, `drover/services/stampede.py`, `tests/test_k3s_stampede.py` |
+| nodegroup·Stampede autoscale | implemented | source-reviewed, test-defined | min_size/max_size, 300–600초 안정화 윈도우, Pod requests/Node allocatable 정밀 계산, GPU allocatable 확인, 안전 drain/relocation 경계 안에서 동작한다 | `drover/services/autoscale.py`, `drover/services/stampede.py`, `drover/services/gpu.py`, `drover/services/kube.py`, `tests/test_k3s_stampede.py` |
 | OpenStack drift reconciliation | implemented | source-reviewed, test-defined | orphan은 보고만 하고 자동 삭제하지 않는다 | `drover/services/reconciliation.py:reconcile_cluster`, `tests/test_reconciliation.py` |
 | Afterglow provisioning intent/GPU admission 연동 | partial | source-reviewed, test-defined | 일반 create는 Drover가 직접 Nova/Cinder 등을 호출하고 intent/admission은 특정 Stampede 경로다 | `drover/services/afterglow.py`, `drover/services/stampede.py`, `tests/test_afterglow_admission.py`, `tests/test_afterglow_provisioning.py` |
 | legacy `gpu_quotas` 제거 | partial | source-reviewed, test-defined | 역사적 `001_baseline.sql` 테이블은 아직 물리 삭제하지 않았고 조건부 runbook만 있다 | `drover/migrations/001_baseline.sql`, `drover/migrations/README.md`, `docs/gpu-quota-table-retirement-runbook.md` |
 
-위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-09-26 로컬 FastAPI `0.141.1`/Starlette `1.6.0` 기준 `uv run pytest tests`는 655건 통과·3건 skip이었고(architecture guard 13건 포함), 2026-09-24 `uv --directory sdk run pytest`는 111건 통과했다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 검증하지 않았다.
+위 표의 `test-defined`는 테스트가 계약을 정의한다는 뜻이다. 2026-10-06 로컬 `v0.3.1` 기준 통합 후 `uv run --frozen pytest tests`는 843건 통과·3건 skip이었고, `uv --directory sdk run --frozen pytest`는 111건 통과했다. skip된 live integration과 실제 OpenStack 배포·외부 서비스 호출은 이 수치에 포함되지 않는다.
 
 ## System context
 
@@ -95,7 +95,12 @@ HA joiner(server 2·3)는 `cloud.conf`를 다시 렌더링하지 않는다(`boot
 
 ### Nodegroups, Stampede, reconciliation
 
-`drover/services/autoscale.py`는 desired nodegroup count를 durable `nodegroup_reconcile` job으로 맞추고, `stampede.py`는 K3s pod pending/resource pressure를 읽어 `min_size`·`max_size`, selector/taint, cooldown을 적용한다. GPU flavor가 필요한 경우 현재 GPU quota/admission authority인 Afterglow의 내부 admission을 조회하고, 특정 Stampede provisioning만 durable Afterglow intent를 claim/submit한다. Worker의 reconcile loop는 active cluster를 프로젝트별 concurrency로 enqueue하고 `reconcile_cluster`는 recorded resource ID를 다시 조회해 missing/mismatch/orphan을 DB에 기록한다.
+`drover/services/autoscale.py`는 desired nodegroup count를 durable `nodegroup_reconcile` job으로 맞추고, `drover/services/stampede.py`는 Kubernetes Pod requests(CPU millicores, memory bytes, NVIDIA GPU slots, extended resources)와 노드 allocatable 용량을 정밀 계산해 명시적 flavor 기반으로 워커 증설을 결정한다.
+
+- **증설 조건 및 GPU 준비성**: PVC 바인딩 지연, 고정 노드 지정, unsupported pod affinity/topology spread/host port 등 비용량적 pending은 증설하지 않는다. 사용자 nodegroup의 명시적 flavor와 label/taint, min/max만 사용한다. 모든 GPU 이미지에는 호환 NVIDIA 커널 드라이버가 필요하며 Ubuntu는 toolkit을 설치하고 FCOS는 toolkit/runtime도 사전 포함해야 한다(`drover/services/gpu.py`). Stampede 증설 job은 K3s Ready 및 해당 GPU 수만큼의 `nvidia.com/gpu` allocatable을 관측해야 성공한다. `drover_afterglow_admission_url` 설정 시 admission 장애는 fail-closed이며, 미설정 시 Nova의 native quota enforcement 아래 직접 증설한다. provisioning URL 설정 시 intent 실패를 local create로 우회하지 않는다.
+- **원자적 예약 및 Fencing**: 수동 nodegroup 변경 및 Stampede sizing 결정은 MariaDB transaction 내 row lock(`with_for_update`)과 job enqueue를 원자적으로 수행한다. `in_flight_count`와 active mutation job으로 중복 증설을 차단하고 `_settle_stampede_job`은 정리 완료한 DB tracking rows 기준으로 count/state를 동기화한다. 부분 정리 실패 row는 삭제하지 않고 재시도를 위해 보존한다.
+- **안전한 축소 및 Drain**: 300–600초 연속 저사용량 뒤 한 번에 worker 하나를 선정한다. 삭제 직전 모든 tracked VM을 Nova ID 조회(`nova.py:observe_server`, `compute.get_server`)로 다시 관측해 absent/deleting VM을 min-size headroom에서 제외하고, live pending/Ready와 controller, PVC/local storage, selector/taint, 잔여 용량을 검사한다. 실제 404만 absent이며 403/400 등은 그대로 실패한다(SDK `find_server`는 GET 403/400 뒤 이름 검색으로 fallback하므로 사용하지 않는다). cordon은 같은 merge-patch로 Node annotation `drover.io/removing-vm-id=<vm_id>`를 남긴다. 실제 Eviction API로 PDB를 준수하며 Pod가 사라져야 drain이 성공한다. drain 실패와 DELETE 직전 최종 Nova 조회·소유권 재검증 실패는 이번 시도가 새로 얻은 cordon만 uncordon(annotation 제거)하며 실패 노드명도 오류에 남긴다. 시도 전에 이미 같은 VM annotation으로 cordon된 노드는 이전 DELETE 뒤일 수 있으므로 상속된 cordon으로 보고 되돌리지 않는다. 최종 재검증을 통과한 뒤에는 DELETE 거부·timeout/volume/Node/DB 정리 실패라도 uncordon하지 않는다. 재시도는 같은 VM annotation이 있는 자기 cordon만 `node_not_ready`에서 제외하고 나머지 guard를 다시 적용해 재개하며, 다른 cordon은 계속 차단한다. Nova-confirmed absent/deleting 재시도는 live relocation/Ready 검사를 생략하고 Nova disappearance, boot-volume, K8s Node, tracking row 정리를 재개한다. 삭제 후 count reconcile은 404 sibling을 live count에서 빼되 tracking row는 자체 정리를 위해 남긴다(`autoscale.py:delete_nodegroup_vms`, `reconcile_nodegroup_vms`, `stampede.py:_delete_and_track`, `kube.py:cordon_node`).
+- **관측 장애 대응**: 관측 실패 또는 이전 관측과 두 scan interval을 초과한 공백은 유휴 윈도우를 초기화한다. 상태 API는 MariaDB에 저장한 마지막 관측을 반환하며 `ready_count`는 K3s Ready 수일 뿐 GPU 준비성 보장이 아니다. Redis 이벤트는 best-effort이고 DB operation/event가 내구성 정본이다. worker의 별도 drift reconciliation은 기록한 외부 ID의 missing/mismatch/orphan을 확인한다.
 
 Keystone application credential inventory는 생성 주체인 project manager의 `current_user_id`와 기록된 credential ID로 `identity.get_application_credential(user, application_credential)`를 호출한다. SDK의 user-scoped 경로를 생략하지 않으며 실제 404만 missing으로 처리하고 인증·통신 오류는 그대로 실패한다(`reconciliation.py:_fetch_keystone_app_cred`, `tests/test_reconciliation.py`). schema·queue·외부 API 계약은 바뀌지 않는다.
 
@@ -144,9 +149,9 @@ FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 �
 - `drover-sdk`: `sdk/`의 독립 Python package이며 API/Worker process에 import되어야 하는 내부 module이 아니다.
 - `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
 - 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
-- Kolla role의 `drover_image_tag`은 `v0.3.1`다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 이미지의 실제 발행과 immutable digest 확인은 이 소스 기본값과 별도로 검증한다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
+- Kolla role의 `drover_image_tag`은 `v0.4.0`다(`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 이미지의 실제 발행과 immutable digest 확인은 이 소스 기본값과 별도로 검증한다. `drover_source_version`은 별도의 source-build pin으로 유지한다.
 
-릴리스 변경과 검증 경계는 [`docs/release-0.3.0.md`](docs/release-0.3.0.md)의 0.3.1 patch candidate section에 정리한다. 0.3.0 및 이전 [`0.2.25`](docs/release-0.2.25.md)의 검증 기록은 보존한다. root wheel/런타임/lock은 `0.3.1`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag 원문으로 발행한다. 두 이미지 모두 main ref는 명시적 `latest`를 만들고, version-tag ref도 `docker/metadata-action@v5`의 기본 `latest=auto` 및 `type=ref,event=tag`에 의해 `latest`를 만든다. 따라서 tag push도 `latest`를 이동하며 main-only 정책이 아니다. 이 문구 자체는 발행·배포 완료의 증거가 아니다.
+릴리스 변경과 검증 경계는 [`docs/release-0.4.0.md`](docs/release-0.4.0.md)에 정리한다. 0.3.1 patch와 0.3.0은 [`docs/release-0.3.0.md`](docs/release-0.3.0.md), 이전 [`0.2.25`](docs/release-0.2.25.md)의 검증 기록으로 보존한다. root wheel/런타임/lock은 `0.4.0`이고 SDK는 독립적으로 `0.2.21`이다. `.github/workflows/release.yml`은 `v*` tag와 `drover.__version__` 일치 및 생성 wheel 이름을 확인하며, `.github/workflows/docker-build.yml`은 테스트 결과를 기다린 뒤 API/Worker 이미지를 tag 원문으로 발행한다. 두 이미지 모두 main ref는 명시적 `latest`를 만들고, version-tag ref도 `docker/metadata-action@v5`의 기본 `latest=auto` 및 `type=ref,event=tag`에 의해 `latest`를 만든다. 따라서 tag push도 `latest`를 이동하며 main-only 정책이 아니다. 발행 workflow는 `platforms`를 지정하지 않으므로 GitHub `ubuntu-latest` runner의 단일 `linux/amd64` image를 만든다. 이 문구 자체는 발행·배포 완료의 증거가 아니다.
 
 `GET /v1/health`와 `/v1/health/live`는 process liveness만 의미한다. `/v1/health/ready`는 MariaDB, Redis ping, migration ledger, Keystone service credentials를 모두 확인하고 하나라도 unavailable이면 `503`을 반환한다. 로그는 각 process의 표준 logging과 correlation ID에 남고, operation event 및 reconciliation drift는 MariaDB API 조회로 확인한다. health 결과·Stampede event는 Redis cache이므로 장애 시 최신 값이 없을 수 있다.
 
@@ -221,9 +226,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "0b0bfd402de00927f1976ff7416824e37ac4e898905487be3e47970513b578b1",
-  "reviewed_at": "2026-10-05T08:48:54Z",
-  "summary": "0.3.1 patch: root pyproject/runtime/lock and Kolla API/worker image tag bumped, SDK0.2.21 and ordinary dependencies/source-build pin preserved. Fixed observed redis==5.0.0 shutdown AttributeError in API cache and cutover source/destination by using its async close API; real-class regressions fail before fix and cover pool disconnect/singleton reset. No topology, schema, migration or public API/data contract changes. Reviewed existing CI/wheel lifecycle and both-target metadata-action latest=auto tag policy; preserved historical 0.3.0 evidence."
+  "source_sha256": "f139391a8f094f522bb82b2eeb3cf794e188825b3d54d3f018b818015e49527f",
+  "reviewed_at": "2026-10-06T06:43:05Z",
+  "summary": "0.4.0: Stampede autoscaling on the v0.3.1 base (Redis 5 shutdown fix retained). Pod request/Node allocatable accounting, explicit-flavor CPU/GPU scale-up with NVIDIA allocatable verification (drover/services/gpu.py), MariaDB row-lock reservation/fencing, 300-600s stabilization and PDB-respecting drain scale-down, Afterglow status/events APIs. Deletion safety: ID-only Nova observation (nova.observe_server; only 404 is absent) for guards, ownership rechecks, disappearance wait, cluster delete and count reconcile; Node annotation drover.io/removing-vm-id makes retained post-DELETE cordons resumable while foreign cordons block; inherited cordons are never rolled back; absent siblings keep tracking rows. No schema/migration change; Kolla image tag v0.4.0; SDK 0.2.21 unchanged."
 }
 ```
 <!-- architecture-review:end -->
