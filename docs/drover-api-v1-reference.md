@@ -164,7 +164,7 @@ LOG_LEVEL=DEBUG drover-worker
 
 ### `POST /v1/clusters/{cluster_id}/stampede/enable`
 - **설명**: 클러스터의 Stampede 오토스케일링 모드를 활성화합니다.
-- **선행 조건**: 클러스터 상태가 `ACTIVE`여야 하며, `stampede_enabled=true`인 agent 노드그룹(유효한 flavor_id 및 min_size <= node_count <= max_size)이 최소 1개 이상 존재해야 합니다.
+- **선행 조건**: 클러스터 상태가 `ACTIVE`여야 하며, `stampede_enabled=true`인 agent 노드그룹(유효한 flavor_id 및 min_size <= node_count <= max_size)이 최소 1개 이상 존재해야 합니다. 노드그룹 `flavor_id`는 요청 프로젝트 scope의 Nova 조회로 검증하므로 프로젝트에 공유된 private flavor(예: GPU passthrough)도 허용되고, 보이지 않는 flavor는 `422`입니다. `image_id`는 `k3s.server_image` 정책(public/community image)을 따릅니다. 노드그룹 생성·수정(`POST`/`PATCH /v1/clusters/{id}/nodegroups`)도 같은 규칙을 적용합니다.
 - **응답 (200 OK - `StampedeMutationResponse`)**:
   ```json
   {

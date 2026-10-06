@@ -947,12 +947,11 @@ async def _set_stampede_enabled(project_id: str, cluster_id: str, enabled: bool,
                                                       True, group.min_size, group.max_size)
                     except ValueError as exc:
                         raise HTTPException(status_code=422, detail=str(exc)) from exc
-                    for identifier, key in ((group.flavor_id, "k3s.default_agent_flavor"),
-                                            (group.image_id, "k3s.server_image")):
+                    for field, identifier in (("flavor_id", group.flavor_id), ("image_id", group.image_id)):
                         if identifier is None:
                             continue
                         try:
-                            selected = await resource_policies.validate_existing_selection(conn, key, identifier)
+                            selected = await resource_policies.validate_nodegroup_resource(conn, field, identifier)
                             if selected["id"] != identifier:
                                 raise resource_policies.ResourcePolicyValidationError("Use a resource ID")
                         except (resource_policies.ResourcePolicyValidationError, ResourceNotFound) as exc:

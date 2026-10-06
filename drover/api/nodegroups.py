@@ -34,12 +34,12 @@ async def _assert_cluster_access(cluster_id: str, token_info: dict, *, mutation:
 
 
 async def _validate_resources(conn, updates: dict) -> None:
-    for field, key in (("flavor_id", "k3s.default_agent_flavor"), ("image_id", "k3s.server_image")):
+    for field in ("flavor_id", "image_id"):
         identifier = updates.get(field)
         if identifier is None:
             continue
         try:
-            selection = await resource_policies.validate_existing_selection(conn, key, identifier)
+            selection = await resource_policies.validate_nodegroup_resource(conn, field, identifier)
             if selection["id"] != identifier:
                 raise resource_policies.ResourcePolicyValidationError("Use the resource ID, not its name")
         except (resource_policies.ResourcePolicyValidationError, ResourceNotFound) as exc:

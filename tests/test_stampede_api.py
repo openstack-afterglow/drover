@@ -23,7 +23,7 @@ def _group(**updates):
 
 
 @pytest.fixture(autouse=True)
-def stampede_api_boundaries(monkeypatch):
+def stampede_api_boundaries(monkeypatch, mock_conn):
     monkeypatch.setattr("drover.db.is_db_available", lambda: True)
     monkeypatch.setattr("drover.api.clusters.get_settings", lambda: SimpleNamespace(
         drover_stampede_enabled=True, drover_stampede_interval=30,
@@ -36,6 +36,8 @@ def stampede_api_boundaries(monkeypatch):
         return {"id": identifier, "name": "resource"}
 
     monkeypatch.setattr("drover.api.clusters.resource_policies.validate_existing_selection", validate_id)
+    # Project-scoped Nova resolves flavors the project may use, including shared private ones.
+    mock_conn.compute.get_flavor.side_effect = lambda flavor_id: SimpleNamespace(id=flavor_id, name="flavor", is_public=False)
     monkeypatch.setattr("drover.api.clusters.k3s_cluster.get_cluster", AsyncMock(return_value={
         "id": CLUSTER_ID, "project_id": PROJECT_ID, "status": "ACTIVE", "stampede_enabled": True,
     }))
@@ -268,13 +270,12 @@ async def test_stampede_policy_denial_precedes_mutation(client):
 
 
 @pytest.mark.asyncio
-async def test_stampede_enable_rejects_unavailable_flavor(client, monkeypatch):
-    from drover.services.resource_policies import ResourcePolicyValidationError
+async def test_stampede_enable_rejects_unavailable_flavor(client, monkeypatch, mock_conn):
+    from openstack.exceptions import NotFoundException
 
     cluster = SimpleNamespace(status="ACTIVE", stampede_enabled=False)
     _database(monkeypatch, cluster, [_group()])
-    monkeypatch.setattr("drover.api.clusters.resource_policies.validate_existing_selection",
-                        AsyncMock(side_effect=ResourcePolicyValidationError("missing flavor")))
+    mock_conn.compute.get_flavor.side_effect = NotFoundException("flavor not visible to project")
     response = await client.post(f"/v1/clusters/{CLUSTER_ID}/stampede/enable")
     assert response.status_code == 422
     assert cluster.stampede_enabled is False

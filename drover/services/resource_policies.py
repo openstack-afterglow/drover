@@ -271,6 +271,26 @@ async def validate_existing_selection(conn, key: str, resource_id: str) -> dict[
     return await asyncio.to_thread(_validate_existing_sync, conn, get_spec(key), resource_id)
 
 
+def _validate_project_flavor_sync(conn, flavor_id: str) -> dict[str, Any]:
+    flavor = conn.compute.get_flavor(flavor_id)
+    if flavor is None:
+        raise ResourcePolicyValidationError("selected flavor is unavailable to this project")
+    return _option(flavor.id, flavor.name)
+
+
+async def validate_nodegroup_resource(conn, field: str, resource_id: str) -> dict[str, Any]:
+    """Validate a nodegroup's own flavor/image selection in the request's project scope.
+
+    Unlike the global ``k3s.default_agent_flavor`` policy, a nodegroup flavor may be a private
+    flavor shared with the project (GPU passthrough flavors usually are); Nova hides private
+    flavors from non-admin tokens of other projects and enforces access at boot. Images keep
+    the public server-image policy.
+    """
+    if field == "flavor_id":
+        return await asyncio.to_thread(_validate_project_flavor_sync, conn, resource_id)
+    return await validate_existing_selection(conn, "k3s.server_image", resource_id)
+
+
 async def validate_selection(conn, key: str, resource_id: str | None) -> dict[str, Any] | None:
     if resource_id is None or not resource_id.strip():
         return None

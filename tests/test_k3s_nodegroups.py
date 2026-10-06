@@ -1,8 +1,11 @@
 """k3s 노드그룹 API 단위 테스트."""
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from openstack.exceptions import NotFoundException
 
 _CLUSTER_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
@@ -69,13 +72,15 @@ def _cluster_access_ok():
 
 
 @pytest.fixture(autouse=True)
-def nodegroup_api_boundaries(monkeypatch):
+def nodegroup_api_boundaries(monkeypatch, mock_conn):
     monkeypatch.setattr("drover.api.nodegroups.is_db_available", lambda: True)
 
     async def validate_id(conn, key, identifier):
         return {"id": identifier, "name": "test resource"}
 
     monkeypatch.setattr("drover.api.nodegroups.resource_policies.validate_existing_selection", validate_id)
+    # Project-scoped Nova resolves flavors the project may use, including shared private ones.
+    mock_conn.compute.get_flavor.side_effect = lambda flavor_id: SimpleNamespace(id=flavor_id, name="flavor", is_public=False)
 
 
 
@@ -145,6 +150,29 @@ async def test_create_nodegroup_success(client):
     assert resp.json()["node_count"] == 3
     assert resp.json()["is_default"] is False
     assert create.await_args.kwargs["project_id"] == "test-project-123"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("visible", [True, False])
+async def test_nodegroup_flavor_uses_project_visibility_not_public_default_policy(client, monkeypatch, mock_conn, visible):
+    from drover.services import resource_policies
+
+    async def real_policy(conn, key, identifier):
+        return await asyncio.to_thread(resource_policies._validate_existing_sync, conn, resource_policies.get_spec(key), identifier)
+
+    # The public-only default-agent policy must not gate a group's own flavor.
+    monkeypatch.setattr(resource_policies, "validate_existing_selection", real_policy)
+    if not visible:
+        mock_conn.compute.get_flavor.side_effect = NotFoundException("flavor not shared with project")
+    create = AsyncMock(return_value=_NG_CUSTOM)
+    with _cluster_access_ok(), patch("drover.services.nodegroup.create_nodegroup", new=create):
+        resp = await client.post(
+            f"/v1/clusters/{_CLUSTER_ID}/nodegroups",
+            json={"name": "gpu-workers", "node_count": 0, "flavor_id": "private-gpu-flavor",
+                  "stampede_enabled": True, "min_size": 0, "max_size": 1},
+        )
+    assert resp.status_code == (201 if visible else 422)
+    assert create.await_count == (1 if visible else 0)
 
 
 @pytest.mark.asyncio

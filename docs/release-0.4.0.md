@@ -33,3 +33,11 @@ Local evidence on the integrated `v0.3.1` base with the final deletion correctio
 Before rollout, the DMSLab Kolla inventory resolved the `drover` group to `dms-controller1..3`, and the existing API on `dms-controller1` was healthy. Existing clusters and workloads are not test fixtures; their names do not establish ownership or safety. GPU flavor or image names do not prove driver or hardware readiness.
 
 The user authorized a Drover-only Kolla rollout and isolated CPU/GPU verification, and separately approved a `v0.4.0` version-tag publication that also moves `latest`. The image publisher sets no `platforms`, so registry manifests must be checked after publication. The wheel workflow still does not wait for the tag suite, and Trivy findings remain non-blocking (`exit-code: '0'`).
+
+## 0.4.1 patch
+
+Live DMSLab verification of `v0.4.0` found that a GPU nodegroup could not be created. Nodegroup `flavor_id` validation reused the global `k3s.default_agent_flavor` tenant policy, which only accepts public flavors. Every DMSLab GPU flavor is private and is shared per project (`afterglow:access_mode=gpu_quota`), so `POST /v1/clusters/{id}/nodegroups` returned `422 Invalid flavor_id` for a flavor the project could boot.
+
+`resource_policies.validate_nodegroup_resource` now validates a nodegroup's own flavor with a project-scoped Nova `get_flavor` lookup. Nova hides private flavors from non-admin tokens of other projects and enforces access at boot. Nodegroup create/update and `POST /stampede/enable` use it; `image_id` keeps the `k3s.server_image` policy. The global default-agent policy and cluster-create `agent_flavor_id` validation are unchanged. Root package/runtime/lock and the Kolla role image tag move to `0.4.1` / `v0.4.1`; no schema or migration change.
+
+Local evidence: `uv run --frozen pytest tests` 845 passed / 3 skipped; `uv run --frozen ruff check .` passed. `tests/test_k3s_nodegroups.py::test_nodegroup_flavor_uses_project_visibility_not_public_default_policy` accepts a shared private flavor and rejects an invisible one. The accept case failed when the previous public-only policy was restored in a throwaway mutation run.
