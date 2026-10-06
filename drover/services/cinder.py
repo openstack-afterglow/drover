@@ -70,6 +70,46 @@ def wait_volume_deleted(conn: openstack.connection.Connection, volume_id: str, t
     raise TimeoutError(f"볼륨 {volume_id} 삭제 대기 타임아웃 ({timeout}s)")
 
 
+def delete_detached_boot_volume(
+    conn: openstack.connection.Connection,
+    volume_id: str,
+    expected_project_id: str,
+    expected_cluster_id: str,
+    timeout: int = 120,
+) -> None:
+    """Remove a worker boot volume that outlived its already-deleted server.
+
+    Nova removes it when the server booted with delete-on-termination; Afterglow provisioning
+    intents boot without it. Only an owned, detached ``available`` volume is deleted. One that
+    stays attached or busy, or fails ownership, is preserved and the cleanup fails. Lookups are
+    ID-only: ``find_volume`` falls back to a name search after a denied GET.
+    """
+    import time
+
+    from openstack import exceptions
+
+    from drover.services.inventory import validate_resource_ownership
+
+    deadline = time.monotonic() + timeout
+    delete_requested = False
+    while True:
+        try:
+            vol = conn.block_storage.get_volume(volume_id)
+        except exceptions.NotFoundException:
+            return
+        status = str(getattr(vol, "status", "") or "").lower()
+        attachments = getattr(vol, "attachments", None) or []
+        if not delete_requested and status == "available" and not attachments:
+            if not validate_resource_ownership(vol, expected_project_id, expected_cluster_id, "volume"):
+                raise ValueError(f"Boot volume {volume_id} ownership validation failed")
+            conn.block_storage.delete_volume(volume_id, ignore_missing=True)
+            delete_requested = True
+            continue
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Boot volume {volume_id} still exists ({status}, {len(attachments)} attachments)")
+        time.sleep(3)
+
+
 def _wait_volume_detachable_or_deleted(
     conn: openstack.connection.Connection,
     volume_id: str,

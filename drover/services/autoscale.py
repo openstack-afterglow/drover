@@ -491,7 +491,8 @@ async def delete_nodegroup_vms(
             await inventory.mark_resource_deleted(service="nova", resource_type="server", resource_id=vm_id)
             for volume_id in boot_volumes[vm_id]:
                 phase = f"boot_volume_delete_unverified:{volume_id}"
-                await asyncio.to_thread(cinder.wait_volume_deleted, conn, volume_id)
+                # Only after Nova confirmed the server is gone; intent-provisioned workers keep it.
+                await asyncio.to_thread(cinder.delete_detached_boot_volume, conn, volume_id, project_id, cluster_id)
                 await inventory.mark_resource_deleted(service="cinder", resource_type="volume", resource_id=volume_id)
             phase = f"node_delete_failed:{node_name}"
             if node_name and not await k3s_kube.delete_k8s_node(cluster_id, node_name):

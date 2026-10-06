@@ -261,6 +261,7 @@ def stampede_deletion(monkeypatch):
     state = SimpleNamespace(
         group=group, servers={"a": server}, volumes={"boot": volume}, nodes={"a": _node("a")},
         pending=[], pods=[], deleted_resources=set(), transitions=[], volume_failure=False, node_failure=False,
+        delete_on_termination=True, volume_status="available", volume_attachments=[], volume_project="project",
     )
     connection = MagicMock()
 
@@ -274,16 +275,26 @@ def stampede_deletion(monkeypatch):
     def delete_server(vm_id, **_):
         state.transitions.append("nova_deleted")
         del state.servers[vm_id]
-        if not state.volume_failure:
-            state.volumes.pop("boot", None)  # Nova delete-on-termination.
+        if state.delete_on_termination and not state.volume_failure:
+            state.volumes.pop("boot", None)
 
-    def find_volume(volume_id, **_):
+    def get_volume(volume_id):
         if state.volume_failure:
             raise TimeoutError("Cinder deletion observation timed out")
-        return state.volumes.get(volume_id)
+        if volume_id not in state.volumes:
+            raise os_exceptions.NotFoundException(f"No Volume found for {volume_id}")
+        return SimpleNamespace(
+            id=volume_id, name="a-boot", status=state.volume_status, attachments=list(state.volume_attachments),
+            project_id=state.volume_project, metadata={},
+        )
+
+    def delete_volume(volume_id, **_):
+        state.transitions.append("volume_deleted")
+        state.volumes.pop(volume_id, None)
 
     connection.compute.delete_server.side_effect = delete_server
-    connection.block_storage.find_volume.side_effect = find_volume
+    connection.block_storage.get_volume.side_effect = get_volume
+    connection.block_storage.delete_volume.side_effect = delete_volume
     state.connection = connection
     monkeypatch.setattr(keystone, "get_project_manager_connection", AsyncMock(return_value=connection))
     state.close = AsyncMock()
@@ -661,6 +672,37 @@ async def test_stampede_permitted_delete_completes_with_absent_sibling(stampede_
     # The absent sibling keeps its row for its own cleanup and supplies no live capacity.
     assert state.group["vms"] == [live, absent]
     assert state.group["node_count"] == 1
+
+
+async def test_stampede_deletes_boot_volume_kept_after_server_deletion(stampede_deletion):
+    """Afterglow provisioning intents boot without delete-on-termination."""
+    state = stampede_deletion
+    state.delete_on_termination = False
+    await jobs._execute_job_direct("nodegroup_reconcile", state.payload, "cluster", "project")
+    assert not state.servers and not state.volumes
+    assert state.transitions.index("nova_deleted") < state.transitions.index("volume_deleted")
+    assert ("cinder", "volume", "boot") in state.deleted_resources
+    assert state.group["vms"] == [] and state.group["node_count"] == 0
+
+
+@pytest.mark.parametrize("volume_state", ["attached_elsewhere", "foreign_project"])
+async def test_stampede_preserves_boot_volume_it_cannot_safely_delete(stampede_deletion, monkeypatch, volume_state):
+    import functools
+
+    from drover.services import cinder
+
+    state = stampede_deletion
+    state.delete_on_termination = False
+    if volume_state == "attached_elsewhere":
+        state.volume_status, state.volume_attachments = "in-use", [{"server_id": "someone-else"}]
+    else:
+        state.volume_project = "another-project"
+    monkeypatch.setattr(cinder, "delete_detached_boot_volume", functools.partial(cinder.delete_detached_boot_volume, timeout=0))
+    with pytest.raises(autoscale.NodegroupDeletionError, match="boot_volume_delete_unverified:boot"):
+        await jobs._execute_job_direct("nodegroup_reconcile", state.payload, "cluster", "project")
+    assert "boot" in state.volumes and "volume_deleted" not in state.transitions
+    assert ("cinder", "volume", "boot") not in state.deleted_resources
+    assert state.group["vms"] == [{"vm_id": "a", "name": "a"}]
 
 
 async def test_gpu_worker_not_successful_until_devices_are_allocatable(monkeypatch):

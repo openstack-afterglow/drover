@@ -786,8 +786,8 @@ async def test_nodegroup_delete_boot_volume_timeout_retains_cleanup_record(nodeg
     monkeypatch.setattr("drover.services.inventory.list_managed_resources", AsyncMock(return_value=[
         SimpleNamespace(service="cinder", resource_type="volume", resource_id="volume-1", name="worker-1-boot"),
     ]))
-    wait_deleted = MagicMock(side_effect=TimeoutError("volume still exists"))
-    monkeypatch.setattr("drover.services.cinder.wait_volume_deleted", wait_deleted)
+    cleanup = MagicMock(side_effect=TimeoutError("volume still exists"))
+    monkeypatch.setattr("drover.services.cinder.delete_detached_boot_volume", cleanup)
     with pytest.raises(autoscale.NodegroupDeletionError, match="boot_volume_delete_unverified:volume-1"):
         await _delete_nodegroup()
     mocks.delete_server.assert_called_once()
