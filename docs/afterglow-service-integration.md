@@ -201,7 +201,7 @@ Afterglow 대시보드 및 BFF에서 테넌트 클러스터의 오토스케일�
      - `last_decision`: 최근 스케줄러 동작 (`scale_up_queued`, `scale_up_complete`, `scale_down_queued`, `scale_down_complete`, `stabilizing`, `within_capacity`, `observation_failed` 등).
      - `last_blocked_reason`: 최근 차단 상세 사유 (`gpu_not_allocatable`, `scale_down_cooldown`, `min_size_reached` 등).
      - `quota_state.allowed`는 admission 단계의 결과입니다. Nova quota나 GPU 호스트의 현재 여유를 예약·보장하지 않으며, 이후 provisioning 실패는 operation 상태로 확인합니다.
-     - `last_blocked_reason=gpu_admission_unavailable`이 지속되면 Afterglow admission 자체가 503을 반환하는 상태입니다. Afterglow는 `/api/v1/internal/k3s/gpu-admission`과 provisioning intent에서 서비스 사용자(Kolla 기본 `afterglow_admin`)를 tenant project scope로 인증하므로 그 사용자에게 해당 project role이 없으면 Keystone 401로 실패합니다. Drover는 admission URL이 설정되면 CPU flavor 증설도 이 판정을 기다립니다. 2026-10-06 DMSLab에서 `afterglow_admin`은 `afterglow-service`에만 role이 있어 모든 tenant project에서 이 상태였고, Afterglow 쪽 onboarding/credential 정책 결정이 필요합니다.
+     - `last_blocked_reason=gpu_admission_unavailable`이 지속되면 Afterglow admission 자체가 503을 반환하는 상태입니다. Afterglow는 `/api/v1/internal/k3s/gpu-admission`과 provisioning intent에서 서비스 사용자(Kolla 기본 `afterglow_admin`)를 tenant project scope로 인증하므로, 그 사용자가 해당 project에서 role을 받지 못하면 Keystone 401로 실패합니다. Drover는 admission URL이 설정되면 CPU flavor 증설도 이 판정을 기다립니다. 2026-10-06 DMSLab의 일회용 test project에서 이 상태를 관측했습니다. `afterglow_admin`의 직접 role assignment는 1건이었고 effective/inherited/group assignment는 확인하지 않았습니다. 다른 tenant project의 동작과 role 부여 정책은 Afterglow 쪽 onboarding/credential 결정입니다.
 
 3. **이벤트 타임라인 (`GET /v1/clusters/{cluster_id}/stampede/events?limit=50`)**:
    - Redis 기반 보조 Activity 피드로, 스케일링 시작(`started`), 완료(`success`), 실패(`failed`), 보류(`skipped`) 이벤트와 상세 메타데이터(노드명, flavor, Pod 수 등)를 역순(최신순)으로 제공합니다.
