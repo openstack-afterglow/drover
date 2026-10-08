@@ -298,7 +298,7 @@ def stampede_deletion(monkeypatch):
     connection.block_storage.get_volume.side_effect = get_volume
     connection.block_storage.delete_volume.side_effect = delete_volume
     state.connection = connection
-    monkeypatch.setattr(keystone, "get_project_manager_connection", AsyncMock(return_value=connection))
+    monkeypatch.setattr("drover.services.execution.open_connection", AsyncMock(return_value=connection))
     state.close = AsyncMock()
     monkeypatch.setattr(keystone, "close_connection", state.close)
     monkeypatch.setattr(nodegroup, "get_nodegroup", AsyncMock(side_effect=lambda *_: group))
@@ -493,7 +493,7 @@ async def test_stampede_job_observation_errors_never_authorize_cleanup(stampede_
     state = stampede_deletion
     if boundary == "auth":
         # A later autoscale lookup could succeed: the first failure must still stop the job.
-        monkeypatch.setattr(keystone, "get_project_manager_connection", AsyncMock(side_effect=[PermissionError("manager auth failed"), state.connection]))
+        monkeypatch.setattr("drover.services.execution.open_connection", AsyncMock(side_effect=[PermissionError("execution auth failed"), state.connection]))
         expected = PermissionError
     elif boundary == "nova":
         lookup = state.connection.compute.get_server.side_effect
@@ -731,6 +731,7 @@ async def test_manual_missing_node_removal_reserves_name_before_vm_delete(stampe
     state = stampede_deletion
     state.nodes.clear()
     state.payload.pop("stampede")  # Automatic scale-down still requires a Ready candidate.
+    state.payload["_delegation_id"] = "admitted-delegation"  # Manual removal runs under the requester's trust.
     state.delete_on_termination = False
     if failure == "observation":
         state.capacity_observation.side_effect = RuntimeError("Node observation unavailable")

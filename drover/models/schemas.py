@@ -400,6 +400,46 @@ class StampedeMutationResponse(BaseModel):
     stampede_enabled: bool
 
 
+class ClusterCredentialInfo(BaseModel):
+    """A cluster resource credential reference; secrets are never returned."""
+
+    app_credential_id: str
+    purpose: str
+    generation: int
+    owner_user_id: str | None = None
+    state: str
+    state_reason: str | None = None
+    role_names: list[str] = []
+    created_at: str | None = None
+    activated_at: str | None = None
+    retired_at: str | None = None
+    last_error: str | None = None
+
+
+class ClusterAuthorizationStatus(BaseModel):
+    cluster_id: str
+    authorized: bool
+    active_generation: int | None = None
+    staged_generations: list[int] = []
+    owner_revocation_required: list[ClusterCredentialInfo] = []
+    credentials: list[ClusterCredentialInfo] = []
+
+
+class ClusterReauthorizationResponse(BaseModel):
+    cluster_id: str
+    generation: int
+    operation_id: str
+    job_id: str
+    credentials: list[ClusterCredentialInfo]
+    retired_credential_ids: list[str] = []
+
+
+class ClusterCredentialRetireResponse(BaseModel):
+    cluster_id: str
+    deleted_credential_ids: list[str]
+    owner_revocation_required: list[ClusterCredentialInfo] = []
+
+
 def _validate_nodegroup_resource_id(value: str | None) -> str | None:
     # Nova flavor IDs need not be UUIDs. Names/whitespace are not selectors.
     if value is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value):

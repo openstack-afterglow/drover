@@ -15,7 +15,9 @@ from sqlalchemy.orm import aliased
 from drover.db import get_session_factory
 from drover.logging import safe_metadata
 from drover.models.orm import DroverJob, DroverOperation, K3sCluster, K3sNodegroup, K3sNodegroupVM
-from drover.services import operations
+from drover.services import delegation as _delegation
+from drover.services import execution, operations
+from drover.services.delegation import AdmittedDelegation
 
 _logger = logging.getLogger("drover.jobs")
 _LEASE_SECONDS = 900
@@ -32,6 +34,7 @@ _SUPPORTED_KINDS = frozenset(
         "delete",
         "rotate_certificates",
         "reconcile",
+        "reauthorize",
     }
 )
 
@@ -45,7 +48,12 @@ JOB_TO_OP_KIND = {
     "delete": "delete",
     "rotate_certificates": "rotate_certificates",
     "reconcile": "reconcile",
+    "reauthorize": "reauthorize",
 }
+
+# Job kinds that must run under an admitted operation delegation versus cluster resource authority.
+_OPERATION_KINDS = frozenset({"create", "bootstrap_ha", "provision_agents", "scale", "delete"})
+_TERMINAL_CLUSTER_SAFE_KINDS = frozenset({"reauthorize"})
 
 
 def _now() -> datetime:
@@ -66,8 +74,16 @@ async def enqueue_job(
     op_kind: str | None = None,
     *,
     session: AsyncSession | None = None,
+    delegation: AdmittedDelegation | None = None,
+    delegation_id: str | None = None,
 ) -> str:
-    """Persist a job/operation, optionally inside the caller's state transaction."""
+    """Persist a job/operation, optionally inside the caller's state transaction.
+
+    ``delegation`` persists a freshly admitted requester trust with the job; ``delegation_id`` lets a callback
+    continuation reuse its operation's already admitted delegation. Neither may be combined.
+    """
+    if delegation is not None and delegation_id is not None:
+        raise ValueError("A job references exactly one delegation")
     if kind not in _SUPPORTED_KINDS:
         raise ValueError(f"unsupported Drover job kind: {kind}")
 
@@ -90,6 +106,11 @@ async def enqueue_job(
                     status="QUEUED",
                 )
                 target_op_id = new_op.id
+        job_delegation_id = delegation_id
+        if delegation is not None:
+            if delegation.project_id != project_id or delegation.cluster_id != cluster_id:
+                raise ValueError("Delegation scope does not match the job")
+            job_delegation_id = await _delegation.persist(session, delegation, target_op_id)
         job = DroverJob(
             id=str(uuid.uuid4()),
             cluster_id=cluster_id,
@@ -100,6 +121,7 @@ async def enqueue_job(
             user_id=user_id or None,
             username=username or None,
             operation_id=target_op_id,
+            delegation_id=job_delegation_id,
             created_at=_now(),
             updated_at=_now(),
         )
@@ -227,7 +249,40 @@ async def enqueue_stampede_job(
         return {"job_id": job_id, "operation_id": op.id, "count": count}
 
 
+def _authority_for(kind: str, payload: dict, cluster_id: str, project_id: str) -> execution.Authority | None:
+    """Resolve the only authority a job kind may use; mutation jobs without a delegation never run."""
+    from drover.services.cluster_authority import CAPABILITY_READ, CAPABILITY_SCALE
+
+    delegation_id = payload.pop("_delegation_id", None)
+    stampede = bool(payload.get("stampede"))
+    if kind in _OPERATION_KINDS or (kind == "nodegroup_reconcile" and not stampede):
+        if not delegation_id:
+            raise execution.AuthorityRevoked("This mutation job has no admitted requester delegation; resubmit it")
+        rollback = payload.get("expired_operation_id") if kind == "delete" else None
+        return execution.OperationAuthority(delegation_id, project_id, cluster_id, kind, rollback)
+    if kind == "stampede_provision" or (kind == "nodegroup_reconcile" and stampede):
+        return execution.ResourceAuthority(project_id, cluster_id, CAPABILITY_SCALE)
+    if kind == "reconcile":
+        return execution.ResourceAuthority(project_id, cluster_id, CAPABILITY_READ)
+    return None
+
+
 async def _execute_job_direct(
+    kind: str,
+    payload: dict,
+    cluster_id: str,
+    project_id: str,
+    operation_id: str | None = None,
+) -> None:
+    authority = _authority_for(kind, payload, cluster_id, project_id)
+    if authority is None:
+        await _dispatch_job(kind, payload, cluster_id, project_id, operation_id)
+        return
+    with execution.bound(authority):
+        await _dispatch_job(kind, payload, cluster_id, project_id, operation_id)
+
+
+async def _dispatch_job(
     kind: str,
     payload: dict,
     cluster_id: str,
@@ -339,6 +394,11 @@ async def _execute_job_direct(
             cluster_id=cluster_id,
             operation_id=operation_id,
         )
+    elif kind == "reauthorize":
+        from drover.services import cluster_authority
+
+        op_id = operation_id or payload.pop("_operation_id", None)
+        await cluster_authority.execute_reauthorization(project_id, cluster_id, payload, operation_id=op_id)
     else:
         raise ValueError(f"unsupported Drover job kind: {kind}")
 
@@ -374,9 +434,15 @@ async def _settle_stampede_job(session: AsyncSession, job: DroverJob, error: str
     ng.updated_at = _now()
 
 
-async def _mark_cluster_failed(session, job: DroverJob, error: str) -> None:
+async def _mark_cluster_failed(session, job: DroverJob, error: str, *, authority_failure: bool = False) -> None:
     if job.kind in {"stampede_provision", "nodegroup_reconcile"}:
         await _settle_stampede_job(session, job, error)
+        return
+    if job.kind in _TERMINAL_CLUSTER_SAFE_KINDS:
+        # A failed reauthorization leaves the previously active generation serving the cluster.
+        return
+    if authority_failure and job.kind == "reconcile":
+        # Lost continuous authority must not make the cluster non-ACTIVE: reauthorization requires ACTIVE.
         return
     cluster = await session.get(K3sCluster, job.cluster_id, with_for_update=True)
     if cluster is not None and cluster.project_id == job.project_id and cluster.deleted_at is None:
@@ -469,6 +535,7 @@ async def _claim_one() -> tuple[str, int, str, str, str, dict] | None:
                             message=f"Job {job.kind} retry limit exceeded: {error}",
                             payload_json={"job_id": job.id, "error": error},
                         )
+                await _delegation.release_if_idle(session, getattr(job, "delegation_id", None), reason="job failed")
                 continue
 
             is_lease_recovery = job.status == "running" and job.claimed_at is not None
@@ -491,6 +558,8 @@ async def _claim_one() -> tuple[str, int, str, str, str, dict] | None:
             payload = dict(job.payload_json or {})
             if getattr(job, "operation_id", None):
                 payload["_operation_id"] = job.operation_id
+            if getattr(job, "delegation_id", None):
+                payload["_delegation_id"] = job.delegation_id
             return (
                 job.id,
                 job.attempts,
@@ -545,11 +614,12 @@ async def _complete(job_id: str, *, attempt: int) -> bool:
                     message=msg,
                     payload_json={"job_id": job.id, "op_status": op.status},
                 )
+        await _delegation.release_if_idle(session, getattr(job, "delegation_id", None))
         return True
 
 
-async def _retry_or_fail(job_id: str, *, attempt: int, error: str) -> bool:
-    """Requeue a failed attempt, terminalizing the cluster on the third failure."""
+async def _retry_or_fail(job_id: str, *, attempt: int, error: str, terminal: bool = False) -> bool:
+    """Requeue a failed attempt, terminalizing on the third failure or on an authorization failure."""
     factory = get_session_factory()
     if factory is None:
         return False
@@ -567,9 +637,9 @@ async def _retry_or_fail(job_id: str, *, attempt: int, error: str) -> bool:
         if op_id:
             op = await session.get(DroverOperation, op_id, with_for_update=True)
 
-        if job.attempts >= _MAX_ATTEMPTS:
+        if terminal or job.attempts >= _MAX_ATTEMPTS:
             job.status = "failed"
-            await _mark_cluster_failed(session, job, clean_error)
+            await _mark_cluster_failed(session, job, clean_error, authority_failure=terminal)
             if op:
                 op.status = "FAILED"
                 op.error = clean_error
@@ -581,6 +651,7 @@ async def _retry_or_fail(job_id: str, *, attempt: int, error: str) -> bool:
                     message=f"Job {job.kind} failed after {job.attempts} attempts: {clean_error}",
                     payload_json={"job_id": job.id, "error": clean_error},
                 )
+            await _delegation.release_if_idle(session, getattr(job, "delegation_id", None), reason="job failed")
         else:
             job.status = "queued"
             if op:
@@ -590,33 +661,6 @@ async def _retry_or_fail(job_id: str, *, attempt: int, error: str) -> bool:
                     phase="job_attempt_failed",
                     message=f"Job {job.kind} attempt {attempt} failed: {clean_error}. Retrying...",
                     payload_json={"job_id": job.id, "attempt": attempt, "error": clean_error},
-                )
-        return True
-
-
-async def _defer_in_progress(job_id: str, *, attempt: int) -> bool:
-    """Keep a remote in-progress intent leased without consuming a retry."""
-    factory = get_session_factory()
-    if factory is None:
-        return False
-    async with factory() as session, session.begin():
-        job = await session.get(DroverJob, job_id, with_for_update=True)
-        if job is None or job.status != "running" or job.attempts != attempt:
-            return False
-        job.attempts = max(0, job.attempts - 1)
-        job.last_error = "Afterglow provisioning remains in progress"
-        job.claimed_at = _now()
-        job.updated_at = job.claimed_at
-        op_id = getattr(job, "operation_id", None)
-        if op_id:
-            op = await session.get(DroverOperation, op_id, with_for_update=True)
-            if op:
-                await operations._append_event_impl(
-                    session,
-                    op.id,
-                    phase="job_deferred",
-                    message=f"Job {job.kind} is waiting for existing Afterglow provisioning",
-                    payload_json={"job_id": job.id, "attempt": attempt},
                 )
         return True
 
@@ -676,23 +720,25 @@ async def process_one_job() -> bool:
         )
     stop = asyncio.Event()
     heartbeat = asyncio.create_task(_heartbeat_lease(job_id, attempt=attempt, stop=stop))
+    delegation_id = payload.get("_delegation_id")
     try:
         await _execute_job_direct(kind, payload, cluster_id, project_id)
         if await _complete(job_id, attempt=attempt):
             _log_job_completion(job_id, attempt, kind, "success")
+    except execution.ExecutionAuthorityError as exc:
+        # Revoked, mismatched or missing authority is never retried and never replaced by another identity.
+        if await _retry_or_fail(job_id, attempt=attempt, error=str(exc), terminal=True):
+            _log_job_completion(job_id, attempt, kind, "error")
     except Exception as exc:
-        from drover.services.autoscale import ProvisioningInProgress
-
-        if isinstance(exc, ProvisioningInProgress):
-            if await _defer_in_progress(job_id, attempt=attempt):
-                _log_job_completion(job_id, attempt, kind, "deferred")
-        elif await _retry_or_fail(job_id, attempt=attempt, error=str(exc)):
+        if await _retry_or_fail(job_id, attempt=attempt, error=str(exc)):
             _log_job_completion(job_id, attempt, kind, "error" if attempt >= _MAX_ATTEMPTS else "retry")
     finally:
         stop.set()
         heartbeat.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await heartbeat
+    # A released or revoked trust is deleted right away through its own token; the sweep retries failures.
+    await _delegation.delete_released(delegation_id)
     return True
 
 

@@ -334,17 +334,19 @@ async def recover_expired_callback_operations(timeout_seconds: int = 1800) -> li
             recovered_op_ids.append(op.id)
 
     if recovered_op_ids:
-        from drover.services import jobs
+        from drover.services import delegation, jobs
 
         for op_id in recovered_op_ids:
             op = await get_operation(None, op_id)
             if op:
+                # Rollback continues the admitted create operation only; without its delegation the job fails closed.
                 await jobs.enqueue_job(
                     cluster_id=op.cluster_id,
                     project_id=op.project_id,
                     kind="delete",
                     payload={"reason": "Cloud-init callback timed out", "expired_operation_id": op.id},
                     op_kind="delete",
+                    delegation_id=await delegation.active_delegation_for_operation(None, op.id),
                 )
 
     return recovered_op_ids

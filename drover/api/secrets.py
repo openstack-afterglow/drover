@@ -14,12 +14,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from drover.auth import get_os_conn, get_token_info
 from drover.models.schemas import SecretCreateRequest, SecretInfo, SecretWriteRequest
+from drover.policy import authorize, require_workload_access
 from drover.services import kube as k3s_kube
 from drover.services import store as k3s_cluster
 from drover.services.activity import rec
 from drover.services.cache import invalidate
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_workload_access)])
 
 
 def _check_cluster(cluster):
@@ -63,6 +64,8 @@ async def create_secret(
     token_info: dict = Depends(get_token_info),
 ):
     project_id = conn._afterglow_project_id
+    if body.type != "Opaque" and not authorize("drover:access:admin", {"project_id": project_id}, token_info, do_raise=False):
+        raise HTTPException(status_code=403, detail="Editors may only write Opaque workload secrets")
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     _check_cluster(cluster)
     item = await k3s_kube.create_secret(
@@ -98,6 +101,8 @@ async def update_secret(
     token_info: dict = Depends(get_token_info),
 ):
     project_id = conn._afterglow_project_id
+    if body.type != "Opaque" and not authorize("drover:access:admin", {"project_id": project_id}, token_info, do_raise=False):
+        raise HTTPException(status_code=403, detail="Editors may only write Opaque workload secrets")
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     _check_cluster(cluster)
     item = await k3s_kube.update_secret(

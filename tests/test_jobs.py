@@ -125,23 +125,6 @@ async def test_second_failure_requeues_job(monkeypatch):
     assert job.claimed_at is None
 
 
-async def test_in_progress_intent_keeps_lease_without_consuming_retry(monkeypatch):
-    job = SimpleNamespace(
-        status="running",
-        attempts=2,
-        claimed_at=object(),
-        last_error=None,
-        updated_at=None,
-        operation_id=None,
-    )
-    session = _Session(objects={(DroverJob, "job-1"): job})
-    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
-
-    assert await jobs._defer_in_progress("job-1", attempt=2) is True
-    assert job.status == "running"
-    assert job.attempts == 1
-    assert job.claimed_at is not None
-    assert job.last_error == "Afterglow provisioning remains in progress"
 
 
 async def test_third_failure_terminalizes_job_and_cluster(monkeypatch):
@@ -213,27 +196,6 @@ async def test_process_failure_is_requeued_with_claimed_attempt(monkeypatch):
     retry.assert_awaited_once_with("job-1", attempt=2, error="capacity unavailable")
 
 
-async def test_process_defers_existing_afterglow_intent_without_failure_retry(monkeypatch):
-    from drover.services.autoscale import ProvisioningInProgress
-
-    defer = AsyncMock(return_value=True)
-    retry = AsyncMock(return_value=True)
-    monkeypatch.setattr(
-        jobs,
-        "_claim_one",
-        AsyncMock(return_value=("job-1", 2, "stampede_provision", "cluster-1", "project-1", {})),
-    )
-    monkeypatch.setattr(
-        jobs,
-        "_execute_job_direct",
-        AsyncMock(side_effect=ProvisioningInProgress("intent-1")),
-    )
-    monkeypatch.setattr(jobs, "_defer_in_progress", defer)
-    monkeypatch.setattr(jobs, "_retry_or_fail", retry)
-
-    assert await jobs.process_one_job() is True
-    defer.assert_awaited_once_with("job-1", attempt=2)
-    retry.assert_not_awaited()
 
 
 async def test_worker_claim_and_success_log_committed_safe_metadata(monkeypatch, caplog):
@@ -286,24 +248,6 @@ async def test_worker_failure_logs_only_committed_outcome(monkeypatch, caplog, a
     assert all(record.exc_info is None for record in caplog.records if record.name == "drover.jobs")
 
 
-async def test_worker_deferred_logs_only_after_lease_is_retained(monkeypatch, caplog):
-    from drover.services.autoscale import ProvisioningInProgress
-
-    job = SimpleNamespace(status="running", attempts=2, claimed_at=object(), last_error=None,
-                          updated_at=None, operation_id=None)
-    session = _Session(objects={(DroverJob, "job-1"): job})
-    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
-    monkeypatch.setattr(jobs, "_claim_one", AsyncMock(return_value=("job-1", 2, "stampede_provision", "secret-cluster", "secret-project", {})))
-    monkeypatch.setattr(jobs, "_execute_job_direct", AsyncMock(side_effect=ProvisioningInProgress("secret-intent")))
-
-    with caplog.at_level(logging.INFO, logger="drover.jobs"):
-        assert await jobs.process_one_job() is True
-
-    assert job.status == "running"
-    assert job.attempts == 1
-    assert any("kind=stampede_provision job_id=untrusted attempt=2 outcome=deferred" in record.getMessage()
-               for record in caplog.records if record.name == "drover.jobs")
-    assert not any("secret" in record.getMessage() or "job-1" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.parametrize("failure", [False, True])

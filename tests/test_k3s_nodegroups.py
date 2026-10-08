@@ -5,6 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("admitted_authority")
+
 from openstack.exceptions import NotFoundException
 
 _CLUSTER_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -468,7 +471,7 @@ async def test_service_rolls_back_sizing_when_enqueue_unavailable(monkeypatch):
     session = _service_session(monkeypatch, [SimpleNamespace(status="ACTIVE", project_id="project-1"), None, group])
     with patch("drover.services.jobs.enqueue_job", new=AsyncMock(side_effect=RuntimeError("DB unavailable"))):
         with pytest.raises(RuntimeError):
-            await nodegroup.update_nodegroup(_CLUSTER_ID, group.id, {"node_count": 3}, project_id="project-1")
+            await nodegroup.update_nodegroup(_CLUSTER_ID, group.id, {"node_count": 3}, project_id="project-1", delegation=SimpleNamespace(id="delegation-1"))
     session.commit.assert_not_awaited()
 
 
@@ -482,7 +485,7 @@ async def test_service_manual_scale_persists_observable_job_state(monkeypatch):
     session = _service_session(monkeypatch, [SimpleNamespace(status="ACTIVE", project_id="project-1"), None,
                                              group, "operation-1"])
     with patch("drover.services.jobs.enqueue_job", new=AsyncMock(return_value="job-1")):
-        result = await nodegroup.update_nodegroup(_CLUSTER_ID, group.id, {"node_count": 3}, project_id="project-1")
+        result = await nodegroup.update_nodegroup(_CLUSTER_ID, group.id, {"node_count": 3}, project_id="project-1", delegation=SimpleNamespace(id="delegation-1"))
     assert result["node_count"] == 3
     assert result["stampede_state"]["in_flight_count"] == 2
     assert result["stampede_state"]["last_job_id"] == "job-1"

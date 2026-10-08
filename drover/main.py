@@ -16,6 +16,7 @@ from sqlalchemy import text
 
 from drover.api import (
     admin,
+    authorization,
     callback,
     certificates,
     clusters,
@@ -129,6 +130,7 @@ app.add_middleware(CorrelationMiddleware)
 # Routers mounted under /v1 (health router included BEFORE clusters router so /v1/clusters/health matches before /{cluster_id})
 app.include_router(health.router, prefix="/v1/clusters", tags=["health"])
 app.include_router(clusters.router, prefix="/v1/clusters", tags=["clusters"])
+app.include_router(authorization.router, prefix="/v1/clusters", tags=["authorization"])
 app.include_router(callback.router, prefix="/v1", tags=["callback"])
 app.include_router(configmaps.router, prefix="/v1/clusters", tags=["configmaps"])
 app.include_router(secrets.router, prefix="/v1/clusters", tags=["secrets"])

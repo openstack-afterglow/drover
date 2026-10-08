@@ -18,57 +18,34 @@ _logger = logging.getLogger(__name__)
 
 _ENFORCER: policy.Enforcer | None = None
 
+def _project_rule(name: str, roles: tuple[str, ...], *, base: str = "member") -> policy.RuleDefault:
+    capability = " or ".join(f"role:{role}" for role in roles)
+    baseline = "(role:reader or role:member)" if base == "reader" else "role:member"
+    return policy.RuleDefault(
+        name=name,
+        check_str=f"rule:context_is_admin or (rule:owner and {baseline} and ({capability}))",
+    )
+
+
 DEFAULT_RULES: list[policy.RuleDefault] = [
-    policy.RuleDefault(
-        name="context_is_admin",
-        check_str="role:admin or is_system_admin:True",
-        description="System admin privileges check",
-    ),
-    policy.RuleDefault(
-        name="owner",
-        check_str="project_id:%(project_id)s",
-        description="Resource owner check",
-    ),
-    policy.RuleDefault(
-        name="admin_or_owner",
-        check_str="rule:context_is_admin or rule:owner",
-        description="Admin or owner check",
-    ),
-    policy.RuleDefault(
-        name="drover:clusters:get",
-        check_str="rule:admin_or_owner",
-        description="List or retrieve cluster details",
-    ),
-    policy.RuleDefault(
-        name="drover:clusters:create",
-        check_str="rule:admin_or_owner",
-        description="Create a cluster",
-    ),
-    policy.RuleDefault(
-        name="drover:clusters:delete",
-        check_str="rule:admin_or_owner",
-        description="Delete a cluster",
-    ),
-    policy.RuleDefault(
-        name="drover:clusters:scale",
-        check_str="rule:admin_or_owner",
-        description="Scale a cluster",
-    ),
-    policy.RuleDefault(
-        name="drover:templates:manage",
-        check_str="rule:context_is_admin",
-        description="Create, update, or delete cluster templates",
-    ),
-    policy.RuleDefault(
-        name="drover:operations:get",
-        check_str="rule:admin_or_owner",
-        description="Retrieve operation details or events",
-    ),
-    policy.RuleDefault(
-        name="drover:admin",
-        check_str="rule:context_is_admin",
-        description="System administrative actions",
-    ),
+    policy.RuleDefault("context_is_admin", "is_system_admin:True"),
+    policy.RuleDefault("owner", "project_id:%(project_id)s"),
+    _project_rule("drover:clusters:get", ("drover-inventory_reader",), base="reader"),
+    _project_rule("drover:operations:get", ("drover-inventory_reader",), base="reader"),
+    _project_rule("drover:clusters:create", ("drover-clusters_editor",)),
+    _project_rule("drover:clusters:scale", ("drover-clusters_editor",)),
+    _project_rule("drover:clusters:delete", ("drover-clusters_admin",)),
+    # Creates the operator's own restricted cluster credentials and rolls them into the guest.
+    _project_rule("drover:clusters:reauthorize", ("drover-clusters_admin",)),
+    # Deleting one's own superseded credential only reduces authority; ownership is checked in code.
+    policy.RuleDefault("drover:clusters:retire_credentials", "rule:context_is_admin or rule:owner"),
+    _project_rule("drover:access:get", ("drover-access_user", "drover-workloads_editor", "drover-access_admin")),
+    _project_rule("drover:access:read", ("drover-access_user", "drover-access_admin")),
+    _project_rule("drover:access:admin", ("drover-access_admin",)),
+    _project_rule("drover:workloads:write", ("drover-workloads_editor", "drover-access_admin")),
+    _project_rule("drover:certificates:rotate", ("drover-clusters_admin",)),
+    policy.RuleDefault("drover:templates:manage", "rule:context_is_admin"),
+    policy.RuleDefault("drover:admin", "rule:context_is_admin"),
 ]
 
 
@@ -105,12 +82,12 @@ def get_enforcer(policy_file: str | None = None, reload: bool = False) -> policy
 
 def build_credentials(token_info: dict[str, Any]) -> dict[str, Any]:
     """Convert token_info into oslo.policy credentials dictionary."""
-    roles = token_info.get("roles") or []
-    is_admin = bool(token_info.get("is_system_admin")) or ("admin" in roles)
+    roles = set(token_info.get("roles") or [])
+    is_admin = token_info.get("is_system_admin") is True
     return {
         "user_id": token_info.get("user_id") or "",
         "project_id": token_info.get("project_id") or "",
-        "roles": roles,
+        "roles": sorted(roles),
         "is_admin": is_admin,
         "is_system_admin": is_admin,
     }
@@ -128,7 +105,8 @@ def authorize(
     creds = build_credentials(token_info)
     target_dict = target if target is not None else {"project_id": creds["project_id"]}
 
-    allowed = enforcer.enforce(rule_name, target_dict, creds)
+    unsafe_roles = not creds["is_system_admin"] and bool({"admin", "manager"}.intersection(creds["roles"]))
+    allowed = not unsafe_roles and enforcer.enforce(rule_name, target_dict, creds)
     if not allowed and do_raise:
         raise HTTPException(status_code=403, detail="Policy enforcement failed: access denied")
     return allowed
@@ -148,3 +126,35 @@ def require_policy(
         return token_info
 
     return _policy_dependency
+
+
+def authorize_workload_namespace(namespace: str, token_info: dict[str, Any]) -> None:
+    """Workload editors operate only in their isolated principal namespace."""
+    project_id = token_info.get("project_id", "")
+    authorize("drover:workloads:write", {"project_id": project_id}, token_info)
+    if authorize("drover:access:admin", {"project_id": project_id}, token_info, do_raise=False):
+        return
+    from drover.services.credentials import workload_namespace
+
+    if not token_info.get("user_id") or namespace != workload_namespace(project_id, token_info["user_id"]):
+        raise HTTPException(status_code=403, detail="Workload namespace access denied")
+
+
+async def require_inventory(token_info: dict[str, Any] = Depends(require_token)) -> dict[str, Any]:
+    authorize("drover:clusters:get", {"project_id": token_info.get("project_id", "")}, token_info)
+    return token_info
+
+
+async def require_workload_access(request: Request, token_info: dict[str, Any] = Depends(require_token)) -> dict[str, Any]:
+    namespace = request.path_params.get("namespace") or request.query_params.get("namespace", "default")
+    authorize_workload_namespace(namespace, token_info)
+    return token_info
+
+
+async def require_workload_or_inventory(request: Request, token_info: dict[str, Any] = Depends(require_token)) -> dict[str, Any]:
+    if request.method in {"GET", "HEAD"}:
+        authorize("drover:clusters:get", {"project_id": token_info.get("project_id", "")}, token_info)
+    else:
+        namespace = request.path_params.get("namespace") or request.query_params.get("namespace", "default")
+        authorize_workload_namespace(namespace, token_info)
+    return token_info

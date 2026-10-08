@@ -282,12 +282,12 @@ async def test_get_probe_ip_uses_managed_connection():
     server.ip_addresses = [floating_ip]
 
     with (
-        patch("drover.services.keystone.project_manager_connection") as managed,
+        patch("drover.services.execution.connection") as managed,
         patch("drover.services.nova.get_server", return_value=server),
     ):
         managed.return_value.__aenter__ = AsyncMock(return_value=conn)
         managed.return_value.__aexit__ = AsyncMock(return_value=False)
-        result = await _get_probe_ip("proj-1", "vm-1", "10.0.0.1")
+        result = await _get_probe_ip("proj-1", "vm-1", "10.0.0.1", cluster_id="cluster-1")
 
     assert result == "203.0.113.10"
     managed.assert_called_once_with("proj-1")

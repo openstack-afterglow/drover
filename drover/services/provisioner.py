@@ -192,7 +192,7 @@ def _cluster_security_group_rules(
 async def provision_agents(project_id: str, cluster_id: str, server_ip: str, node_token: str) -> None:
     """에이전트 VM을 모두 생성하고 클러스터 상태를 ACTIVE로 전환한다."""
     from drover.config import get_settings
-    from drover.services import cinder, inventory, keystone, nova
+    from drover.services import cinder, execution, inventory, keystone, nova
     from drover.services import cloudinit as k3s_cloudinit
 
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
@@ -227,11 +227,13 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
         )
         return
     try:
-        conn = await keystone.get_project_manager_connection(project_id)
+        conn = await execution.open_connection(project_id)
+    except execution.ExecutionAuthorityError as e:
+        await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"실행 권한 거부: {e}")
+        raise
     except Exception as e:
         _logger.error("k3s agent provision: cannot get OpenStack connection: %s", e)
-        await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"OpenStack 연결 실패: {e}")
-        return
+        raise
     try:
         agent_vm_ids: list[str] = []
         failed_count = 0
@@ -345,6 +347,7 @@ async def bootstrap_ha_servers(
     from drover.config import get_settings
     from drover.services import (
         cinder,
+        execution,
         inventory,
         keystone,
         nova,
@@ -379,11 +382,7 @@ async def bootstrap_ha_servers(
         _logger.error("HA bootstrap: creation-time resource snapshot is incomplete")
         return
 
-    try:
-        conn = await keystone.get_project_manager_connection(project_id)
-    except Exception as e:
-        _logger.error("HA bootstrap: cannot get OpenStack connection: %s", e)
-        return
+    conn = await execution.open_connection(project_id)
     try:
         plugin_settings = await _guest_plugin_settings(conn, s, resource_snapshot)
         join_url, ha_extra_tls_sans = await _resolve_ha_join_endpoint(
@@ -419,10 +418,23 @@ async def bootstrap_ha_servers(
         except Exception as e:
             _logger.warning("HA: failed to add server#1 to LB pool: %s", e)
 
-        # server#2, server#3 생성. Plugins read the cloud-config Secret that server#1 created once; the
-        # application credential secret is not retained, so joiners must not re-render cloud.conf.
+        # server#2, server#3. Joiners read the cloud-config Secret that server#1 created and never re-render
+        # cloud.conf; host-level Barbican KMS files are rendered from the cluster's active guest credential.
         extra_server_args = k3s_plugins.aggregate_server_args(plugin_settings)
-        extra_write_files = k3s_plugins.aggregate_extra_write_files(project_id, cluster_name, plugin_settings)
+        guest_credential = None
+        if any(p.name == "barbican_kms" for p in k3s_plugins.get_active_plugins(plugin_settings)):
+            from drover.services import barbican as _barbican
+            from drover.services import cluster_authority
+
+            guest_credential = await cluster_authority.active_guest_credential(cluster_id)
+            if guest_credential is None:
+                raise RuntimeError("Barbican KMS joiners require the cluster's active guest credential")
+            kek_id = await _barbican.ensure_project_kek(conn)
+        else:
+            kek_id = None
+        extra_write_files = k3s_plugins.aggregate_extra_write_files(
+            project_id, cluster_name, plugin_settings, app_credential=guest_credential, kek_id=kek_id
+        )
 
         for idx in range(2, master_count + 1):
             server_suffix = _rand_suffix()
@@ -520,26 +532,38 @@ async def create_cluster_job(
     """Execute OpenStack resource creation for cluster create job."""
     from drover.config import get_settings
     from drover.models.schemas import K3sProgressStep
-    from drover.services import cinder, inventory, keystone, neutron, nova, octavia, operations
+    from drover.services import (
+        cinder,
+        cluster_authority,
+        execution,
+        inventory,
+        keystone,
+        neutron,
+        nova,
+        octavia,
+        operations,
+    )
     from drover.services import cloudinit as k3s_cloudinit
     from drover.services import plugins as k3s_plugins
 
     s = get_settings()
     ssh_public_key = _require_ssh_public_key_snapshot(payload)
     try:
-        conn = await keystone.get_project_manager_connection(project_id)
+        conn = await execution.open_connection(project_id)
     except Exception as e:
+        terminal = isinstance(e, execution.ExecutionAuthorityError)
         _logger.error("k3s cluster create job: cannot get OpenStack connection for project %s: %s", project_id, e)
-        if operation_id:
+        if operation_id and terminal:
             await operations.append_operation_event(
                 None,
                 operation_id,
                 phase=K3sProgressStep.FAILED.value,
-                message=f"OpenStack 연결 실패: {e}",
+                message=f"실행 권한 거부: {e}",
                 payload_json={"step": K3sProgressStep.FAILED.value, "progress": 0, "error": str(e)},
             )
             await operations.update_operation_status(None, operation_id, "FAILED", error=str(e))
-        await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"OpenStack 연결 실패: {e}")
+        if terminal:
+            await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"실행 권한 거부: {e}")
         raise
 
     name = payload.get("name", "")
@@ -782,37 +806,14 @@ async def create_cluster_job(
             pass
 
         active_plugins = k3s_plugins.get_active_plugin_names(plugin_settings)
-        active_plugins.get("occm", False)
 
-        from drover.services import keystone as _keystone
-
+        # The requester's restricted guest credential was created at admission; Drover never mints one here.
         app_cred: dict | None = None
-        needs_app_cred = (
-            active_plugins.get("occm", False)
-            or active_plugins.get("manila_csi", False)
-            or active_plugins.get("octavia_ingress", False)
-            or active_plugins.get("barbican_kms", False)
-        )
-        if needs_app_cred:
-            if operation_id:
-                await operations.append_operation_event(
-                    None,
-                    operation_id,
-                    phase=K3sProgressStep.SERVER_CREATING.value,
-                    message="App Credential 발급 중...",
-                    payload_json={"step": K3sProgressStep.SERVER_CREATING.value, "progress": 38},
-                )
-            app_cred = await _keystone.create_app_credential_for_cluster(project_id, name)
+        if any(active_plugins.get(name, False) for name in cluster_authority.GUEST_PLUGIN_NAMES):
+            app_cred = await cluster_authority.active_guest_credential(cluster_id)
+            if app_cred is None:
+                raise RuntimeError("Guest plugins require the guest credential admitted with this cluster")
             app_credential_id = app_cred["id"]
-            await inventory.record_resource(
-                None,
-                cluster_id=cluster_id,
-                service="keystone",
-                resource_type="app_credential",
-                resource_id=app_credential_id,
-                operation_id=operation_id,
-                name=name,
-            )
 
         cloud_conf = k3s_plugins.aggregate_cloud_conf(
             project_id, plugin_settings, internal_network_name=_internal_network_name, app_credential=app_cred
@@ -830,7 +831,7 @@ async def create_cluster_job(
                 )
             from drover.services import barbican as _barbican
 
-            kek_id = await _barbican.ensure_project_kek(project_id)
+            kek_id = await _barbican.ensure_project_kek(conn)
 
         manifest_kwargs: dict = {"app_credential": app_cred, "cluster_id": cluster_id}
         if active_plugins.get("octavia_ingress", False):

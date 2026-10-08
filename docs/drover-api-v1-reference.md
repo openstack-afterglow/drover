@@ -2,6 +2,8 @@
 
 Drover 서비스의 네이티브 REST, SSE(Server-Sent Events) 및 WebSocket API에 대한 완전한 사양서입니다. 본 API 사양서는 OpenStack Keystone 인증 기반의 프로젝트 격리 멀티테넌트 환경을 전제로 설계되었습니다.
 
+**Execution-authority 변경의 증거는 source-reviewed only입니다.** 기존 테스트 계약은 test-defined로 구분하며 이번 갱신에서는 테스트·live Keystone/OpenStack/K3s 검증을 실행하지 않았습니다. 역사적 릴리스 결과는 새 trust/credential rollout의 검증 증거가 아닙니다.
+
 > **기계 읽기용 OpenAPI 스키마**
 > 실행 중인 Drover API 서버의 최신 기계 읽기 표준 OpenAPI 스키마는 **`/openapi.json`**, 대화형 UI는 **`/docs`**에서 동적으로 조회할 수 있습니다.
 
@@ -38,6 +40,16 @@ LOG_LEVEL=DEBUG drover-worker
 * `409 Conflict`: 멱동성 키 불일치 중복 요청 또는 리소스 상태 충돌
 * `429 Too Many Requests`: Rate Limit(초당/분당 요청 제한) 초과
 * `503 Service Unavailable`: 백엔드 서비스(Redis, DB, Keystone 등) 오류
+
+### 1.3 Durable execution authority
+
+- create/scale/delete, mutation nodegroup 및 admin scale/delete는 target project-scoped requester token으로 per-operation Keystone trust를 admit합니다. trustor=requester, trustee=service-project에서 resolve한 Drover identity, `impersonation=True`입니다. required roles는 모두 현재 보유해야 하며 optional은 보유한 것만 위임합니다. `admin`/`manager` 위임과 service/tenant-manager fallback은 없습니다. admin API도 target project에 scope된 caller token이 필요합니다.
+- trust record의 scope/impersonation/role subset/expiry를 검증하고 각 connection에서 enabled principal/project, 현재 held role IDs 및 create/scale/delete capability와 token identity/project/trustee/expiry를 재검증합니다. trust/app-credential token은 admitted role IDs를 모두 포함해야 합니다. Keystone implied-role 확장은 허용하지만 `admin`/`manager` token roles는 거부합니다. `AuthorityRevoked`/`ReauthorizationRequired` 등 `ExecutionAuthorityError`는 terminal이고 retry하지 않으며 directory/Keystone 통신 장애는 attempt-fenced retry입니다. HTTP admission denial은 403, unavailable은 503입니다.
+- callback continuation과 해당 create operation의 rollback delete는 create delegation을 재사용합니다. queued/running job 또는 live operation이 있으면 유지하고 idle이면 `released`로 전환합니다. job 종료 후와 300초 sweep에서 `delete_released`가 released/revoked trust를 자신의 impersonating trust-scoped password token으로 DELETE합니다(project selector 없음). 성공/404는 `deleted`, Unauthorized/Forbidden은 released/revoked와 `state_reason="trust inert until expiry"`, 통신 장애는 다음 sweep 재시도입니다. expiry 이후 Keystone GET 404가 확인되면 `expired`입니다. TTL은 원격 DELETE 불가/장애의 fallback bound입니다. caller token/password는 persist하지 않으며 미커밋 admission은 일시적 caller token으로 정리합니다.
+- [Keystone master trusts.py](https://github.com/openstack/keystone/blob/master/keystone/api/trusts.py)의 `_check_delegated_token`은 app-credential/OAuth/EC2 token을 차단하지만 ordinary trust-scoped token은 차단하지 않습니다. `identity:delete_trust`는 admin/trustor를 허용하고 impersonation token의 user는 trustor이므로 Drover는 이 token으로 trust를 삭제합니다. [Master users.py](https://github.com/openstack/keystone/blob/master/keystone/api/users.py)의 `_block_delegated_token_app_creds`와 `_check_unrestricted_application_credential`은 trust/OAuth/EC2와 restricted app-credential token의 추가 app-credential 관리를 차단하므로 resource credential 원격 폐기는 owner의 non-delegated token을 사용합니다. 이는 source-reviewed이며 배포 Keystone 검증이 아닙니다. `tests/test_native_trust_loopback.py`는 실제 keystoneauth1/keystoneclient HTTP trust create, project-less OS-TRUST auth/verification, trust-token DELETE와 revoked-role terminal 경계를 synthetic provider에서 정의합니다(test-defined, 이 문서 slice에서는 실행하지 않음).
+- create admission은 caller-owned `unrestricted=False` control과 플러그인용 별도 guest credential을 held delegated-role subset으로 발급·암호화 저장합니다. control은 guest에 노출하지 않습니다. Stampede는 owner의 현재 scale, reconcile/health는 get capability 및 credential token scope/roles를 매 connection에 검증합니다. legacy active control 없음은 재인가 필요입니다. reconcile authority 실패나 credential missing(non-required drift)만으로 cluster를 ERROR로 바꾸지 않아 ACTIVE-only 재인가가 가능합니다.
+- 설정(`[drover]` TOML, Settings/Kolla는 `drover_` prefix): `operation_trust_ttl_seconds=14400`(900–86400), `operation_trust_min_remaining_seconds=300`(60–3600, TTL보다 작음), `delegated_required_roles=["member"]`(nonempty), `delegated_optional_roles=["load-balancer_member"]`(보유한 것만), `guest_rollout_timeout_seconds=600`(60–3600). Barbican member/Octavia member-role defaults의 실제 cloud policy 충족은 **[INFERENCE]**입니다.
+
 
 ---
 
@@ -107,9 +119,14 @@ LOG_LEVEL=DEBUG drover-worker
 - **설명**: 지정 클러스터 상세 정보 조회.
 - **응답 (200 OK)**: `K3sClusterInfo`
 
-### `GET /v1/clusters/{cluster_id}/kubeconfig`
-- **설명**: K3s 클러스터 접근용 Kubeconfig YAML 파일 다운로드.
-- **응답 (200 OK)**: `text/yaml` / `application/x-yaml`
+### `GET /v1/clusters/{cluster_id}/kubeconfig?grade=user|editor|admin`
+- **설명**: K3s 클러스터 접근용 Kubeconfig YAML 다운로드. 기본 `grade=user`이며 요청한 grade만 발급하고 상위·하위 grade로 대체하지 않는다.
+  - `user`: `drover-access_user` 또는 `drover-access_admin`. 읽기 전용 ClusterRole에 묶인 ServiceAccount TokenRequest(최대 900초, Keystone 토큰 만료 이내). secret·변경·exec 권한 없음.
+  - `editor`: `drover-workloads_editor` 또는 `drover-access_admin`. 사용자별 격리 namespace의 Role과 admission 정책에 묶인 TokenRequest. 새 ValidatingAdmissionPolicy/binding이 dry-run probe를 거부할 때까지 최대 20회(0.5초 간격) 확인하고, 끝내 거부하지 않으면 토큰 없이 `502`를 반환한다.
+  - `admin`: `drover-access_admin`(또는 검증된 system admin)만. 저장된 전체 kubeconfig.
+  - 모든 grade에 base `member`가 필요하고, system admin이 아닌 raw `admin`/`manager` 역할은 거부한다.
+- **응답 (200 OK)**: `application/yaml`, `Cache-Control: no-store`. 제한 grade는 `X-Credential-Expires-At`, `X-Workload-Namespace` 헤더를 포함한다.
+- **오류**: 권한 없는 grade `403`, 알 수 없는 grade `422`, 다른 프로젝트 cluster `404`, 발급·admission 실패 `502`(관리자 자격으로 대체하지 않음). `HEAD`는 권한만 확인하고 자격을 발급하지 않는다.
 
 ### `POST /v1/clusters/async`
 - **설명**: 비동기 K3s 클러스터 생성 (SSE 스트림 반환). `Idempotency-Key` 헤더 지원. (Rate limit: 5/min)
@@ -133,8 +150,8 @@ LOG_LEVEL=DEBUG drover-worker
   - 이벤트 라인 형식 (`K3sProgressMessage`):
     `data: {"step": "security_group", "progress": 10, "message": "...", "cluster_id": "...", "operation_id": "op-123"}`
 
-- **SSH 키 소유권**: `key_name`은 요청자의 Nova 키페어 이름이다. API가 요청자 connection으로 공개키를 조회·검증하고 기존 `ssh_public_key` cluster/job 필드에 snapshot을 저장한다. Worker는 tenant manager 계정으로 실행하므로 요청자의 `key_name`을 Nova server 생성에 넘기지 않는다. 서버·HA joiner·agent는 snapshot을 Ubuntu cloud-init 또는 FCOS Ignition의 authorized keys로 받는다. 공개키만 저장하며 private key나 caller token은 job에 보관하지 않는다.
-- **실패 및 upgrade 경계**: 선택한 키를 조회·검증할 수 없으면 cluster/job 생성 전에 요청을 거부한다. 이미 승인된 idempotent 요청은 저장된 operation을 재사용한다. 업그레이드 전 생성된 named-key job/cluster에 공개키 snapshot이 없으면 worker는 키를 무시하거나 manager 이름으로 추정하지 않고 실패한다. 기존 실패 job을 재시도하는 대신 API/worker 업그레이드 후 새 요청으로 생성한다. 기존 부분 생성 자원은 inventory를 확인해 별도 정리해야 하며 자동 삭제를 보장하지 않는다.
+- **SSH 키 소유권**: `key_name`은 요청자 Nova 키페어 이름입니다. API가 공개키를 조회·검증해 `ssh_public_key` cluster/job snapshot에 저장하고 Worker는 requester trust로 실행합니다. Nova에 키페어 이름을 넘기지 않고 서버/HA/agent userdata에 공개키를 설치합니다. private key/caller token은 job에 저장하지 않습니다.
+- **실패 및 upgrade 경계**: 키 조회/검증 실패는 cluster/job 전에 거부합니다. 이미 승인된 idempotent 요청은 기존 operation을 재사용합니다. named-key 구 job/cluster에 공개키 snapshot이 없거나 mutation job에 delegation이 없으면 fail closed 하며 다른 identity/keypair로 추정하지 않습니다. [004 upgrade runbook](../drover/migrations/README.md#execution-authority-upgrade-004)에 따라 구 mutation/callback jobs를 drain한 뒤 새 API/Worker를 적용합니다.
 
 ### `PATCH /v1/clusters/{cluster_id}/scale`
 - **설명**: 클러스터 워커(Agent) 노드 수 변경. (Rate limit: 10/min)
@@ -142,12 +159,32 @@ LOG_LEVEL=DEBUG drover-worker
 - **응답 (200 OK)**: `{"message": "...", "target_count": 4}`
 
 ### `DELETE /v1/clusters/{cluster_id}`
-- **설명**: 클러스터 동기 삭제. (Rate limit: 5/min)
+- **설명**: 내구성 delete job을 enqueue합니다. 현재 delete 권한 actor의 trust를 사용하며 creator의 account/credential이 필요하지 않습니다. caller 소유 credential은 admission에서 caller token으로 동기 회수 시도합니다. worker 완료 시 남은 secret을 지우고 다른 owner/legacy credential은 owner revocation backlog로 보고합니다. 204는 cloud 삭제 완료/모든 원격 credential 폐기의 증거가 아닙니다.
 - **응답 (204 No Content)**
 
 ### `POST /v1/clusters/{cluster_id}/delete-async`
-- **설명**: 클러스터 비동기 삭제 (SSE 스트림 반환). (Rate limit: 5/min)
+- **설명**: 현재 caller connection으로 `delete_cluster_progress`를 직접 실행하는 SSE 삭제 경로입니다. creator credential은 필요 없고 caller 소유 credential을 이 connection으로 회수합니다. durable delete job/trust admission 경로가 아니므로 disconnect 후 계속 실행된다는 계약은 없습니다. tenant `DELETE` 및 admin deletion과 구분합니다. (Rate limit: 5/min)
 - **응답 (200 OK)**: `text/event-stream` (SSE 스트림)
+
+### `GET /v1/clusters/{cluster_id}/authorization`
+- **Policy**: `drover:clusters:get`; 다른 프로젝트/없는 cluster는 404.
+- **응답 (200, `ClusterAuthorizationStatus`)**: `cluster_id`, `authorized`(active control row 존재), `active_generation`, `staged_generations`, `credentials`, `owner_revocation_required`(retiring 항목). credential reference는 ID/purpose/generation/owner/state/reason/role names/timestamps/last_error이며 secret은 없습니다. `authorized=true`는 현재 Keystone 권한/authentication이 live 검증됐다는 뜻이 아닙니다.
+- **SDK**: `conn.drover.cluster_authorization(cluster_id)`.
+
+### `POST /v1/clusters/{cluster_id}/authorization`
+- **Policy**: `drover:clusters:reauthorize`; caller의 target project token으로 restricted credentials를 발급합니다. body는 없습니다.
+- **선행 조건**: `ACTIVE` cluster, 다른 queued/running mutation 없음(reconcile 제외). legacy cluster도 새 generation으로 재인가해야 합니다. 기존 active guest 또는 legacy app credential이 있으면 guest도 대체하고 기존 plugin metadata를 유지/legacy detect합니다.
+- **응답 (202, `ClusterReauthorizationResponse`)**: `cluster_id`, `generation`, `operation_id`, `job_id`, staged `credentials` reference, `retired_credential_ids`(이번 admission에서 caller 소유의 이미 retiring인 항목을 회수한 ID). **202는 activation 완료가 아닙니다.** operation과 authorization 상태를 poll합니다.
+- **Worker rollout**: 현재 reauthorize capability와 staged token을 검증합니다. `kube-system/cloud-config`·`manila-cloud-secret` Secret, Octavia Ingress `octavia-ingress-controller-config` ConfigMap의 credential keys를 바꾸고 참조 Deployment/DaemonSet/StatefulSet을 restart/rollout wait합니다. KMS required/legacy detect이면 control-plane host별 privileged hostPID Job이 temporary Secret env와 `nsenter`로 `/etc/kubernetes/cloud.conf`(있으면), `/etc/kubernetes/barbican-cloud.conf`를 rewrite하고 `barbican-kms.service` restart/active/socket을 확인합니다. 마지막 Secret-write probe 뒤에만 atomic activation합니다.
+- **실패/retirement**: 부분 실패는 staged `last_error`와 이전 active generation을 유지합니다; guest 객체의 자동 원복은 보장하지 않습니다. 성공 시 이전 active/다른 staged generation을 retiring으로 바꾸고 secret을 지웁니다. 원격 credential 폐기는 owner token 또는 legacy operator의 out-of-band 절차가 필요합니다.
+- **오류**: 프로젝트/cluster 404, non-ACTIVE/busy/concurrent generation 409, issuance denial 403, DB/Keystone issuance unavailable 503. durable rollout 실패는 operation에서 확인합니다.
+- **SDK**: `conn.drover.reauthorize_cluster(cluster_id)`.
+
+### `POST /v1/clusters/{cluster_id}/authorization/retire`
+- **Policy**: `drover:clusters:retire_credentials`; body 없음. caller token으로 **caller 소유 retiring** credential만 삭제하고 삭제된 row의 secret을 지웁니다. active credential이나 다른 owner 항목을 삭제하지 않습니다.
+- **응답 (200, `ClusterCredentialRetireResponse`)**: `cluster_id`, `deleted_credential_ids`, 남은 `owner_revocation_required`. 개별 원격 DELETE 실패는 backlog에 남을 수 있으므로 200을 전체 회수 성공으로 해석하지 않습니다. endpoint-level 회수 장애는 503.
+- **SDK**: `conn.drover.retire_cluster_credentials(cluster_id)`.
+
 
 ### `GET /v1/clusters/{cluster_id}/nodes/{vm_id}/interfaces`
 - **설명**: 특정 노드 VM에 연결된 Neutron 네트워크 인터페이스 목록 조회.
@@ -165,6 +202,7 @@ LOG_LEVEL=DEBUG drover-worker
 ### `POST /v1/clusters/{cluster_id}/stampede/enable`
 - **설명**: 클러스터의 Stampede 오토스케일링 모드를 활성화합니다.
 - **선행 조건**: 클러스터 상태가 `ACTIVE`여야 하며, `stampede_enabled=true`인 agent 노드그룹(유효한 flavor_id 및 min_size <= node_count <= max_size)이 최소 1개 이상 존재해야 합니다. 노드그룹 `flavor_id`는 요청 프로젝트 scope의 Nova 조회로 검증하므로 프로젝트에 공유된 private flavor(예: GPU passthrough)도 허용되고, 보이지 않는 flavor는 `422`입니다. `image_id`는 `k3s.server_image` 정책(public/community image)을 따릅니다. 노드그룹 생성·수정(`POST`/`PATCH /v1/clusters/{id}/nodegroups`)도 같은 규칙을 적용합니다.
+- **Resource authority**: active control credential이 없으면 409로 거부합니다(legacy cluster는 먼저 재인가). planner와 job은 credential owner의 현재 scale capability를 재검증하며 `reauthorization_required`/`authority_revoked` 차단은 다른 identity로 우회하지 않습니다.
 - **응답 (200 OK - `StampedeMutationResponse`)**:
   ```json
   {
@@ -252,6 +290,7 @@ LOG_LEVEL=DEBUG drover-worker
   ```
 - `ready_count`는 K3s Ready 수이고 GPU-ready 수가 아닙니다. `capacity.allocatable.gpu`, `stampede_state.ready_nodes`/`failed_nodes` 및 최종 operation 상태를 함께 확인합니다. `tracked_count`는 DB 추적 row 수입니다.
 - `quota_state.allowed`는 admission 결과일 뿐, 현재 Nova quota/GPU 호스트 여유를 보장하지 않습니다. `blocked_reasons`는 Pending Pod 분류이고 flavor/cooldown/min-max 등 결정 차단은 `last_blocked_reason`에 기록합니다.
+- GPU admission URL이 설정되면 planner 판정과 별도로 **각 새 native GPU worker create 전** admission을 재검사합니다. Afterglow provisioning intents는 제거됐고 Nova/Cinder 생성은 Drover가 bound authority로 직접 실행합니다. live-count admission은 capacity reservation이 아니며 denial/unavailable은 fail closed 합니다. URL 미설정이면 native Nova quota를 따릅니다.
 - 증설 실패 사유는 Node가 Ready가 되지 않았으면 `node_not_ready`, Ready 이후 GPU allocatable이 요청보다 부족하면 `gpu_not_allocatable`입니다. 부분 VM 생성은 `provision_failed`가 우선하고, 여러 worker 중 join 실패가 있으면 GPU 부족보다 우선합니다.
 
 ### `GET /v1/clusters/{cluster_id}/stampede/events`
@@ -355,9 +394,9 @@ Drover API는 K3s 클러스터 내부 Control Plane과 통신하여 테넌트용
 
 #### 오퍼레이션 상태(Status) 및 종류(Kinds) 정의
 - **Status**: `QUEUED`, `RUNNING`, `WAITING_CALLBACK`, `SUCCEEDED`, `FAILED`, `CANCELLED`
-- **Kinds**: `create`, `scale`, `nodegroup_reconcile`, `delete`, `rotate_certificates`, `reconcile`
+- **Kinds**: `create`, `scale`, `nodegroup_reconcile`, `delete`, `rotate_certificates`, `reconcile`, `reauthorize`
 
-> 생성은 외부 멱동성 키와 operation ID를 반환하는 SSE 계약을 제공합니다. 스케일·삭제·노드그룹 변경도 Worker Job으로 큐잉되지만, 현재 해당 HTTP 응답에서 operation ID를 반환하지 않습니다. 이들은 클러스터/노드그룹의 후속 상태 조회로 완료를 확인해야 합니다.
+> 생성은 외부 멱동성 키와 operation ID를 반환하는 SSE 계약을 제공합니다. durable 스케일·DELETE·노드그룹 변경의 현재 HTTP 응답은 operation ID를 반환하지 않으므로 후속 상태로 완료를 확인합니다. 재인가는 202에 operation ID를 반환합니다. 현재 tenant delete-async는 직접 caller-connection SSE이며 durable operation 계약의 예외입니다.
 
 ### `GET /v1/operations/{operation_id}/events`
 - **설명**: 오퍼레이션의 시퀀스별 상세 이벤트 로그 조회.
@@ -379,6 +418,7 @@ Policy `drover:admin` (시스템 관리자 전용) 인증이 요구되는 관리
 * **`GET /v1/admin/clusters/{cluster_id}/ca-certificate`**: CA 다운로드
 * **`GET /v1/admin/clusters/{cluster_id}/certificate-expiry`**: 인증서 만료 조회 (kubeconfig CA/클라이언트 + `api_address` URL의 host/port, 없으면 `server_ip:6443` TLS 프로브; 프로브 실패 시 `server_via_tls=[]`)
 * **`POST /v1/admin/clusters/{cluster_id}/rotate-certs`**: 인증서 강제 순환 (SSE 스트림). 사용자 경로와 같은 클러스터별 Redis 회전 락을 사용하므로 진행 중인 회전이 있으면 `409`를 반환하며, 사용자 경로의 상태·`master_count≥3` 제한은 적용하지 않음. `last_rotation_initiated_by`는 `system-admin`으로 기록
+- admin scale/delete도 requester trust가 필요하며 caller token을 target cluster project에 scope해야 합니다. system-admin 인증이 tenant-manager/service fallback을 허용하지 않습니다.
 * **`GET /v1/admin/cluster-templates`**: 전체 템플릿 관리자 조회
 * **`GET /v1/admin/managed-resources`**:
   - Drover가 생성하고 관리 중인 OpenStack 클라우드 실제 자원(`ManagedOpenStackResource`) 목록 조회.
@@ -409,6 +449,7 @@ Policy `drover:admin` (시스템 관리자 전용) 인증이 요구되는 관리
 - **보안 제한**:
   - Kolla Reverse Proxy 및 API 백엔드 레벨에서 `drover_callback_allowed_cidrs` (CIDR 허용목록) 외부의 소스 IP 요청을 즉시 거부 (403 Forbidden).
   - 30분 만료 또는 1회 콜백 성공 후 Redis 토큰 즉시 삭제(`GETDEL`).
+  - callback은 create operation의 active delegation을 후속 HA/agent job과 HA Octavia connection에 연결하며 새 authority를 부여하지 않습니다. delegation 없는/revoked/만료된 worker mutation은 terminal입니다. HA callback의 LB-member 예외는 현재 warning으로 기록하고 join-count/후속 enqueue를 계속할 수 있으므로 callback HTTP/operation을 즉시 실패 처리한다고 보장하지 않습니다; 다른 identity connection으로 우회하지 않습니다.
 - **요청 바디 (`K3sCallbackRequest`)**:
   ```json
   {

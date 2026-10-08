@@ -24,6 +24,9 @@ def _response(status_code=200, *, payload=None, text=""):
 # `body` is the expected JSON body kwarg (None when the call carries none); `params` is the
 # expected query-string kwarg (None when the call carries no filters).
 JSON_METHOD_TABLE = [
+    ("cluster_authorization", ("cluster-1",), {}, "GET", "/v1/clusters/cluster-1/authorization", None, None),
+    ("reauthorize_cluster", ("cluster-1",), {}, "POST", "/v1/clusters/cluster-1/authorization", None, None),
+    ("retire_cluster_credentials", ("cluster-1",), {}, "POST", "/v1/clusters/cluster-1/authorization/retire", None, None),
     ("clusters", (), {}, "GET", "/v1/clusters", None, None),
     ("clusters", (), {"include_deleted": True}, "GET", "/v1/clusters", None, {"include_deleted": True}),
     ("get_cluster", ("cluster-1",), {}, "GET", "/v1/clusters/cluster-1", None, None),

@@ -7,6 +7,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("callback_delegation", "credential_retirement")
+
+
 from drover.models.schemas import CreateK3sClusterRequest
 
 # ---------------------------------------------------------------------------
@@ -229,7 +232,7 @@ async def test_handle_ha_joiner_adds_lb_member_and_triggers_agents():
             "drover.services.store.get_cluster_node_token",
             new=AsyncMock(return_value="K10abc::server:xyz"),
         ) as get_node_token,
-        patch("drover.services.keystone.get_project_manager_connection") as mock_conn,
+        patch("drover.services.execution.open_connection") as mock_conn,
         patch("drover.services.octavia.add_member") as mock_add,
         patch("drover.api.callback._jobs_svc.enqueue_job", new=AsyncMock()) as enqueue_job,
     ):
@@ -272,7 +275,7 @@ async def test_handle_ha_joiner_no_agents_if_not_all_joined():
     with (
         patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
         patch("drover.services.store.incr_ha_join_count", new=AsyncMock(return_value=1)),
-        patch("drover.services.keystone.get_project_manager_connection") as mock_conn,
+        patch("drover.services.execution.open_connection") as mock_conn,
         patch("drover.services.octavia.add_member"),
         patch("drover.api.callback._jobs_svc.enqueue_job", new=AsyncMock()) as enqueue_job,
     ):
@@ -425,7 +428,7 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
 
     with (
         patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
-        patch("drover.services.keystone.get_project_manager_connection", return_value=mock_conn),
+        patch("drover.services.execution.open_connection", return_value=mock_conn),
         patch("drover.services.octavia.add_member", return_value=mock_mem1),
         patch(
             "drover.services.octavia.get_load_balancer",
@@ -476,7 +479,7 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
             "drover.services.store.get_cluster_node_token",
             new=AsyncMock(return_value="K10node::token123"),
         ),
-        patch("drover.services.keystone.get_project_manager_connection", return_value=mock_conn),
+        patch("drover.services.execution.open_connection", return_value=mock_conn),
         patch("drover.services.octavia.add_member", side_effect=[mock_mem2, mock_mem3]),
         patch("drover.services.operations.get_active_operation", new=AsyncMock(return_value=MagicMock(id=op_id))),
         patch("drover.api.callback._jobs_svc.enqueue_job", new=AsyncMock()),
@@ -583,7 +586,7 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
         patch("drover.services.neutron.wait_port_deleted", return_value=None),
         patch("drover.services.neutron.delete_security_group_rule", return_value=None),
         patch("drover.services.neutron.delete_security_group_safe", return_value=None),
-        patch("drover.services.keystone.delete_app_credential", AsyncMock()),
+        patch("drover.services.cluster_authority.retire_remaining_for_deleted_cluster", AsyncMock(return_value=0)),
         patch("drover.services.kube.delete_k8s_nodes", AsyncMock()),
         patch("drover.services.store.delete_cluster_record", AsyncMock()),
         patch("drover.services.operations.append_operation_event", AsyncMock()),

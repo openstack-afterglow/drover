@@ -9,7 +9,7 @@ from typing import Any
 import openstack.connection
 from openstack.exceptions import NotFoundException, ResourceNotFound
 
-from drover.services import inventory, keystone, operations, store
+from drover.services import cluster_authority, execution, inventory, keystone, operations, store
 
 _logger = logging.getLogger("drover.reconciliation")
 
@@ -404,6 +404,10 @@ async def reconcile_cluster(
     targets_map: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     for r in managed_resources:
+        if r.service == "keystone" and r.resource_type == "app_credential":
+            # Credential authority lives in drover_cluster_credentials; historic manager-owned rows are not
+            # readable by the cluster owner's credential and are tracked there as retiring.
+            continue
         key = (r.service, r.resource_type, r.resource_id)
         targets_map[key] = {
             "service": r.service,
@@ -420,7 +424,6 @@ async def reconcile_cluster(
         ("neutron", "security_group", cluster_dict.get("security_group_id"), "Security Group", True),
         ("octavia", "load_balancer", cluster_dict.get("api_lb_id"), "API Load Balancer", True),
         ("neutron", "floating_ip", cluster_dict.get("api_fip_id"), "API Floating IP", True),
-        ("keystone", "app_credential", cluster_dict.get("app_credential_id"), "App Credential", True),
     ]
     for svc, rtype, rid, label, req in primary_items:
         if rid:
@@ -450,11 +453,37 @@ async def reconcile_cluster(
                     "metadata": None,
                 }
 
+    for credential in await cluster_authority.active_credentials(cluster_id):
+        key = ("keystone", "app_credential", credential["app_credential_id"])
+        targets_map[key] = {
+            "service": "keystone",
+            "resource_type": "app_credential",
+            "resource_id": credential["app_credential_id"],
+            "name": f"{credential['purpose'].title()} credential g{credential['generation']}",
+            # A deleted credential means lost authority, repaired by reauthorization (ACTIVE-only), not cluster ERROR.
+            "is_required": False,
+            "metadata": None,
+        }
+
     known_resource_ids = {t["resource_id"] for t in targets_map.values()}
 
     created_conn = False
     if conn is None:
-        conn = await keystone.get_project_manager_connection(project_id)
+        try:
+            conn = await execution.open_connection(project_id)
+        except execution.ReauthorizationRequired:
+            _logger.info("Cluster %s has no resource authority; reconciliation requires reauthorization", cluster_id)
+            if operation_id:
+                await operations.append_operation_event(
+                    None, operation_id, phase="reconcile_complete",
+                    message="Reconciliation skipped: cluster requires reauthorization",
+                    payload_json={"reauthorization_required": True},
+                )
+            return {
+                "has_drift": False, "missing_count": 0, "orphan_count": 0, "mismatch_count": 0,
+                "missing": [], "orphans": [], "mismatches": [], "reconciled_at": _now().isoformat(),
+                "reauthorization_required": True,
+            }
         created_conn = True
 
     try:
@@ -658,9 +687,12 @@ async def schedule_worker_reconciliations(max_per_project: int = 2) -> list[str]
         for op in active_ops:
             clusters_with_active_jobs.add(op.cluster_id)
 
+        # Continuous reconciliation runs only under a reauthorized cluster's control credential.
+        authorized = await cluster_authority.authorized_cluster_ids(session)
         clusters_by_project: dict[str, list[K3sCluster]] = defaultdict(list)
         for c in clusters:
-            clusters_by_project[c.project_id].append(c)
+            if c.id in authorized:
+                clusters_by_project[c.project_id].append(c)
 
         for project_id, proj_clusters in clusters_by_project.items():
             current_active = project_active_reconcile_count[project_id]

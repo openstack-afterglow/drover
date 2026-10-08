@@ -23,7 +23,7 @@ def fixed_key(monkeypatch):
     [
         (crypto.encrypt_kubeconfig, crypto.decrypt_kubeconfig, "apiVersion: v1\nkind: Config\n"),
         (crypto.encrypt_node_token, crypto.decrypt_node_token, "K10secret::server:value"),
-        (crypto.encrypt_manager_password, crypto.decrypt_manager_password, "manager-secret"),
+        (crypto.encrypt_app_credential_secret, crypto.decrypt_app_credential_secret, "credential-secret"),
     ],
 )
 def test_drover_crypto_round_trip(encrypt, decrypt, value, fixed_key):

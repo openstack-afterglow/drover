@@ -11,12 +11,14 @@ import time
 import websockets
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 
-from drover.auth import get_os_conn, get_token_info
+from drover.auth import get_os_conn, get_token_info, validate_token
+from drover.policy import authorize_workload_namespace
 from drover.services import cloud_shell as k3s_cloud_shell
 from drover.services import kube as k3s_kube
 from drover.services import store as k3s_cluster
 from drover.services.activity import rec
 from drover.services.cache import _get_redis
+from drover.services.credentials import workload_namespace
 from drover.services.errors import K3sApiError
 
 router = APIRouter()
@@ -35,6 +37,7 @@ async def create_shell_ticket(
 ):
     """Cloud Shell WebSocket 연결용 일회용 티켓 발급."""
     pid = conn._afterglow_project_id
+    authorize_workload_namespace(workload_namespace(pid, token_info["user_id"]), token_info)
     cluster = await k3s_cluster.get_cluster(pid, cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
@@ -84,17 +87,43 @@ async def shell_ws(
     project_id: str = info["project_id"]
     user_id: str = info["user_id"]
 
+    # Tickets carry no authority: revalidate the original token and its scope.
     try:
-        pod = await k3s_cloud_shell.ensure_session(cluster_id, user_id, project_id=project_id)
+        token_info = await asyncio.to_thread(validate_token, info["token"])
+    except Exception:
+        await websocket.close(code=4401, reason="invalid or expired Keystone token")
+        return
+    if token_info.get("project_id") != project_id or token_info.get("user_id") != user_id:
+        await websocket.close(code=4403, reason="principal mismatch")
+        return
+    try:
+        authorize_workload_namespace(workload_namespace(project_id, user_id), token_info)
+        cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
+        if not cluster:
+            raise HTTPException(404, "Cluster not found")
+        if cluster.get("status") != "ACTIVE":
+            raise HTTPException(409, "Cluster is not ACTIVE")
+        pod = await k3s_cloud_shell.ensure_session(cluster_id, token_info, project_id=project_id)
     except (HTTPException, K3sApiError) as e:
         try:
             await websocket.send_bytes(b"\x02" + f"\r\n\x1b[31m{e.detail}\x1b[0m\r\n".encode())
-            await websocket.close(code=4500, reason=str(e.detail))
+            code = 4403 if e.status_code == 403 else 4404 if e.status_code == 404 else 4500
+            await websocket.close(code=code, reason=str(e.detail))
         except Exception:
             pass
         return
 
+    session_owned = False
     try:
+        shell_pod = await k3s_kube.get_pod(
+            cluster_id, k3s_cloud_shell.SHELL_NAMESPACE, pod, project_id=project_id,
+        )
+        annotations = (shell_pod or {}).get("metadata", {}).get("annotations", {})
+        if annotations.get("drover.io/user-id") != user_id or annotations.get("drover.io/project-id") != project_id:
+            raise HTTPException(403, "Shell pod principal mismatch")
+        session_owned = True
+        authorize_workload_namespace(annotations.get("drover.io/workload-namespace", ""), token_info)
+        expires_at = float(annotations["drover.io/credential-expiry"])
         async with k3s_kube._kube_ws_params(cluster_id, project_id=project_id) as (ssl_ctx, ws_url):
             exec_url = (
                 f"{ws_url}/api/v1/namespaces/{k3s_cloud_shell.SHELL_NAMESPACE}"
@@ -112,9 +141,11 @@ async def shell_ws(
                 ping_timeout=10,
                 open_timeout=30,
             ) as backend:
-                await _proxy(websocket, backend)
+                await _proxy(websocket, backend, expires_at=expires_at)
     except WebSocketDisconnect:
         pass
+    except HTTPException as e:
+        await websocket.close(code=4403, reason=e.detail)
     except Exception as e:
         _logger.warning("cloud shell proxy error (cluster=%s user=%s): %s", cluster_id, user_id[:8], e)
         try:
@@ -122,13 +153,14 @@ async def shell_ws(
         except Exception:
             pass
     finally:
-        asyncio.create_task(
-            _gc_pod(cluster_id, user_id, project_id),
-            name=f"shell-gc-{user_id[:8]}",
-        )
+        if session_owned:
+            asyncio.create_task(
+                _gc_pod(cluster_id, pod, project_id),
+                name=f"shell-gc-{user_id[:8]}",
+            )
 
 
-async def _proxy(client: WebSocket, backend) -> None:
+async def _proxy(client: WebSocket, backend, *, expires_at: float) -> None:
     """양방향 프록시.
 
     K8s v4.channel.k8s.io 프레이밍:
@@ -140,7 +172,10 @@ async def _proxy(client: WebSocket, backend) -> None:
 
     async def watchdog() -> None:
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(min(30, max(0, expires_at - time.time())))
+            if time.time() >= expires_at:
+                await client.close(code=4401, reason="session credentials expired")
+                return
             if time.monotonic() - last_activity > _IDLE_TIMEOUT:
                 _logger.info("cloud shell idle timeout")
                 try:
@@ -186,22 +221,18 @@ async def _proxy(client: WebSocket, backend) -> None:
     wd = asyncio.create_task(watchdog())
     b2k = asyncio.create_task(browser_to_kube())
     k2b = asyncio.create_task(kube_to_browser())
-    done, pending = await asyncio.wait([b2k, k2b], return_when=asyncio.FIRST_COMPLETED)
-    wd.cancel()
-    for t in pending:
-        t.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
-
-
-async def _gc_pod(cluster_id: str, user_id: str, project_id: str) -> None:
-    """WS 종료 후 pod 삭제 (best-effort)."""
+    tasks = (wd, b2k, k2b)
     try:
-        await k3s_kube.delete_pod(
-            cluster_id,
-            k3s_cloud_shell.SHELL_NAMESPACE,
-            k3s_cloud_shell.pod_name(user_id),
-            project_id=project_id,
-        )
-        _logger.info("cloud shell pod deleted (user=%s)", user_id[:8])
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _gc_pod(cluster_id: str, pod: str, project_id: str) -> None:
+    """Remove only this connection's pod and Secret, never a newer session."""
+    try:
+        await k3s_cloud_shell.delete_session(cluster_id, pod, project_id=project_id)
     except Exception as e:
-        _logger.warning("cloud shell pod GC failed: %s", e)
+        _logger.warning("cloud shell session GC failed: %s", e)

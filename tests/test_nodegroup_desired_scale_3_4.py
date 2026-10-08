@@ -140,7 +140,7 @@ async def test_reconcile_nodegroup_vms_nova_tags_convergence():
     mock_conn = MagicMock()
     with (
         patch("drover.services.nodegroup.get_nodegroup", new=AsyncMock(return_value=ng)),
-        patch("drover.services.keystone.get_project_manager_connection", return_value=mock_conn),
+        patch("drover.services.execution.open_connection", return_value=mock_conn),
         patch("drover.services.nova.observe_server", side_effect=[mock_server_active, None]),
         patch("drover.services.nodegroup.set_nodegroup_count", new=AsyncMock()) as set_count,
     ):
@@ -159,7 +159,7 @@ async def test_nodegroup_reconcile_nova_failure_preserves_desired_count():
     conn = MagicMock()
     with (
         patch("drover.services.nodegroup.get_nodegroup", new=AsyncMock(return_value=ng)),
-        patch("drover.services.keystone.get_project_manager_connection", new=AsyncMock(return_value=conn)),
+        patch("drover.services.execution.open_connection", new=AsyncMock(return_value=conn)),
         patch("drover.services.nova.observe_server", side_effect=RuntimeError("Nova unavailable")),
         patch("drover.services.nodegroup.set_nodegroup_count", new=AsyncMock()) as set_count,
     ):
@@ -176,7 +176,7 @@ async def test_nodegroup_reconcile_error_worker_still_consumes_capacity():
     server = MagicMock(status="ERROR")
     with (
         patch("drover.services.nodegroup.get_nodegroup", new=AsyncMock(return_value=ng)),
-        patch("drover.services.keystone.get_project_manager_connection", new=AsyncMock(return_value=conn)),
+        patch("drover.services.execution.open_connection", new=AsyncMock(return_value=conn)),
         patch("drover.services.nova.observe_server", return_value=server),
         patch("drover.services.nodegroup.set_nodegroup_count", new=AsyncMock()) as set_count,
     ):

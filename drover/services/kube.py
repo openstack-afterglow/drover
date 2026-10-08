@@ -48,6 +48,24 @@ def _make_ssl_context(cert_pem: bytes, key_pem: bytes) -> ssl.SSLContext:
     return ctx
 
 
+def _verified_server_context(kubeconfig_yaml: str, cert_pem: bytes, key_pem: bytes, server_url: str) -> ssl.SSLContext:
+    """Authenticate the issuance provider with the stored CA and server hostname."""
+    from urllib.parse import urlsplit
+
+    endpoint = urlsplit(server_url)
+    if endpoint.scheme != "https" or not endpoint.hostname or endpoint.username or endpoint.password:
+        raise K3sApiError(502, "Credential issuance requires an authenticated HTTPS provider")
+    config = yaml.safe_load(kubeconfig_yaml)
+    ca_pem = base64.b64decode(config["clusters"][0]["cluster"]["certificate-authority-data"], validate=True)
+    if not ca_pem:
+        raise K3sApiError(502, "Credential issuance requires a stored server CA")
+    ctx = _make_ssl_context(cert_pem, key_pem)
+    ctx.load_verify_locations(cadata=ca_pem.decode("ascii"))
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
+    return ctx
+
+
 async def delete_k8s_node(cluster_id: str, node_name: str) -> bool:
     """K8s API로 노드 삭제.
 
@@ -96,11 +114,12 @@ async def delete_k8s_nodes(cluster_id: str, node_names: list[str]) -> None:
 
 
 @contextlib.asynccontextmanager
-async def _kube_client(cluster_id: str, *, project_id: str | None = None):
+async def _kube_client(cluster_id: str, *, project_id: str | None = None, verify_server: bool = False):
     """K8s API 클라이언트 컨텍스트 매니저.
 
     project_id 가 주어지면 멀티테넌시 격리를 위해 `get_kubeconfig` 사용,
     없으면 관리자/내부 작업용 `get_kubeconfig_admin` 사용.
+    verify_server enables CA and hostname verification for credential issuance.
     """
     if project_id is not None:
         kubeconfig_yaml = await k3s_db.get_kubeconfig(project_id=project_id, cluster_id=cluster_id)
@@ -109,7 +128,10 @@ async def _kube_client(cluster_id: str, *, project_id: str | None = None):
     if not kubeconfig_yaml:
         raise K3sApiError(502, "kubeconfig 를 찾을 수 없습니다 (클러스터 미준비)")
     cert_pem, key_pem, server_url = _parse_kubeconfig(kubeconfig_yaml)
-    ssl_ctx = _make_ssl_context(cert_pem, key_pem)
+    ssl_ctx = (
+        _verified_server_context(kubeconfig_yaml, cert_pem, key_pem, server_url)
+        if verify_server else _make_ssl_context(cert_pem, key_pem)
+    )
     async with httpx.AsyncClient(verify=ssl_ctx, timeout=15.0) as client:
         yield client, server_url
 
@@ -540,50 +562,6 @@ async def wait_pod_ready(
         if remaining <= 0:
             return False
         await _asyncio.sleep(min(2.0, remaining))
-
-
-async def get_cluster_role_binding(cluster_id: str, name: str, *, project_id: str | None = None) -> dict | None:
-    async with _kube_client(cluster_id, project_id=project_id) as (client, server_url):
-        resp = await client.get(f"{server_url}/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{name}")
-        if resp.status_code == 404:
-            return None
-        if resp.status_code != 200:
-            _raise_k8s_error(resp, f"get clusterrolebinding {name}")
-        return resp.json()
-
-
-async def create_cluster_role_binding(
-    cluster_id: str, name: str, user_name: str, role_name: str = "cluster-admin", *, project_id: str | None = None
-) -> dict:
-    body = {
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRoleBinding",
-        "metadata": {"name": name},
-        "roleRef": {
-            "apiGroup": "rbac.authorization.k8s.io",
-            "kind": "ClusterRole",
-            "name": role_name,
-        },
-        "subjects": [{"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": user_name}],
-    }
-    async with _kube_client(cluster_id, project_id=project_id) as (client, server_url):
-        resp = await client.post(f"{server_url}/apis/rbac.authorization.k8s.io/v1/clusterrolebindings", json=body)
-        if resp.status_code not in (200, 201):
-            _raise_k8s_error(resp, f"create clusterrolebinding {name}")
-        return resp.json()
-
-
-async def ensure_cluster_role_binding_for_user(
-    cluster_id: str, k8s_user: str, *, project_id: str | None = None
-) -> None:
-    crb_name = f"afterglow-shell-{k8s_user}"
-    existing = await get_cluster_role_binding(cluster_id, crb_name, project_id=project_id)
-    if not existing:
-        try:
-            await create_cluster_role_binding(cluster_id, crb_name, k8s_user, project_id=project_id)
-        except K3sApiError as e:
-            if e.status_code != 409:
-                raise
 
 
 async def create_k8s_secret(

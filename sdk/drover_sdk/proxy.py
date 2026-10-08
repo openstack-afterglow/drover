@@ -243,6 +243,18 @@ class Proxy(proxy.Proxy):
             f"/v1/clusters/{_segment(cluster_id)}/nodes/{_segment(vm_id)}/interfaces/{_segment(port_id)}",
         )
 
+    def cluster_authorization(self, cluster_id):
+        """Resource credential references and owner-revocation backlog (never secrets)."""
+        return self._json_request("GET", f"/v1/clusters/{_segment(cluster_id)}/authorization")
+
+    def reauthorize_cluster(self, cluster_id):
+        """Stage the caller's restricted credentials; poll the returned operation for guest rollout."""
+        return self._json_request("POST", f"/v1/clusters/{_segment(cluster_id)}/authorization")
+
+    def retire_cluster_credentials(self, cluster_id):
+        """Delete the caller's own superseded cluster credentials."""
+        return self._json_request("POST", f"/v1/clusters/{_segment(cluster_id)}/authorization/retire")
+
     def enable_stampede(self, cluster_id):
         return self._json_request("POST", f"/v1/clusters/{_segment(cluster_id)}/stampede/enable")
 

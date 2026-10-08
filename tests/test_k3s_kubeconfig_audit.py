@@ -19,7 +19,7 @@ def _make_cluster_record():
 
 
 @pytest.mark.asyncio
-async def test_kubeconfig_download_records_audit(client):
+async def test_kubeconfig_download_records_audit(admin_client):
     """GET /kubeconfig 시 rec(action="kubeconfig_download") 호출."""
     with (
         patch("drover.api.clusters.k3s_cluster") as mock_db,
@@ -27,7 +27,7 @@ async def test_kubeconfig_download_records_audit(client):
     ):
         mock_db.get_cluster = AsyncMock(return_value=_make_cluster_record())
         mock_db.get_kubeconfig = AsyncMock(return_value=b"apiVersion: v1\n...")
-        resp = await client.get("/v1/clusters/k3s-1/kubeconfig")
+        resp = await admin_client.get("/v1/clusters/k3s-1/kubeconfig?grade=admin")
     assert resp.status_code == 200
     mock_rec.assert_called_once()
     kwargs = mock_rec.call_args.kwargs
@@ -38,7 +38,7 @@ async def test_kubeconfig_download_records_audit(client):
 
 
 @pytest.mark.asyncio
-async def test_kubeconfig_head_does_not_record(client):
+async def test_kubeconfig_head_does_not_record(admin_client):
     """HEAD 는 보통 사전 요청 — audit 기록 안 함 (GET 시에만)."""
     with (
         patch("drover.api.clusters.k3s_cluster") as mock_db,
@@ -46,19 +46,20 @@ async def test_kubeconfig_head_does_not_record(client):
     ):
         mock_db.get_cluster = AsyncMock(return_value=_make_cluster_record())
         mock_db.get_kubeconfig = AsyncMock(return_value=b"apiVersion: v1\n...")
-        resp = await client.request("HEAD", "/v1/clusters/k3s-1/kubeconfig")
+        resp = await admin_client.request("HEAD", "/v1/clusters/k3s-1/kubeconfig")
     assert resp.status_code == 200
     mock_rec.assert_not_called()
+    mock_db.get_kubeconfig.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_kubeconfig_404_does_not_record(client):
+async def test_kubeconfig_404_does_not_record(admin_client):
     """존재하지 않는 클러스터 — audit 기록 안 함."""
     with (
         patch("drover.api.clusters.k3s_cluster") as mock_db,
         patch("drover.api.clusters.rec", new=AsyncMock()) as mock_rec,
     ):
         mock_db.get_cluster = AsyncMock(return_value=None)
-        resp = await client.get("/v1/clusters/missing/kubeconfig")
+        resp = await admin_client.get("/v1/clusters/missing/kubeconfig")
     assert resp.status_code == 404
     mock_rec.assert_not_called()

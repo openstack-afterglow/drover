@@ -110,6 +110,7 @@ async def test_repaired_cluster_health_list_route():
         "project_id": "proj-123",
         "user_id": "user-1",
         "is_system_admin": False,
+        "roles": ["reader", "drover-inventory_reader"],
     }
     with (
         patch("drover.auth.validate_token", return_value=valid_token),
@@ -121,28 +122,6 @@ async def test_repaired_cluster_health_list_route():
             res_auth = await client.get("/v1/clusters/health", headers=headers)
             assert res_auth.status_code == 200
             assert res_auth.json() == []
-
-
-@pytest.mark.asyncio
-async def test_kubeconfig_head_operation():
-    """Verify HEAD /v1/clusters/{cluster_id}/kubeconfig returns 200 with empty body when ready."""
-    valid_token = {
-        "project_id": "proj-123",
-        "user_id": "user-1",
-        "is_system_admin": False,
-    }
-    cluster_rec = {"id": "c1", "name": "mycluster", "status": "ACTIVE"}
-    with (
-        patch("drover.auth.validate_token", return_value=valid_token),
-        patch("drover.api.clusters.k3s_cluster.get_cluster", new=AsyncMock(return_value=cluster_rec)),
-        patch("drover.api.clusters.k3s_cluster.get_kubeconfig", new=AsyncMock(return_value=b"apiVersion: v1")),
-    ):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            headers = {"X-Auth-Token": "valid-token"}
-            res = await client.request("HEAD", "/v1/clusters/c1/kubeconfig", headers=headers)
-            assert res.status_code == 200
-            assert res.content == b""
-
 
 def test_liveness_and_readiness_schema():
     schema = app.openapi()
@@ -200,3 +179,16 @@ def test_operations_and_admin_endpoints_require_keystone_token_and_valid_schema(
         op = paths[path][method]
         assert op.get("security") == [{"KeystoneToken": []}], f"KeystoneToken missing for {method.upper()} {path}"
         assert "200" in op.get("responses", {}), f"200 response missing for {method.upper()} {path}"
+
+
+@pytest.mark.parametrize("path,method,status,response_model", [
+    ("/v1/clusters/{cluster_id}/authorization", "get", "200", "ClusterAuthorizationStatus"),
+    ("/v1/clusters/{cluster_id}/authorization", "post", "202", "ClusterReauthorizationResponse"),
+    ("/v1/clusters/{cluster_id}/authorization/retire", "post", "200", "ClusterCredentialRetireResponse"),
+])
+def test_resource_authorization_routes_have_typed_authenticated_contracts(path, method, status, response_model):
+    operation = app.openapi()["paths"][path][method]
+    assert operation.get("security") == [{"KeystoneToken": []}]
+    schema = operation["responses"][status]["content"]["application/json"]["schema"]
+    assert schema["$ref"].endswith(response_model)
+

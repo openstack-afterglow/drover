@@ -32,7 +32,7 @@ from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from drover.config import get_settings
-from drover.crypto import decrypt_kubeconfig, decrypt_manager_password, decrypt_node_token
+from drover.crypto import decrypt_kubeconfig, decrypt_node_token
 
 
 class CutoverError(RuntimeError):
@@ -539,23 +539,14 @@ def _verify_ciphertext(
                 raise CutoverError("Drover cluster node_token ciphertext cannot be decrypted with the configured key") from exc
             verified_any = True
 
+    # Legacy manager rows are preserved only as an operator cleanup inventory; Drover never decrypts or uses them.
     source_creds = source_tables.get("project_manager_credentials", [])
     dest_creds = {row["project_id"]: row for row in destination_tables.get("project_manager_credentials", [])}
     for sample in source_creds:
-        proj_id = sample["project_id"]
-        dest_row = dest_creds.get(proj_id, {})
         mgr_pw_ct = sample.get("encrypted_password")
-        if isinstance(mgr_pw_ct, str) and mgr_pw_ct.strip():
-            copied = dest_row.get("encrypted_password")
-            if copied != mgr_pw_ct:
-                raise CutoverError("Drover project manager password ciphertext was not copied byte-identically")
-            try:
-                decrypt_manager_password(mgr_pw_ct)
-            except Exception as exc:
-                raise CutoverError(
-                    "Drover project manager password ciphertext cannot be decrypted with the configured key"
-                ) from exc
-            verified_any = True
+        copied = dest_creds.get(sample["project_id"], {}).get("encrypted_password")
+        if isinstance(mgr_pw_ct, str) and mgr_pw_ct.strip() and copied != mgr_pw_ct:
+            raise CutoverError("Drover legacy manager credential row was not copied byte-identically")
 
     return verified_any
 

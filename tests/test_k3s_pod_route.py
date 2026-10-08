@@ -9,11 +9,15 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
 
+from drover.auth import get_token_info, require_token
+from drover.main import app
 from drover.services.cloudinit import generate_agent_userdata, generate_server_userdata
+from drover.services.credentials import workload_namespace
 
 _SCRIPT = "/usr/local/sbin/afterglow-k3s-pod-route.sh"
 _UNIT = "afterglow-k3s-pod-route.service"
@@ -208,3 +212,139 @@ def test_pod_route_ensure_is_idempotent_and_fails_closed(tmp_path: Path) -> None
     failed = ensure(FAIL_ADD="1")
     assert failed.returncode != 0
     assert "Pod route rule is missing" in failed.stderr
+
+
+def _pod_authority(roles: list[str], *, system_admin: bool = False) -> dict:
+    return {
+        "token": "test-token", "project_id": "test-project-123", "user_id": "pod-user",
+        "roles": roles, "is_system_admin": system_admin, "expires_at": "2099-01-01T00:00:00Z",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("roles", [
+    ["member"], ["reader"], ["reader", "member", "drover-access_user"],
+    ["reader", "drover-workloads_editor"],
+])
+async def test_pod_mutations_require_service_workload_editor(client, roles):
+    app.dependency_overrides[require_token] = lambda: _pod_authority(roles)
+    app.dependency_overrides[get_token_info] = lambda: _pod_authority(roles)
+    namespace = workload_namespace("test-project-123", "pod-user")
+    with patch("drover.api.pods.k3s_kube.delete_pod", new_callable=AsyncMock) as delete:
+        response = await client.delete(f"/v1/clusters/c/namespaces/{namespace}/pods/p")
+    assert response.status_code == 403
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("namespace", ["kube-system", "default", "afterglow-shell", workload_namespace("test-project-123", "another-user")])
+async def test_editor_cannot_mutate_system_or_other_principal_namespace(client, namespace):
+    token = _pod_authority(["member", "reader", "drover-workloads_editor"])
+    app.dependency_overrides[require_token] = lambda: token
+    app.dependency_overrides[get_token_info] = lambda: token
+    with patch("drover.api.pods.k3s_kube.delete_pod", new_callable=AsyncMock) as delete:
+        response = await client.delete(f"/v1/clusters/c/namespaces/{namespace}/pods/p")
+    assert response.status_code == 403
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("roles", "system_admin", "namespace"), [
+    (["reader", "member", "drover-workloads_editor"], False, workload_namespace("test-project-123", "pod-user")),
+    (["reader", "member", "drover-workloads_editor", "drover-access_admin"], False, "kube-system"),
+    ([], True, "kube-system"),
+])
+async def test_authorized_pod_mutation_stays_project_scoped(client, roles, system_admin, namespace):
+    token = _pod_authority(roles, system_admin=system_admin)
+    app.dependency_overrides[require_token] = lambda: token
+    app.dependency_overrides[get_token_info] = lambda: token
+    with (
+        patch("drover.api.pods.k3s_cluster.get_cluster", AsyncMock(return_value={"id": "c"})) as lookup,
+        patch("drover.api.pods.k3s_kube.delete_pod", new_callable=AsyncMock) as delete,
+        patch("drover.api.pods.rec", new_callable=AsyncMock),
+    ):
+        response = await client.delete(f"/v1/clusters/c/namespaces/{namespace}/pods/p")
+    assert response.status_code == 204
+    lookup.assert_awaited_once_with("test-project-123", "c")
+    delete.assert_awaited_once_with("c", namespace, "p", project_id="test-project-123")
+
+
+@pytest.mark.asyncio
+async def test_reader_inventory_does_not_grant_mutation(client):
+    token = _pod_authority(["reader", "drover-inventory_reader"])
+    app.dependency_overrides[require_token] = lambda: token
+    app.dependency_overrides[get_token_info] = lambda: token
+    with (
+        patch("drover.api.pods.k3s_cluster.get_cluster", AsyncMock(return_value={"id": "c"})),
+        patch("drover.api.pods.k3s_kube.list_pods", AsyncMock(return_value=[])) as listing,
+    ):
+        response = await client.get("/v1/clusters/c/namespaces/default/pods")
+    assert response.status_code == 200
+    listing.assert_awaited_once_with("c", "default", project_id="test-project-123")
+
+
+@pytest.mark.asyncio
+async def test_workload_editor_cannot_mutate_other_project_cluster(client):
+    token = _pod_authority(["reader", "member", "drover-workloads_editor"])
+    app.dependency_overrides[require_token] = lambda: token
+    app.dependency_overrides[get_token_info] = lambda: token
+    namespace = workload_namespace("test-project-123", "pod-user")
+    with (
+        patch("drover.api.pods.k3s_cluster.get_cluster", AsyncMock(return_value=None)),
+        patch("drover.api.pods.k3s_kube.delete_pod", new_callable=AsyncMock) as delete,
+    ):
+        response = await client.delete(f"/v1/clusters/c/namespaces/{namespace}/pods/p")
+    assert response.status_code == 404
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("roles", [
+    ["member"], ["reader"], ["reader", "drover-inventory_reader"],
+    ["reader", "drover-access_user"],
+])
+async def test_inventory_reader_cannot_read_pod_log_content(client, roles):
+    token = _pod_authority(roles)
+    app.dependency_overrides[require_token] = lambda: token
+    app.dependency_overrides[get_token_info] = lambda: token
+    with patch("drover.api.pods.k3s_kube.get_pod_log", new_callable=AsyncMock) as log:
+        response = await client.get("/v1/clusters/c/namespaces/default/pods/p/log")
+    assert response.status_code == 403
+    log.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("roles", "system_admin"), [
+    (["member", "reader", "drover-access_user"], False),
+    (["member", "reader", "drover-inventory_reader", "drover-access_user"], False),
+    (["member", "reader", "drover-access_admin"], False),
+    ([], True),
+])
+async def test_pod_log_requires_access_capability_not_inventory_capability(client, roles, system_admin):
+    token = _pod_authority(roles, system_admin=system_admin)
+    app.dependency_overrides[require_token] = lambda: token
+    app.dependency_overrides[get_token_info] = lambda: token
+    with (
+        patch("drover.api.pods.k3s_cluster.get_cluster", AsyncMock(return_value={"id": "c"})) as lookup,
+        patch("drover.api.pods.k3s_kube.get_pod_log", AsyncMock(return_value="workload content")) as log,
+    ):
+        response = await client.get("/v1/clusters/c/namespaces/default/pods/p/log")
+    assert response.status_code == 200
+    assert response.json()["log"] == "workload content"
+    lookup.assert_awaited_once_with("test-project-123", "c")
+    log.assert_awaited_once_with("c", "default", "p", container=None, tail_lines=200, project_id="test-project-123")
+
+
+@pytest.mark.asyncio
+async def test_access_user_cannot_read_other_project_pod_logs(client):
+    token = _pod_authority(["member", "reader", "drover-access_user"])
+    app.dependency_overrides[require_token] = lambda: token
+    app.dependency_overrides[get_token_info] = lambda: token
+    with (
+        patch("drover.api.pods.k3s_cluster.get_cluster", AsyncMock(return_value=None)) as lookup,
+        patch("drover.api.pods.k3s_kube.get_pod_log", new_callable=AsyncMock) as log,
+    ):
+        response = await client.get("/v1/clusters/c/namespaces/default/pods/p/log")
+    assert response.status_code == 404
+    lookup.assert_awaited_once_with("test-project-123", "c")
+    log.assert_not_awaited()

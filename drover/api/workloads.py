@@ -11,11 +11,12 @@ from fastapi import APIRouter, Depends
 
 from drover.auth import get_os_conn, get_token_info
 from drover.models.schemas import DeploymentInfo, ReplicaSetInfo, ScaleDeploymentRequest
+from drover.policy import require_workload_or_inventory
 from drover.services import kube as k3s_kube
 from drover.services import store as k3s_cluster
 from drover.services.activity import rec
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_workload_or_inventory)])
 
 
 def _check_cluster(cluster):

@@ -306,9 +306,9 @@ def _assign_pending_pods(
 
 
 async def _get_available_flavors(project_id: str) -> list[dict]:
-    from drover.services import keystone, nova
+    from drover.services import execution, nova
 
-    async with keystone.project_manager_connection(project_id) as conn:
+    async with execution.connection(project_id) as conn:
         raw = await asyncio.to_thread(nova.list_flavors, conn)
     return [{"id": flavor.id, "name": flavor.name, "vcpus_m": int(flavor.vcpus or 0) * 1000,
              "ram_bytes": int(flavor.ram or 0) * 1024 * 1024, "gpu": _flavor_gpu_count(flavor.extra_specs or {}),
@@ -531,7 +531,7 @@ async def _scale_down_nodegroup(
 
 async def _delete_and_track(project_id: str, cluster_id: str, payload: dict, operation_id: str | None) -> None:
     """Guard live VM deletion without blocking cleanup of confirmed-absent servers."""
-    from drover.services import autoscale, keystone, kube, nodegroup, nova
+    from drover.services import autoscale, execution, kube, nodegroup, nova
 
     ng_id = payload["nodegroup"]["id"]
     ng = await nodegroup.get_nodegroup(cluster_id, ng_id)
@@ -546,7 +546,7 @@ async def _delete_and_track(project_id: str, cluster_id: str, payload: dict, ope
         requested_ids.add(entry["vm_id"])
     live_ids = set()
     if entries:
-        async with keystone.project_manager_connection(project_id) as conn:
+        async with execution.connection(project_id) as conn:
             for vm_id in tracked_ids | requested_ids:
                 server = await asyncio.to_thread(nova.observe_server, conn, vm_id)
                 if server is not None and not nova.is_server_deleting(server):
@@ -583,7 +583,8 @@ async def _delete_and_track(project_id: str, cluster_id: str, payload: dict, ope
 
 
 async def reconcile_cluster(cluster: dict) -> None:
-    from drover.services import kube, nodegroup
+    from drover.services import execution, kube, nodegroup
+    from drover.services.cluster_authority import CAPABILITY_SCALE
 
     cluster_id = cluster.get("id") or cluster.get("cluster_id", "")
     project_id = cluster.get("project_id", "")
@@ -593,14 +594,31 @@ async def reconcile_cluster(cluster: dict) -> None:
     groups = [ng for ng in await nodegroup.list_nodegroups(cluster_id) if ng.get("stampede_enabled") and ng.get("role") == "agent" and ng.get("flavor_id")]
     if not groups:
         return
-    try:
-        pending, capacities, pods = await asyncio.gather(kube.list_unschedulable_pods(cluster_id), kube.get_node_capacity(cluster_id), kube.get_pod_resource_usage(cluster_id))
-        flavors = {item["id"]: item for item in await _get_available_flavors(project_id)}
-    except Exception:
-        _logger.warning("Stampede observation failed cluster_id=%s", cluster_id)
-        for ng in groups:
-            await _update_stampede_state(ng["id"], cluster_id, {"idle_since": {}, "last_decision": "observation_failed", "last_blocked_reason": "observation_unavailable"})
-        return
+    # Planner decisions run only under the reauthorized owner's control credential and current scale capability.
+    with execution.bound(execution.ResourceAuthority(project_id, cluster_id, CAPABILITY_SCALE)):
+        try:
+            flavors = {item["id"]: item for item in await _get_available_flavors(project_id)}
+        except execution.ExecutionAuthorityError as exc:
+            reason = "reauthorization_required" if isinstance(exc, execution.ReauthorizationRequired) else "authority_revoked"
+            for ng in groups:
+                await _update_stampede_state(ng["id"], cluster_id, {"idle_since": {}, "last_decision": "blocked", "last_blocked_reason": reason})
+            return
+        except Exception:
+            flavors = None
+        try:
+            if flavors is None:
+                raise RuntimeError("flavor observation unavailable")
+            pending, capacities, pods = await asyncio.gather(kube.list_unschedulable_pods(cluster_id), kube.get_node_capacity(cluster_id), kube.get_pod_resource_usage(cluster_id))
+        except Exception:
+            _logger.warning("Stampede observation failed cluster_id=%s", cluster_id)
+            for ng in groups:
+                await _update_stampede_state(ng["id"], cluster_id, {"idle_since": {}, "last_decision": "observation_failed", "last_blocked_reason": "observation_unavailable"})
+            return
+        await _decide(cluster_id, project_id, groups, flavors, pending, capacities, pods, settings)
+
+
+async def _decide(cluster_id: str, project_id: str, groups: list[dict], flavors: dict, pending: list[dict],
+                  capacities: list[dict], pods: list[dict], settings) -> None:
     assignments, blocked, summaries = _assign_pending_pods(pending, groups, flavors, pods, capacities, settings.drover_stampede_resource_headroom_factor)
     blocked_summary = [{"namespace": item["pod"].get("namespace"), "name": item["pod"].get("name"), "reason": item["reason"], "message": item["pod"].get("message", "")} for item in blocked]
     observed_at = time.time()

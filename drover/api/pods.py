@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Query
 
 from drover.auth import get_os_conn, get_token_info
 from drover.models.schemas import PodInfo, PodLogResponse
+from drover.policy import require_policy, require_workload_or_inventory
 from drover.services import kube as k3s_kube
 from drover.services import store as k3s_cluster
 from drover.services.activity import rec
@@ -25,7 +26,7 @@ def _check_cluster(cluster):
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
 
 
-@router.get("/{cluster_id}/namespaces/{namespace}/pods")
+@router.get("/{cluster_id}/namespaces/{namespace}/pods", dependencies=[Depends(require_workload_or_inventory)])
 async def list_pods(
     cluster_id: str,
     namespace: str,
@@ -38,7 +39,10 @@ async def list_pods(
     return [PodInfo(**item) for item in items]
 
 
-@router.delete("/{cluster_id}/namespaces/{namespace}/pods/{name}", status_code=204)
+@router.delete(
+    "/{cluster_id}/namespaces/{namespace}/pods/{name}", status_code=204,
+    dependencies=[Depends(require_workload_or_inventory)],
+)
 async def delete_pod(
     cluster_id: str,
     namespace: str,
@@ -61,7 +65,10 @@ async def delete_pod(
     )
 
 
-@router.get("/{cluster_id}/namespaces/{namespace}/pods/{name}/log")
+@router.get(
+    "/{cluster_id}/namespaces/{namespace}/pods/{name}/log",
+    dependencies=[Depends(require_policy("drover:access:get"))],
+)
 async def get_pod_log(
     cluster_id: str,
     namespace: str,

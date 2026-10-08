@@ -8,9 +8,10 @@ from sqlalchemy import case, func, select
 from drover.auth import require_token
 from drover.db import get_session_factory, is_db_available
 from drover.models.orm import K3sCluster
+from drover.policy import require_inventory
 from drover.services import store
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_inventory)])
 
 
 @router.get("/clusters")

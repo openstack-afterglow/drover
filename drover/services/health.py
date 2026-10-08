@@ -105,21 +105,28 @@ def _make_ssl_context(cert_pem: bytes, key_pem: bytes) -> ssl.SSLContext:
 
 
 async def _get_probe_ip(
-    project_id: str, server_vm_id: str | None, server_ip: str, api_fip_address: str | None = None
+    project_id: str,
+    server_vm_id: str | None,
+    server_ip: str,
+    api_fip_address: str | None = None,
+    cluster_id: str = "",
 ) -> str:
     """프로브 IP 결정: API LB FIP > Nova floating IP > private IP 순."""
     if api_fip_address:
         return api_fip_address
-    if not server_vm_id or not project_id:
+    if not server_vm_id or not project_id or not cluster_id:
         return server_ip
     try:
-        from drover.services import keystone, nova
+        from drover.services import execution, nova
+        from drover.services.cluster_authority import CAPABILITY_READ
 
-        async with keystone.project_manager_connection(project_id) as conn:
-            server = await asyncio.to_thread(nova.get_server, conn, server_vm_id)
-            for ip_info in server.ip_addresses:
-                if ip_info.type == "floating":
-                    return ip_info.addr
+        # Read-only lookup under the reauthorized cluster's control credential; no authority means private IP.
+        with execution.bound(execution.ResourceAuthority(project_id, cluster_id, CAPABILITY_READ)):
+            async with execution.connection(project_id) as conn:
+                server = await asyncio.to_thread(nova.get_server, conn, server_vm_id)
+                for ip_info in server.ip_addresses:
+                    if ip_info.type == "floating":
+                        return ip_info.addr
     except Exception:
         _logger.debug("k3s health: floating IP 조회 실패 (vm=%s), private IP 사용", server_vm_id)
     return server_ip
@@ -153,7 +160,9 @@ async def check_cluster_health(cluster: dict) -> K3sClusterHealth:
         )
 
     # 접근 가능한 IP 결정 (API LB FIP > Nova floating IP > private IP)
-    probe_ip = await _get_probe_ip(project_id, server_vm_id, server_ip, api_fip_address=api_fip_address)
+    probe_ip = await _get_probe_ip(
+        project_id, server_vm_id, server_ip, api_fip_address=api_fip_address, cluster_id=cluster_id
+    )
     base_url = f"https://{probe_ip}:6443"
 
     # kubeconfig 사전 로드 (healthz + nodes 양쪽에서 사용)

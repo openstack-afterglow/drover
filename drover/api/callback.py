@@ -9,8 +9,8 @@ from drover.config import get_settings
 from drover.middleware import get_request_id
 from drover.models.schemas import K3sCallbackRequest
 from drover.rate_limit import get_trusted_client_ip, is_ip_in_cidrs, limiter
+from drover.services import delegation, operations
 from drover.services import jobs as _jobs_svc
-from drover.services import operations
 from drover.services import store as k3s_cluster
 
 router = APIRouter()
@@ -173,6 +173,7 @@ async def k3s_callback(request: Request, req: K3sCallbackRequest):
         }
         if active_op:
             enqueue_kwargs["operation_id"] = active_op.id
+            enqueue_kwargs["delegation_id"] = await delegation.active_delegation_for_operation(None, active_op.id)
         await _jobs_svc.enqueue_job(**enqueue_kwargs)
     else:
         _logger.info("k3s cluster %s server ready, queuing provision_agents job", cluster_id)
@@ -187,6 +188,7 @@ async def k3s_callback(request: Request, req: K3sCallbackRequest):
         }
         if active_op:
             enqueue_kwargs["operation_id"] = active_op.id
+            enqueue_kwargs["delegation_id"] = await delegation.active_delegation_for_operation(None, active_op.id)
         await _jobs_svc.enqueue_job(**enqueue_kwargs)
     return {"ok": True}
 
@@ -198,8 +200,7 @@ async def _handle_ha_joiner(
     req: K3sCallbackRequest,
     source_ip: str = "unknown",
 ) -> dict:
-    from drover.services import octavia
-
+    from drover.services import execution, octavia
 
     cluster_info = await k3s_cluster.get_cluster(project_id, cluster_id)
     if not cluster_info:
@@ -211,43 +212,43 @@ async def _handle_ha_joiner(
     network_id = cluster_info.get("network_id") or ""
 
     if lb_pool_id and req.server_ip:
-        conn = None
         try:
-            from drover.services import keystone
-
-            conn = await keystone.get_project_manager_connection(project_id)
-            subnets = await asyncio.to_thread(lambda: list(conn.network.subnets(network_id=network_id)))
-            subnet_id = subnets[0].id if subnets else None
-            cluster_name = cluster_info.get("name") or cluster_id
-            member = await asyncio.to_thread(
-                octavia.add_member,
-                conn,
-                lb_pool_id,
-                req.server_ip,
-                6443,
-                subnet_id=subnet_id,
-                name=f"{cluster_name}-server{server_index}",
-            )
+            # The joiner only continues the admitted create operation; it never gains other authority.
+            create_op = await operations.get_active_operation(None, cluster_id, kind="create")
+            delegation_id = await delegation.active_delegation_for_operation(None, create_op.id if create_op else None)
+            if not delegation_id:
+                raise execution.AuthorityRevoked("No admitted create delegation remains for this HA joiner")
+            authority = execution.OperationAuthority(delegation_id, project_id, cluster_id, "bootstrap_ha")
+            with execution.bound(authority):
+                async with execution.connection(project_id) as conn:
+                    subnets = await asyncio.to_thread(lambda: list(conn.network.subnets(network_id=network_id)))
+                    subnet_id = subnets[0].id if subnets else None
+                    cluster_name = cluster_info.get("name") or cluster_id
+                    member = await asyncio.to_thread(
+                        octavia.add_member,
+                        conn,
+                        lb_pool_id,
+                        req.server_ip,
+                        6443,
+                        subnet_id=subnet_id,
+                        name=f"{cluster_name}-server{server_index}",
+                    )
             _logger.info("HA: server#%d %s added to LB pool %s", server_index, req.server_ip, lb_pool_id)
             if member and isinstance(member, dict) and "id" in member:
                 from drover.services import inventory
-                active_op = await operations.get_active_operation(None, cluster_id, kind="create")
-                op_id = active_op.id if active_op else None
+
                 await inventory.record_resource(
                     None,
                     cluster_id=cluster_id,
                     service="octavia",
                     resource_type="member",
                     resource_id=member["id"],
-                    operation_id=op_id,
+                    operation_id=create_op.id if create_op else None,
                     name=f"{cluster_name}-server{server_index}",
                     metadata={"pool_id": lb_pool_id, "role": "ha_server_member", "server_index": server_index},
                 )
         except Exception as e:
             _logger.warning("HA: failed to add server#%d to LB pool: %s", server_index, e)
-        finally:
-            if conn is not None:
-                await keystone.close_connection(conn)
     join_count = await k3s_cluster.incr_ha_join_count(cluster_id)
     _logger.info("HA: cluster %s join count: %d / %d", cluster_id, join_count, master_count - 1)
 
@@ -284,6 +285,7 @@ async def _handle_ha_joiner(
             }
             if active_op:
                 enqueue_kwargs["operation_id"] = active_op.id
+                enqueue_kwargs["delegation_id"] = await delegation.active_delegation_for_operation(None, active_op.id)
             await _jobs_svc.enqueue_job(**enqueue_kwargs)
         else:
             _logger.error("HA: cluster %s missing server_ip/node_token after HA join", cluster_id)

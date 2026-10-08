@@ -9,8 +9,9 @@ if TYPE_CHECKING:
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from drover.auth import get_os_conn, get_token_info
+from drover.auth import get_os_conn, get_token_info, require_token
 from drover.models.schemas import ConfigMapCreateRequest, ConfigMapInfo, ConfigMapWriteRequest
+from drover.policy import authorize, require_inventory, require_workload_access
 from drover.services import kube as k3s_kube
 from drover.services import store as k3s_cluster
 from drover.services.activity import rec
@@ -24,18 +25,26 @@ def _check_cluster(cluster):
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
 
 
-@router.get("/{cluster_id}/namespaces")
+@router.get("/{cluster_id}/namespaces", dependencies=[Depends(require_inventory)])
 async def list_namespaces(
     cluster_id: str,
     conn: openstack.connection.Connection = Depends(get_os_conn),
+    token_info: dict = Depends(require_token),
 ):
     project_id = conn._afterglow_project_id
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     _check_cluster(cluster)
+    scope = {"project_id": project_id}
+    if not authorize("drover:access:admin", scope, token_info, do_raise=False) and authorize(
+        "drover:workloads:write", scope, token_info, do_raise=False
+    ):
+        from drover.services.credentials import ensure_workload_namespace
+
+        return [await ensure_workload_namespace(cluster_id, token_info)]
     return await k3s_kube.list_namespaces(cluster_id, project_id=project_id)
 
 
-@router.get("/{cluster_id}/configmaps")
+@router.get("/{cluster_id}/configmaps", dependencies=[Depends(require_workload_access)])
 async def list_configmaps(
     cluster_id: str,
     namespace: str = Query(default="default"),
@@ -48,7 +57,7 @@ async def list_configmaps(
     return [ConfigMapInfo(**item) for item in items]
 
 
-@router.get("/{cluster_id}/namespaces/{namespace}/configmaps/{name}")
+@router.get("/{cluster_id}/namespaces/{namespace}/configmaps/{name}", dependencies=[Depends(require_workload_access)])
 async def get_configmap(
     cluster_id: str,
     namespace: str,
@@ -62,7 +71,7 @@ async def get_configmap(
     return ConfigMapInfo(**item)
 
 
-@router.post("/{cluster_id}/namespaces/{namespace}/configmaps", status_code=201)
+@router.post("/{cluster_id}/namespaces/{namespace}/configmaps", status_code=201, dependencies=[Depends(require_workload_access)])
 async def create_configmap(
     cluster_id: str,
     namespace: str,
@@ -95,7 +104,7 @@ async def create_configmap(
     return ConfigMapInfo(**item)
 
 
-@router.put("/{cluster_id}/namespaces/{namespace}/configmaps/{name}")
+@router.put("/{cluster_id}/namespaces/{namespace}/configmaps/{name}", dependencies=[Depends(require_workload_access)])
 async def update_configmap(
     cluster_id: str,
     namespace: str,
@@ -129,7 +138,7 @@ async def update_configmap(
     return ConfigMapInfo(**item)
 
 
-@router.delete("/{cluster_id}/namespaces/{namespace}/configmaps/{name}", status_code=204)
+@router.delete("/{cluster_id}/namespaces/{namespace}/configmaps/{name}", status_code=204, dependencies=[Depends(require_workload_access)])
 async def delete_configmap(
     cluster_id: str,
     namespace: str,

@@ -11,7 +11,7 @@ def test_owned_domains_derive_distinct_subkeys():
     domains = (
         crypto._DOMAIN_KUBECONFIG,
         crypto._DOMAIN_NODE_TOKEN,
-        crypto._DOMAIN_MANAGER_PASSWORD,
+        crypto._DOMAIN_CLUSTER_APP_CREDENTIAL,
     )
     subkeys = {aesgcm.derive_encryption_subkey(_KEY, domain) for domain in domains}
     assert len(subkeys) == len(domains)

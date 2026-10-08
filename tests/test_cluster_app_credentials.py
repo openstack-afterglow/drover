@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
-from drover.services import deletion, keystone, provisioner
+from drover.services import deletion, execution, provisioner
 from drover.services.plugins.barbican_kms import BarbicanKmsPlugin
 from drover.services.plugins.manila_csi import ManilaCsiPlugin
 from drover.services.plugins.occm import OccmPlugin
@@ -94,47 +94,24 @@ def test_2_sql_stores_id_only():
     assert not hasattr(cluster, "app_cred_secret")
 
 
-@pytest.mark.asyncio
-async def test_manager_bootstrap_uses_admin_project_scope():
-    """The service user must not be password-scoped directly to a tenant project."""
-    settings = _mock_settings()
-    admin_conn = MagicMock()
-    admin_factory = MagicMock(return_value=admin_conn)
-    bootstrap = MagicMock(return_value=("manager-user", "manager-name", "manager-password"))
-
-    with (
-        patch("drover.services.store.get_manager_credentials", new=AsyncMock(return_value=None)),
-        patch("drover.services.store.save_manager_credentials", new=AsyncMock()) as save_credentials,
-        patch("drover.services.keystone.get_settings", return_value=settings),
-        patch("drover.services.keystone.get_admin_project_connection", admin_factory),
-        patch("drover.services.keystone._ensure_cluster_manager_user_sync_with_admin_conn", bootstrap),
-        patch("drover.crypto.encrypt_manager_password", return_value="encrypted-password"),
-    ):
-        result = await keystone.ensure_cluster_manager_user("tenant-project")
-
-    assert result == ("manager-user", "manager-password")
-    admin_factory.assert_called_once_with()
-    bootstrap.assert_called_once_with("tenant-project", admin_conn, settings)
-    save_credentials.assert_awaited_once_with("tenant-project", "manager-user", "manager-name", "encrypted-password")
-    admin_conn.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
-async def test_project_manager_connection_always_closes():
+async def test_execution_connection_always_closes():
     conn = MagicMock()
     http_session = MagicMock()
     conn._session.session = http_session
-    with patch("drover.services.keystone.get_project_manager_connection", AsyncMock(return_value=conn)):
-        async with keystone.project_manager_connection("proj-1") as yielded:
+    with patch("drover.services.execution.open_connection", AsyncMock(return_value=conn)):
+        async with execution.connection("proj-1") as yielded:
             assert yielded is conn
     conn.close.assert_called_once_with()
     http_session.close.assert_called_once_with()
 
     conn.reset_mock()
     http_session.reset_mock()
-    with patch("drover.services.keystone.get_project_manager_connection", AsyncMock(return_value=conn)):
+    with patch("drover.services.execution.open_connection", AsyncMock(return_value=conn)):
         with pytest.raises(RuntimeError, match="boom"):
-            async with keystone.project_manager_connection("proj-1"):
+            async with execution.connection("proj-1"):
                 raise RuntimeError("boom")
     conn.close.assert_called_once_with()
     http_session.close.assert_called_once_with()
@@ -142,7 +119,7 @@ async def test_project_manager_connection_always_closes():
 
 @pytest.mark.asyncio
 async def test_3_create_failure_before_provision_call():
-    """Verify cluster create fails before Nova VM boot call if app credential acquisition fails."""
+    """Verify cluster create fails before Nova VM boot call if the admitted guest credential cannot be read."""
     conn_mock = MagicMock()
     conn_mock.compute.create_server = MagicMock()
     conn_mock.network.subnets = MagicMock(return_value=[MagicMock(id="sub-1")])
@@ -162,15 +139,16 @@ async def test_3_create_failure_before_provision_call():
         "k3s_version": "v1.28.4+k3s2",
         "os_type": "ubuntu",
         "plugin_settings": mock_s,
-        "policy_snapshot": {"k3s.octavia_ingress_floating_network": {"id": "fip-net-1"}},
+        "resource_policy_snapshot": {"k3s.octavia_ingress_floating_network": {"id": "fip-net-1"},
+                                     "k3s.volume_availability_zone": {"id": "nova"}},
     }
 
     with (
         patch("drover.config.get_settings", return_value=mock_s),
-        patch("drover.services.keystone.get_project_manager_connection", AsyncMock(return_value=conn_mock)),
+        patch("drover.services.execution.open_connection", AsyncMock(return_value=conn_mock)),
         patch(
-            "drover.services.keystone.create_app_credential_for_cluster",
-            side_effect=RuntimeError("Keystone auth failed"),
+            "drover.services.cluster_authority.active_guest_credential",
+            new=AsyncMock(side_effect=RuntimeError("Guest credential unavailable")),
         ),
         patch("drover.services.inventory.record_resource", AsyncMock()),
         patch("drover.services.operations.append_operation_event", AsyncMock()),
@@ -178,7 +156,7 @@ async def test_3_create_failure_before_provision_call():
         patch("drover.services.store.update_cluster_status", AsyncMock()),
         patch("drover.services.cinder.create_volume_from_image", MagicMock(return_value=MagicMock(id="vol-1"))),
     ):
-        with pytest.raises(RuntimeError, match="Keystone auth failed"):
+        with pytest.raises(RuntimeError, match="Guest credential unavailable"):
             await provisioner.create_cluster_job(
                 project_id="proj-1",
                 cluster_id="cluster-123",
@@ -218,8 +196,8 @@ def test_4_kubernetes_secret_rendered_from_app_credential():
 
 
 @pytest.mark.asyncio
-async def test_5_delete_revokes_app_credential():
-    """Verify deleting a cluster revokes its recorded Keystone application credential."""
+async def test_5_delete_retires_remaining_credentials():
+    """Deleting a cluster retires credentials for owner revocation without creator authority."""
     cluster_dict = {
         "id": "c-123",
         "project_id": "proj-1",
@@ -227,12 +205,12 @@ async def test_5_delete_revokes_app_credential():
         "app_credential_id": "appcred-id-999",
     }
 
-    mock_ks_delete = AsyncMock()
+    mock_ks_delete = AsyncMock(return_value=1)
 
     with (
         patch("drover.services.inventory.list_managed_resources", AsyncMock(return_value=[])),
         patch("drover.services.inventory.mark_resource_deleted", AsyncMock()),
-        patch("drover.services.keystone.delete_app_credential", mock_ks_delete),
+        patch("drover.services.cluster_authority.retire_remaining_for_deleted_cluster", mock_ks_delete),
         patch("drover.services.operations.append_operation_event", AsyncMock()),
         patch("drover.services.store.update_cluster_status", AsyncMock()),
         patch("drover.services.store.delete_cluster_record", AsyncMock()),
@@ -244,4 +222,4 @@ async def test_5_delete_revokes_app_credential():
                 MagicMock(), "proj-1", cluster_dict, token_info=None, operation_id="op-1"
             )
         ]
-        mock_ks_delete.assert_called_once_with("proj-1", "appcred-id-999")
+        mock_ks_delete.assert_awaited_once_with("c-123", "proj-1", "appcred-id-999")

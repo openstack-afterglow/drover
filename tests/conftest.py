@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
-from unittest.mock import MagicMock
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock
 
 os.environ.setdefault("DROVER_KUBECONFIG_ENCRYPTION_KEY", "0123456789abcdef" * 4)
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/7")
@@ -12,7 +14,8 @@ import fakeredis.aioredis
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from drover.auth import get_os_conn, get_token_info, require_token
+from drover.api.clusters import limiter as clusters_limiter
+from drover.auth import _get_admin_ks_session, get_os_conn, get_token_info, require_token
 from drover.config import get_settings
 from drover.main import app
 from drover.rate_limit import limiter
@@ -53,14 +56,15 @@ def make_token_info(*, roles: list[str], is_system_admin: bool = False) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def _reset_settings_and_rate_limit():
+def _reset_settings_and_rate_limit(monkeypatch):
     get_settings.cache_clear()
-    try:
-        limiter._storage.reset()
-    except Exception:
-        pass
+    _get_admin_ks_session.cache_clear()
+    for current in (limiter, clusters_limiter):
+        monkeypatch.setattr(current, "enabled", False)
+        current._storage.reset()
     yield
     get_settings.cache_clear()
+    _get_admin_ks_session.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -103,7 +107,7 @@ async def _client_for(mock_conn, *, roles: list[str], is_system_admin: bool = Fa
 
 @pytest.fixture
 async def client(mock_conn):
-    async with await _client_for(mock_conn, roles=["member"]) as test_client:
+    async with await _client_for(mock_conn, roles=["member", "reader", "drover-inventory_reader", "drover-access_user", "drover-clusters_editor", "drover-workloads_editor", "drover-clusters_admin", "drover-access_admin"]) as test_client:
         yield test_client
     app.dependency_overrides.clear()
 
@@ -120,3 +124,44 @@ async def non_admin_client(mock_conn):
     async with await _client_for(mock_conn, roles=["member"]) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def admitted_authority(monkeypatch):
+    """Fake only Keystone admission for API tests; scope and policy guards still run."""
+    from drover.services import cluster_authority, delegation
+
+    @contextlib.asynccontextmanager
+    async def admission(token_info, *, project_id, cluster_id, action):
+        if token_info.get("project_id") != project_id:
+            raise delegation.DelegationDenied("Requester token belongs to another project")
+        yield delegation.AdmittedDelegation(
+            id="delegation-1", project_id=project_id, cluster_id=cluster_id, action=action,
+            trust_id="trust-1", trustor_user_id=token_info["user_id"], trustee_user_id="drover-service",
+            role_ids=["member-id"], role_names=["member"], expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+        )
+
+    async def issue(conn, token_info, *, purposes, **scope):
+        return [cluster_authority.IssuedCredential(
+            purpose=purpose, app_credential_id=f"credential-{purpose}", owner_user_id=token_info["user_id"],
+            role_ids=["member-id"], role_names=["member"], secret="credential-secret-123",
+        ) for purpose in purposes]
+
+    monkeypatch.setattr(delegation, "admission", admission)
+    monkeypatch.setattr(cluster_authority, "issue", issue)
+    return "delegation-1"
+
+
+@pytest.fixture
+def credential_retirement(monkeypatch):
+    """Keep cloud-deletion tests independent of credential persistence (covered separately)."""
+    monkeypatch.setattr("drover.services.cluster_authority.retire_owned", AsyncMock(return_value=[]))
+    monkeypatch.setattr("drover.services.cluster_authority.retire_remaining_for_deleted_cluster",
+                        AsyncMock(return_value=0))
+
+
+@pytest.fixture
+def callback_delegation(monkeypatch):
+    """Callback continuations reuse the create operation's already admitted trust."""
+    monkeypatch.setattr("drover.services.delegation.active_delegation_for_operation",
+                        AsyncMock(return_value="delegation-1"))

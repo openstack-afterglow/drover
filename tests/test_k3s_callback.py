@@ -4,6 +4,9 @@ import shlex
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("callback_delegation")
+
 from httpx import ASGITransport, AsyncClient
 
 from drover.main import app

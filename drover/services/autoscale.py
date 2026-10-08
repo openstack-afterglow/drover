@@ -16,10 +16,6 @@ from drover.utils.ssh_keys import normalize_ssh_public_key
 _logger = logging.getLogger(__name__)
 
 
-class ProvisioningInProgress(RuntimeError):
-    """A claimed Afterglow intent must be retried with its existing key."""
-
-
 def _rand_suffix(n: int = 5) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
@@ -100,7 +96,7 @@ async def provision_nodegroup_vms(
     labels/taints는 cloud-init extra_agent_args로 주입.
     생성된 VM 목록 {vm_id, name}을 반환한다 (실패한 것은 포함하지 않음).
     """
-    from drover.services import cinder, inventory, keystone, nova
+    from drover.services import cinder, execution, inventory, keystone, nova
     from drover.services import cloudinit as k3s_cloudinit
     from drover.services import nodegroup as k3s_nodegroup
     from drover.services import plugins as k3s_plugins
@@ -140,20 +136,13 @@ async def provision_nodegroup_vms(
         _logger.error("provision_nodegroup_vms: creation-time resource snapshot is incomplete")
         return []
 
-    remote_provisioning = provisioning_key_prefix is not None and bool(
-        getattr(s, "drover_afterglow_provisioning_url", "")
-    )
-    conn = None
-    if not remote_provisioning:
-        conn = await keystone.get_project_manager_connection(project_id)
+    conn = await execution.open_connection(project_id)
     try:
         if (provisioning_key_prefix is None or inspect_flavor_gpu) and add_count > 0 and not gpu_required:
             # Manual nodegroups use the same explicitly selected Nova flavor.
             from drover.services import gpu
             from drover.services.stampede import _flavor_gpu_count
 
-            if conn is None:
-                conn = await keystone.get_project_manager_connection(project_id)
             flavors = await asyncio.to_thread(nova.list_flavors, conn)
             selected = next((flavor for flavor in flavors if flavor.id == flavor_id), None)
             if selected is None:
@@ -209,89 +198,6 @@ async def provision_nodegroup_vms(
                 )
                 if provisioning_key is not None:
                     agent_metadata["drover.provisioning_idempotency_key"] = provisioning_key
-                if remote_provisioning:
-                    from drover.services import afterglow as afterglow_service
-
-                    intent = await afterglow_service.create_provisioning_intent(
-                        idempotency_key=provisioning_key,
-                        project_id=project_id,
-                        cluster_id=cluster_id,
-                        nodegroup_id=nodegroup_id,
-                        name=agent_name,
-                        flavor_id=flavor_id,
-                        image_id=image_id,
-                        network_id=network_id,
-                        boot_volume_size_gb=boot_volume_size,
-                        volume_availability_zone=volume_availability_zone,
-                        security_group_id=sg_id,
-                        metadata=agent_metadata,
-                        config_drive=os_type == "fcos",
-                        settings=s,
-                    )
-                    state = intent.get("state")
-                    if state == "succeeded":
-                        result = intent
-                    elif state in {"pending", "submitting"}:
-                        userdata = k3s_cloudinit.generate_agent_userdata(
-                            cluster_name=cluster_name,
-                            k3s_version=k3s_version,
-                            server_ip=server_ip,
-                            node_token=node_token or "",
-                            primary_network_id=network_id,
-                            ssh_public_key=ssh_public_key,
-                            extra_agent_args=_agent_args,
-                            os_type=os_type,
-                            gpu_required=gpu_required,
-                        )
-                        try:
-                            result = await afterglow_service.submit_provisioning_intent(
-                                provisioning_key,
-                                userdata.data,
-                                settings=s,
-                            )
-                        except afterglow_service.ProvisioningRemoteError as exc:
-                            if exc.status_code == 409 and exc.state == "submitting" and exc.no_duplicate:
-                                raise ProvisioningInProgress(provisioning_key) from exc
-                            raise
-                    else:
-                        _logger.warning(
-                            "stampede: nodegroup %s — provisioning intent %s is %s; no local VM",
-                            nodegroup_id,
-                            provisioning_key,
-                            state or "unknown",
-                        )
-                        continue
-                    if result.get("state") != "succeeded" or not result.get("server_id") or not result.get("volume_id"):
-                        _logger.warning(
-                            "stampede: nodegroup %s — provisioning intent %s did not succeed; no local VM",
-                            nodegroup_id,
-                            provisioning_key,
-                        )
-                        continue
-                    await inventory.record_resource(
-                        None,
-                        cluster_id=cluster_id,
-                        service="cinder",
-                        resource_type="volume",
-                        resource_id=str(result["volume_id"]),
-                        name=f"{agent_name}-boot",
-                    )
-                    await inventory.record_resource(
-                        None,
-                        cluster_id=cluster_id,
-                        service="nova",
-                        resource_type="server",
-                        resource_id=str(result["server_id"]),
-                        name=agent_name,
-                    )
-                    entry = {"vm_id": str(result["server_id"]), "name": agent_name}
-                    group = await k3s_nodegroup.get_nodegroup(cluster_id, nodegroup_id)
-                    if entry["vm_id"] not in {v["vm_id"] for v in (group or {}).get("vms", [])}:
-                        await k3s_nodegroup.add_nodegroup_vms(nodegroup_id, cluster_id, [entry])
-                    new_entries.append(entry)
-                    _logger.info("stampede: nodegroup %s — agent %s 생성됨", nodegroup_id, agent_name)
-                    continue
-
                 existing_vm = None
                 vol = None
                 recorded_ids = set()
@@ -316,6 +222,11 @@ async def provision_nodegroup_vms(
                         await asyncio.to_thread(conn.compute.wait_for_server, existing_vm, status="ACTIVE", wait=600)
                     new_entries.append(entry)
                     continue
+                if gpu_required:
+                    # Afterglow counts live GPU servers instead of reserving them: re-admit right before creating.
+                    from drover.services import afterglow
+
+                    await afterglow.require_gpu_admission(project_id, flavor_id, settings=s)
                 vol_metadata = inventory.build_drover_metadata(cluster_id, None, "volume")
                 vol_metadata["k3s_horse_generator_nodegroup_id"] = nodegroup_id
                 if provisioning_key is not None:
@@ -381,8 +292,6 @@ async def provision_nodegroup_vms(
                     server = await asyncio.to_thread(conn.compute.get_server, vm.id)
                     await asyncio.to_thread(conn.compute.wait_for_server, server, status="ACTIVE", wait=600)
                 _logger.info("stampede: nodegroup %s — agent %s (%s) 생성됨", nodegroup_id, agent_name, vm.id)
-            except ProvisioningInProgress:
-                raise
             except Exception as e:
                 _logger.error("stampede: nodegroup %s — agent %s 생성 실패: %s", nodegroup_id, agent_name, e)
                 if provisioning_key is not None:
@@ -390,8 +299,7 @@ async def provision_nodegroup_vms(
 
         return new_entries
     finally:
-        if conn is not None:
-            await keystone.close_connection(conn)
+        await keystone.close_connection(conn)
 
 
 class NodegroupDeletionError(RuntimeError):
@@ -420,13 +328,13 @@ async def delete_nodegroup_vms(
     vm_entries: list[dict],
 ) -> None:
     """Drain every live node before deleting any VM; retain failed records for retry."""
-    from drover.services import cinder, inventory, keystone, nova
+    from drover.services import cinder, execution, inventory, keystone, nova
     from drover.services import kube as k3s_kube
     from drover.services import nodegroup as k3s_nodegroup
 
     if not vm_entries:
         return
-    conn = await keystone.get_project_manager_connection(project_id)
+    conn = await execution.open_connection(project_id)
     cordoned: list[str] = []
     phase = "server_lookup"
     try:
@@ -545,7 +453,7 @@ async def reconcile_nodegroup_vms(
     nodegroup_id: str,
 ) -> list[dict]:
     """Reconcile recorded nodegroup VM rows against OpenStack Nova server tags/metadata."""
-    from drover.services import keystone, nova
+    from drover.services import execution, keystone, nova
     from drover.services import nodegroup as nodegroup_store
 
     ng = await nodegroup_store.get_nodegroup(cluster_id, nodegroup_id)
@@ -559,7 +467,7 @@ async def reconcile_nodegroup_vms(
         return []
 
     verified_vms: list[dict] = []
-    conn = await keystone.get_project_manager_connection(project_id)
+    conn = await execution.open_connection(project_id)
     try:
         for vm_entry in vms:
             vm_id = vm_entry.get("vm_id")
@@ -577,8 +485,7 @@ async def reconcile_nodegroup_vms(
             await nodegroup_store.set_nodegroup_count(cluster_id, nodegroup_id, actual_count)
         return verified_vms
     finally:
-        if conn is not None:
-            await keystone.close_connection(conn)
+        await keystone.close_connection(conn)
 
 
 async def provision_nodegroup_and_reconcile(

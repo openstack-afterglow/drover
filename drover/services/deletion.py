@@ -10,7 +10,17 @@ from collections.abc import AsyncGenerator
 import openstack.connection
 
 from drover.models.schemas import K3sProgressMessage, K3sProgressStep
-from drover.services import cinder, inventory, keystone, neutron, nova, octavia, operations
+from drover.services import (
+    cinder,
+    cluster_authority,
+    execution,
+    inventory,
+    keystone,
+    neutron,
+    nova,
+    octavia,
+    operations,
+)
 from drover.services import kube as k3s_kube
 from drover.services import store as k3s_cluster
 from drover.services.activity import rec
@@ -37,8 +47,14 @@ async def delete_cluster_progress(
     cluster: dict,
     token_info: dict | None,
     operation_id: str | None = None,
+    *,
+    credential_owner_user_id: str | None = None,
 ) -> AsyncGenerator[K3sProgressMessage, None]:
-    """k3s 클러스터 삭제 단계별 진행. 각 단계 진입 시 K3sProgressMessage 를 yield."""
+    """k3s 클러스터 삭제 단계별 진행. 각 단계 진입 시 K3sProgressMessage 를 yield.
+
+    ``credential_owner_user_id`` is set only when ``conn`` is that user's own (non-delegated) token connection,
+    which Keystone allows to delete the user's application credentials. Delegated connections cannot.
+    """
     cluster_id: str = cluster["id"]
     cluster_name: str = cluster.get("name") or ""
 
@@ -68,7 +84,6 @@ async def delete_cluster_progress(
     neutron_ports = [r for r in managed_res_list if r.service == "neutron" and r.resource_type == "port"]
     neutron_sg_rules = [r for r in managed_res_list if r.service == "neutron" and r.resource_type == "security_group_rule"]
     neutron_sgs = [r for r in managed_res_list if r.service == "neutron" and r.resource_type == "security_group"]
-    app_creds = [r for r in managed_res_list if r.service == "keystone" and r.resource_type == "app_credential"]
 
     # Also include IDs recorded on the cluster record
     all_server_ids = {r.resource_id for r in nova_servers}
@@ -93,10 +108,6 @@ async def delete_cluster_progress(
     all_sg_ids = {r.resource_id for r in neutron_sgs}
     if cluster.get("security_group_id"):
         all_sg_ids.add(cluster["security_group_id"])
-
-    all_app_cred_ids = {r.resource_id for r in app_creds}
-    if cluster.get("app_credential_id"):
-        all_app_cred_ids.add(cluster["app_credential_id"])
 
     # Step A: K8s Node cleanup
     msg = K3sProgressMessage(step=K3sProgressStep.DELETE_K8S_NODES, progress=15, message="Kubernetes 노드 정리 중...")
@@ -268,13 +279,17 @@ async def delete_cluster_progress(
         )
     yield msg
 
-    for app_cred_id in all_app_cred_ids:
-        try:
-            await keystone.delete_app_credential(project_id, app_cred_id)
-            await inventory.mark_resource_deleted(None, service="keystone", resource_type="app_credential", resource_id=app_cred_id)
-            _logger.info("k3s delete: App credential %s deleted", app_cred_id)
-        except Exception as e:
-            _logger.warning("k3s delete: App credential %s delete failed: %s", app_cred_id, e)
+    if credential_owner_user_id:
+        await cluster_authority.retire_owned(
+            conn, cluster_id=cluster_id, owner_user_id=credential_owner_user_id,
+            states=("staged", "active", "retiring"),
+        )
+    # Every remaining secret is erased; credentials of other owners are reported for owner revocation.
+    pending = await cluster_authority.retire_remaining_for_deleted_cluster(
+        cluster_id, project_id, cluster.get("app_credential_id") or ""
+    )
+    if pending:
+        _logger.info("k3s delete: %d application credential(s) await owner revocation", pending)
 
     # Step 8: Record soft deletion
     msg = K3sProgressMessage(step=K3sProgressStep.DELETE_RECORD, progress=98, message="삭제 이력 기록 중...")
@@ -311,7 +326,7 @@ async def execute_delete_cluster(
     if not cluster or cluster.get("deleted_at"):
         return
 
-    conn = await keystone.get_project_manager_connection(project_id)
+    conn = await execution.open_connection(project_id)
     token_info = {
         "project_id": project_id,
         "user_id": payload.get("user_id", ""),

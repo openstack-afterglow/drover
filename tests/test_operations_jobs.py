@@ -609,6 +609,10 @@ async def test_schedule_worker_reconciliations_dedupe_and_concurrency(monkeypatc
     )
     monkeypatch.setattr("drover.db.get_session_factory", lambda: _factory(session))
     monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+    # Only clusters with an active control credential are reconciled; all three are authorized here.
+    monkeypatch.setattr(
+        "drover.services.cluster_authority.authorized_cluster_ids", AsyncMock(return_value={"c1", "c2", "c3"})
+    )
 
     enqueued = await reconciliation.schedule_worker_reconciliations(max_per_project=2)
     assert len(enqueued) == 1

@@ -28,7 +28,7 @@ def mock_operations_store(monkeypatch):
                 "project_id": "proj-1",
                 "user_id": "user-1",
                 "username": "user1",
-                "roles": ["member"],
+                "roles": ["reader", "drover-inventory_reader"],
                 "is_system_admin": False,
             }
         if token == "token-proj-2":
@@ -37,7 +37,7 @@ def mock_operations_store(monkeypatch):
                 "project_id": "proj-2",
                 "user_id": "user-2",
                 "username": "user2",
-                "roles": ["member"],
+                "roles": ["reader", "drover-inventory_reader"],
                 "is_system_admin": False,
             }
         raise Exception("Invalid token")

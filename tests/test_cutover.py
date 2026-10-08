@@ -198,7 +198,6 @@ def test_cluster_snapshot_rewrite_and_conflict():
 def test_ciphertext_verification_requires_identical_copy_and_valid_key(monkeypatch):
     monkeypatch.setattr(cutover, "decrypt_kubeconfig", lambda val: "kc-plain")
     monkeypatch.setattr(cutover, "decrypt_node_token", lambda val: "token-plain")
-    monkeypatch.setattr(cutover, "decrypt_manager_password", lambda val: "pass-plain")
 
     source_tables = {
         "k3s_clusters": [
@@ -233,13 +232,6 @@ def test_ciphertext_verification_requires_identical_copy_and_valid_key(monkeypat
 
     assert cutover._verify_ciphertext(source_tables, dest_tables) is True
 
-    # Verification without cluster kubeconfig (e.g. manager password only)
-    source_no_cluster = {
-        "k3s_clusters": [],
-        "project_manager_credentials": [{"project_id": "p-1", "encrypted_password": "v3:pass-cipher"}],
-    }
-    dest_no_cluster = dict(source_no_cluster)
-    assert cutover._verify_ciphertext(source_no_cluster, dest_no_cluster) is True
 
     # Byte mismatch
     dest_mismatch = {
@@ -480,7 +472,6 @@ async def test_migrate_database_applies_when_legacy_source_has_no_drover_jobs_ta
     monkeypatch.setattr(cutover, "_update_rows", update)
     monkeypatch.setattr(cutover, "decrypt_kubeconfig", lambda _ct: "kc-plain")
     monkeypatch.setattr(cutover, "decrypt_node_token", lambda _ct: "token-plain")
-    monkeypatch.setattr(cutover, "decrypt_manager_password", lambda _ct: "pass-plain")
 
     report = await cutover.migrate_database(
         "mysql+asyncmy://afterglow:secret@db/afterglow",

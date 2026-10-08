@@ -7,6 +7,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 pytest_plugins = ("pytest_asyncio",)
 import pytest
 
+pytestmark = pytest.mark.usefixtures("credential_retirement")
+
+
 from drover.models.orm import ManagedOpenStackResource
 from drover.services import deletion, inventory
 
@@ -292,8 +295,9 @@ async def test_deletion_order_and_ownership_constraints(intent_readable):
     def mock_del_sg_safe(*args, **kwargs):
         call_order.append("neutron_sg")
 
-    def mock_del_app_cred(*args, **kwargs):
-        call_order.append("keystone_app_cred")
+    async def mock_retire_credentials(*args, **kwargs):
+        call_order.append("credential_retirement")
+        return 1
 
     cluster_dict = {
         "id": cluster_id,
@@ -321,7 +325,7 @@ async def test_deletion_order_and_ownership_constraints(intent_readable):
         patch("drover.services.neutron.wait_port_deleted", return_value=None),
         patch("drover.services.neutron.delete_security_group_rule", return_value=None),
         patch("drover.services.neutron.delete_security_group_safe", side_effect=mock_del_sg_safe),
-        patch("drover.services.keystone.delete_app_credential", side_effect=mock_del_app_cred),
+        patch("drover.services.cluster_authority.retire_remaining_for_deleted_cluster", side_effect=mock_retire_credentials),
         patch("drover.services.kube.delete_k8s_nodes", AsyncMock()),
         patch("drover.services.store.delete_cluster_record", AsyncMock()),
     ):
@@ -339,7 +343,7 @@ async def test_deletion_order_and_ownership_constraints(intent_readable):
     assert "cinder_volume" in call_order
     assert "neutron_port" in call_order
     assert "neutron_sg" in call_order
-    assert "keystone_app_cred" in call_order
+    assert "credential_retirement" in call_order
 
     idx_vm = call_order.index("nova_server")
     idx_mem = call_order.index("octavia_member")
@@ -350,7 +354,7 @@ async def test_deletion_order_and_ownership_constraints(intent_readable):
     idx_vol = call_order.index("cinder_volume")
     idx_port = call_order.index("neutron_port")
     idx_sg = call_order.index("neutron_sg")
-    idx_cred = call_order.index("keystone_app_cred")
+    idx_cred = call_order.index("credential_retirement")
 
     # VMs/members before pools/listeners
     assert idx_vm < idx_pool
@@ -365,7 +369,7 @@ async def test_deletion_order_and_ownership_constraints(intent_readable):
     # Volumes before ports/SGs
     assert idx_vol < idx_port
     assert idx_vol < idx_sg
-    # SGs before app creds
+    # SGs before credential retirement
     assert idx_sg < idx_cred
     # OCCM cannot recreate Service LBs once every cluster VM is gone.
     assert idx_vm < call_order.index("occm_service_lbs")

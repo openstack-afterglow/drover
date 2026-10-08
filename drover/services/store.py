@@ -549,53 +549,6 @@ async def check_stale_clusters(timeout_minutes: int = 30) -> None:
 
     await operations.recover_expired_callback_operations(timeout_seconds=timeout_minutes * 60)
 
-# ---------------------------------------------------------------------------
-# Project Manager Credentials (Octavia Ingress App Cred 관리용)
-# ---------------------------------------------------------------------------
-
-
-async def get_manager_credentials(project_id: str) -> dict | None:
-    """프로젝트 관리 사용자 자격 조회. 없으면 None."""
-    if not is_db_available():
-        return None
-
-    from sqlalchemy import text
-
-    factory = get_session_factory()
-    async with factory() as session:
-        result = await session.execute(
-            text(
-                "SELECT user_id, username, encrypted_password FROM project_manager_credentials WHERE project_id = :pid"
-            ),
-            {"pid": project_id},
-        )
-        row = result.mappings().one_or_none()
-        if row is None:
-            return None
-        return {"user_id": row["user_id"], "username": row["username"], "encrypted_password": row["encrypted_password"]}
-
-
-async def save_manager_credentials(project_id: str, user_id: str, username: str, encrypted_password: str) -> None:
-    """프로젝트 관리 사용자 자격 저장 (INSERT OR REPLACE)."""
-    if not is_db_available():
-        return
-
-    from sqlalchemy import text
-
-    factory = get_session_factory()
-    async with factory() as session:
-        await session.execute(
-            text(
-                "INSERT INTO project_manager_credentials "
-                "(project_id, user_id, username, encrypted_password) "
-                "VALUES (:pid, :uid, :uname, :epw) "
-                "ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), "
-                "username = VALUES(username), encrypted_password = VALUES(encrypted_password)"
-            ),
-            {"pid": project_id, "uid": user_id, "uname": username, "epw": encrypted_password},
-        )
-        await session.commit()
-
 
 async def get_cluster_app_credential_id(project_id: str, cluster_id: str) -> str | None:
     """클러스터의 app_credential_id 조회."""

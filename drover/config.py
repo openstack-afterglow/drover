@@ -158,6 +158,11 @@ def _load_toml() -> dict:
         "drover_barbican_kms_kek_id": drover.get("barbican_kms_kek_id", ""),
         "drover_cert_rotation_node_timeout_sec": drover.get("cert_rotation_node_timeout_sec", 300),
         "drover_cert_rotation_job_image": drover.get("cert_rotation_job_image", "rancher/k3s:v1.28.4-k3s2"),
+        "drover_operation_trust_ttl_seconds": drover.get("operation_trust_ttl_seconds", 14400),
+        "drover_operation_trust_min_remaining_seconds": drover.get("operation_trust_min_remaining_seconds", 300),
+        "drover_delegated_required_roles": drover.get("delegated_required_roles", ["member"]),
+        "drover_delegated_optional_roles": drover.get("delegated_optional_roles", ["load-balancer_member"]),
+        "drover_guest_rollout_timeout_seconds": drover.get("guest_rollout_timeout_seconds", 600),
         "k3s_health_interval": drover.get("k3s_health_interval", drover.get("health_interval", 180)),
         "drover_stampede_enabled": drover.get("stampede_enabled", False),
         "drover_stampede_interval": drover.get("stampede_interval", 60),
@@ -183,16 +188,6 @@ def _load_toml() -> dict:
         ),
         "drover_afterglow_admission_token_file": drover.get(
             "afterglow_admission_token_file", drover.get("drover_afterglow_admission_token_file", "")
-        ),
-        "drover_afterglow_provisioning_url": drover.get(
-            "afterglow_provisioning_url", drover.get("drover_afterglow_provisioning_url", "")
-        ),
-        "drover_afterglow_provisioning_token": drover.get(
-            "afterglow_provisioning_token", drover.get("drover_afterglow_provisioning_token", "")
-        ),
-        "drover_afterglow_provisioning_token_file": drover.get(
-            "afterglow_provisioning_token_file",
-            drover.get("drover_afterglow_provisioning_token_file", ""),
         ),
     }
 
@@ -262,6 +257,12 @@ class Settings(BaseSettings):
     drover_barbican_kms_kek_id: str = ""
     drover_cert_rotation_node_timeout_sec: int = 300
     drover_cert_rotation_job_image: str = "rancher/k3s:v1.28.4-k3s2"
+    # Requester-owned operation trusts; never admin/manager. Optional roles are delegated only when held.
+    drover_operation_trust_ttl_seconds: int = Field(default=14400, ge=900, le=86400)
+    drover_operation_trust_min_remaining_seconds: int = Field(default=300, ge=60, le=3600)
+    drover_delegated_required_roles: list[str] = ["member"]
+    drover_delegated_optional_roles: list[str] = ["load-balancer_member"]
+    drover_guest_rollout_timeout_seconds: int = Field(default=600, ge=60, le=3600)
     k3s_health_interval: int = 180
     drover_stampede_enabled: bool = False
     drover_stampede_interval: int = Field(default=60, ge=10)
@@ -277,9 +278,6 @@ class Settings(BaseSettings):
     drover_afterglow_admission_url: str = ""
     drover_afterglow_admission_token: str = ""
     drover_afterglow_admission_token_file: str = ""
-    drover_afterglow_provisioning_url: str = ""
-    drover_afterglow_provisioning_token: str = ""
-    drover_afterglow_provisioning_token_file: str = ""
 
     @field_validator("drover_callback_allowed_cidrs", mode="before")
     @classmethod
@@ -291,6 +289,28 @@ class Settings(BaseSettings):
         if isinstance(value, (list, tuple, set)):
             return [str(c).strip() for c in value if str(c).strip()]
         return []
+
+    @field_validator("drover_delegated_required_roles", "drover_delegated_optional_roles", mode="before")
+    @classmethod
+    def validate_delegated_roles(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            items = [item.strip() for item in value.split(",")]
+        elif isinstance(value, (list, tuple, set)):
+            items = [str(item).strip() for item in value]
+        else:
+            raise ValueError("delegated roles must be a list or comma-separated string")
+        roles = [item for item in items if item]
+        if any(role.lower() in {"admin", "manager"} for role in roles):
+            raise ValueError("delegated roles must not include admin or manager")
+        return list(dict.fromkeys(roles))
+
+    @model_validator(mode="after")
+    def _validate_delegated_role_sets(self) -> Settings:
+        if not self.drover_delegated_required_roles:
+            raise ValueError("drover_delegated_required_roles must contain at least one role")
+        if self.drover_operation_trust_min_remaining_seconds >= self.drover_operation_trust_ttl_seconds:
+            raise ValueError("drover_operation_trust_min_remaining_seconds must be shorter than the trust TTL")
+        return self
 
     @field_validator("drover_kubeconfig_encryption_key")
     @classmethod
@@ -321,28 +341,6 @@ class Settings(BaseSettings):
             ):
                 raise ValueError("drover_afterglow_admission_url must be a credential-free HTTP or HTTPS URL")
         return value
-
-    @field_validator("drover_afterglow_provisioning_url")
-    @classmethod
-    def validate_afterglow_provisioning_url(cls, value: str) -> str:
-        value = value.strip()
-        if value:
-            parts = urlsplit(value)
-            if (
-                parts.scheme not in ("http", "https")
-                or not parts.netloc
-                or parts.username
-                or parts.password
-                or parts.query
-                or parts.fragment
-            ):
-                raise ValueError("drover_afterglow_provisioning_url must be a credential-free HTTP or HTTPS URL")
-        return value
-
-    @field_validator("drover_afterglow_provisioning_token")
-    @classmethod
-    def validate_afterglow_provisioning_token(cls, value: str) -> str:
-        return value.strip()
 
     @field_validator("drover_afterglow_admission_token")
     @classmethod
@@ -409,21 +407,6 @@ class Settings(BaseSettings):
             p = Path(target_token_file)
             if p.is_file():
                 self.drover_afterglow_admission_token = p.read_text().strip()
-
-        target_provisioning_token_file = self.drover_afterglow_provisioning_token_file or os.environ.get(
-            "DROVER_AFTERGLOW_PROVISIONING_TOKEN_FILE", ""
-        )
-        if (
-            not target_provisioning_token_file
-            and not self.drover_afterglow_provisioning_token
-            and Path("/etc/drover/secrets/afterglow_k3s_provisioning_token").is_file()
-        ):
-            target_provisioning_token_file = "/etc/drover/secrets/afterglow_k3s_provisioning_token"
-        if target_provisioning_token_file:
-            self.drover_afterglow_provisioning_token_file = target_provisioning_token_file
-            p = Path(target_provisioning_token_file)
-            if p.is_file():
-                self.drover_afterglow_provisioning_token = p.read_text().strip()
 
         return self
 

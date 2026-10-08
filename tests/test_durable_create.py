@@ -6,12 +6,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("admitted_authority")
+
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from drover.api.clusters import router as clusters_router
 from drover.auth import get_os_conn, get_token_info
-from drover.models.orm import DroverJob, DroverOperation, DroverOperationEvent
+from drover.models.orm import DroverClusterCredential, DroverJob, DroverOperation, DroverOperationEvent
 
 
 class MemoryStore:
@@ -21,6 +24,7 @@ class MemoryStore:
         self.events = {}  # op_id -> list[DroverOperationEvent]
         self.jobs = {}  # job_id -> DroverJob
         self.clusters = {}  # (project_id, cluster_id) -> dict
+        self.credentials = []
 
     def add_operation(self, op: DroverOperation):
         self.operations[op.id] = op
@@ -42,6 +46,19 @@ class MemoryStore:
         )
         op_events.append(ev)
         return ev
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    def begin(self):
+        return self
+
+    def add(self, row):
+        assert isinstance(row, DroverClusterCredential)
+        self.credentials.append(row)
 
 
 @pytest.fixture
@@ -66,7 +83,8 @@ def test_app(store):
         return conn
 
     async def mock_token_info():
-        return {"project_id": "proj-test-123", "user_id": "user-test-123", "username": "testuser"}
+        return {"project_id": "proj-test-123", "user_id": "user-test-123", "username": "testuser",
+                "roles": ["member", "reader", "drover-inventory_reader", "drover-clusters_editor", "drover-access_admin"]}
 
     app.dependency_overrides[get_os_conn] = mock_os_conn
     app.dependency_overrides[get_token_info] = mock_token_info
@@ -86,6 +104,7 @@ async def async_client(test_app):
 
 @pytest.fixture(autouse=True)
 def mock_durable_services(store, monkeypatch):
+    monkeypatch.setattr("drover.db.get_session_factory", lambda: lambda: store)
     policy_snapshot = {
         "k3s.server_image": {"id": "img-srv-1", "name": "ubuntu"},
         "k3s.server_flavor": {"id": "flv-srv-1", "name": "m1.medium"},
@@ -152,7 +171,13 @@ def mock_durable_services(store, monkeypatch):
         idempotency_key=None,
         request_hash=None,
         op_kind=None,
+        *,
+        session=None,
+        delegation=None,
+        delegation_id=None,
     ):
+        assert session is store
+        assert delegation.project_id == project_id and delegation.cluster_id == cluster_id
         op_id = store.idemp_index.get((project_id, idempotency_key)) if idempotency_key else None
         if not op_id:
             op_id = f"op-{len(store.operations) + 1}"
@@ -180,6 +205,7 @@ def mock_durable_services(store, monkeypatch):
             status="queued",
             payload_json=dict(payload),
             operation_id=op_id,
+            delegation_id=delegation.id,
         )
         return job_id
 
@@ -479,7 +505,7 @@ async def test_queued_create_without_network_never_reaches_nova():
     from drover.services.provisioner import create_cluster_job
 
     with (
-        patch("drover.services.keystone.get_project_manager_connection", new=AsyncMock(return_value=MagicMock())),
+        patch("drover.services.execution.open_connection", new=AsyncMock(return_value=MagicMock())),
         patch("drover.services.keystone.close_connection", new=AsyncMock()),
         patch("drover.services.store.update_cluster_status", new=AsyncMock()),
         patch("drover.services.neutron.create_security_group") as create_security_group,

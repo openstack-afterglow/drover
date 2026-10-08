@@ -10,21 +10,21 @@ from drover.models.schemas import (
     K3sClusterTemplateInfo,
     UpdateK3sClusterTemplateRequest,
 )
-from drover.policy import require_policy
+from drover.policy import require_inventory, require_policy
 from drover.services import template as _svc
 
 router = APIRouter()
 _logger = logging.getLogger(__name__)
 
 
-@router.get("", response_model=list[K3sClusterTemplateInfo])
+@router.get("", response_model=list[K3sClusterTemplateInfo], dependencies=[Depends(require_inventory)])
 async def list_k3s_cluster_templates(token_info: dict = Depends(get_token_info)):
     """사용자용 템플릿 목록 (public 또는 본인 생성)."""
     user_id = token_info.get("user_id") or token_info.get("sub")
     return await _svc.list_templates(user_id=user_id, admin=False)
 
 
-@router.get("/{template_id}", response_model=K3sClusterTemplateInfo)
+@router.get("/{template_id}", response_model=K3sClusterTemplateInfo, dependencies=[Depends(require_inventory)])
 async def get_k3s_cluster_template(template_id: str, token_info: dict = Depends(get_token_info)):
     t = await _svc.get_template(template_id)
     if not t:

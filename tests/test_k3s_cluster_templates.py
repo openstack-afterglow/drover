@@ -108,10 +108,10 @@ async def test_get_template_not_found(admin_client):
 
 
 @pytest.mark.asyncio
-async def test_get_private_template_by_non_owner(non_admin_client):
+async def test_get_private_template_by_non_owner(client):
     """public=False이고 본인 소유 아닌 템플릿은 404 반환."""
     with patch("drover.services.template.get_template", new=AsyncMock(return_value=_PRIVATE_TMPL)):
-        resp = await non_admin_client.get(f"/v1/cluster-templates/{_PRIVATE_TMPL['id']}")
+        resp = await client.get(f"/v1/cluster-templates/{_PRIVATE_TMPL['id']}")
     assert resp.status_code == 404
 
 

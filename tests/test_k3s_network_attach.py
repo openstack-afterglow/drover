@@ -55,7 +55,7 @@ async def client(mock_conn):
             "project_name": "test-project",
             "user_id": "test-user-1",
             "username": "testuser",
-            "roles": ["member"],
+            "roles": ["member", "reader", "drover-inventory_reader", "drover-clusters_editor", "drover-clusters_admin"],
             "expires_at": "2099-01-01T00:00:00Z",
             "is_system_admin": False,
         }

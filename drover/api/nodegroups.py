@@ -6,10 +6,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from openstack.exceptions import ResourceNotFound
 from sqlalchemy.exc import InterfaceError, OperationalError
 
+from drover.api.delegated import admitted_operation
 from drover.auth import get_os_conn, get_token_info
 from drover.db import is_db_available
 from drover.models.schemas import CreateK3sNodegroupRequest, K3sNodegroupInfo, UpdateK3sNodegroupRequest
 from drover.policy import authorize
+from drover.services import delegation as _delegation
 from drover.services import nodegroup as _svc
 from drover.services import resource_policies
 from drover.services import store as k3s_db
@@ -84,9 +86,18 @@ async def create_nodegroup(
     await _assert_cluster_access(cluster_id, token_info, mutation=True)
     data = req.model_dump()
     await _validate_resources(conn, data)
+    project_id = token_info.get("project_id") or ""
     try:
+        if int(data.get("node_count") or 0) > 0:
+            async with admitted_operation(
+                token_info, project_id=project_id, cluster_id=cluster_id, action=_delegation.ACTION_SCALE
+            ) as admitted:
+                return await _svc.create_nodegroup(
+                    cluster_id, data, project_id=project_id, user_id=token_info.get("user_id"),
+                    username=token_info.get("username"), delegation=admitted,
+                )
         return await _svc.create_nodegroup(
-            cluster_id, data, project_id=token_info.get("project_id") or "",
+            cluster_id, data, project_id=project_id,
             user_id=token_info.get("user_id"), username=token_info.get("username"),
         )
     except _svc.NodegroupConflict as exc:
@@ -108,15 +119,25 @@ async def update_nodegroup(
     """Merge config against locked DB state, then enqueue manual sizing work."""
     await _assert_cluster_access(cluster_id, token_info, mutation=True)
     updates = {k: v for k, v in req.model_dump(exclude_unset=True).items() if v is not None}
+    project_id = token_info.get("project_id") or ""
     try:
         before = await _svc.get_nodegroup(cluster_id, nodegroup_id)
         if not before:
             raise HTTPException(status_code=404, detail="노드그룹을 찾을 수 없습니다.")
         await _validate_resources(conn, updates)
-        ng = await _svc.update_nodegroup(
-            cluster_id, nodegroup_id, updates, project_id=token_info.get("project_id") or "",
-            user_id=token_info.get("user_id"), username=token_info.get("username"),
-        )
+        if "node_count" in updates:
+            async with admitted_operation(
+                token_info, project_id=project_id, cluster_id=cluster_id, action=_delegation.ACTION_SCALE
+            ) as admitted:
+                ng = await _svc.update_nodegroup(
+                    cluster_id, nodegroup_id, updates, project_id=project_id,
+                    user_id=token_info.get("user_id"), username=token_info.get("username"), delegation=admitted,
+                )
+        else:
+            ng = await _svc.update_nodegroup(
+                cluster_id, nodegroup_id, updates, project_id=project_id,
+                user_id=token_info.get("user_id"), username=token_info.get("username"),
+            )
         if not ng:
             raise HTTPException(status_code=404, detail="노드그룹을 찾을 수 없습니다.")
         return ng
@@ -131,12 +152,17 @@ async def update_nodegroup(
 @router.delete("/{cluster_id}/nodegroups/{nodegroup_id}", status_code=204)
 async def delete_nodegroup(cluster_id: str, nodegroup_id: str, token_info: dict = Depends(get_token_info)):
     """Delete a non-default group through the durable worker, not while scaling."""
-    await _assert_cluster_access(cluster_id, token_info, mutation=True)
+    authorize("drover:clusters:delete", {"project_id": token_info.get("project_id") or ""}, token_info)
+    await _assert_cluster_access(cluster_id, token_info)
+    project_id = token_info.get("project_id") or ""
     try:
-        deleted = await _svc.enqueue_nodegroup_delete(
-            cluster_id, nodegroup_id, project_id=token_info.get("project_id") or "",
-            user_id=token_info.get("user_id"), username=token_info.get("username"),
-        )
+        async with admitted_operation(
+            token_info, project_id=project_id, cluster_id=cluster_id, action=_delegation.ACTION_DELETE
+        ) as admitted:
+            deleted = await _svc.enqueue_nodegroup_delete(
+                cluster_id, nodegroup_id, project_id=project_id,
+                user_id=token_info.get("user_id"), username=token_info.get("username"), delegation=admitted,
+            )
         if not deleted:
             raise HTTPException(status_code=404, detail="노드그룹을 찾을 수 없습니다.")
     except _svc.NodegroupConflict as exc:

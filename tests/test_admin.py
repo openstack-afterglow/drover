@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 
 from drover.services.cert_rotation import _lock_key
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("admitted_authority")]
 
 _ROTATION_LOCK_KEY = _lock_key("cluster-1")
 
@@ -17,7 +17,7 @@ _ROTATION_LOCK_KEY = _lock_key("cluster-1")
 def _cluster(cluster_id: str, status: str = "ACTIVE") -> dict:
     return {
         "id": cluster_id,
-        "project_id": "project-1",
+        "project_id": "test-project-123",
         "name": cluster_id,
         "status": status,
         "agent_vm_ids": [],
@@ -47,7 +47,7 @@ async def test_admin_cluster_status_filter_accepts_dashboard_status_set(admin_cl
 
     assert response.status_code == 200
     assert [item["id"] for item in response.json()] == ["creating", "error"]
-    assert {item["project_id"] for item in response.json()} == {"project-1"}
+    assert {item["project_id"] for item in response.json()} == {"test-project-123"}
 
 
 async def test_admin_scale_persists_durable_job_before_success(admin_client):
@@ -68,18 +68,19 @@ async def test_admin_scale_persists_durable_job_before_success(admin_client):
 
     assert response.status_code == 200
     update.assert_awaited_once_with(
-        "project-1",
+        "test-project-123",
         "cluster-1",
         "SCALING",
         "에이전트 노드 스케일 변경 중",
     )
     enqueue.assert_awaited_once_with(
         cluster_id="cluster-1",
-        project_id="project-1",
+        project_id="test-project-123",
         kind="scale",
         payload={"desired_count": 3},
-        user_id="admin",
-        username="system-admin",
+        user_id="test-user-123",
+        username="testuser",
+        delegation=ANY,
     )
 
 
@@ -99,14 +100,15 @@ async def test_admin_delete_persists_durable_job(admin_client):
     assert response.status_code == 204
     enqueue.assert_awaited_once_with(
         cluster_id="cluster-1",
-        project_id="project-1",
+        project_id="test-project-123",
         kind="delete",
-        payload={"user_id": "admin", "username": "system-admin"},
-        user_id="admin",
-        username="system-admin",
+        payload={"user_id": "test-user-123", "username": "testuser"},
+        user_id="test-user-123",
+        username="testuser",
+        delegation=ANY,
     )
     update.assert_awaited_once_with(
-        "project-1",
+        "test-project-123",
         "cluster-1",
         "DELETING",
         "관리자 삭제 요청",
@@ -204,7 +206,7 @@ async def test_admin_rotate_certs_streams_service_messages(admin_client, _fake_r
     assert response.status_code == 200
     assert "text/event-stream" in response.headers["content-type"]
     assert calls == [
-        (("cluster-1", "project-1", "system-admin"), {"node_timeout": 42.0, "job_image": "registry.example/k3s:test"})
+        (("cluster-1", "test-project-123", "system-admin"), {"node_timeout": 42.0, "job_image": "registry.example/k3s:test"})
     ]
     events = _sse_events(response.text)
     assert [event["step"] for event in events] == ["rotate_discover", "completed"]

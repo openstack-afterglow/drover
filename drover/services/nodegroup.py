@@ -198,7 +198,7 @@ async def create_default_nodegroups(
 
 async def create_nodegroup(
     cluster_id: str, data: dict, *, project_id: str | None = None,
-    user_id: str | None = None, username: str | None = None,
+    user_id: str | None = None, username: str | None = None, delegation=None,
 ) -> dict:
     """노드그룹 생성. DB 미설정 시 RuntimeError."""
     if not is_db_available():
@@ -254,7 +254,7 @@ async def create_nodegroup(
         if project_id is not None and node_count > 0:
             await _enqueue_manual_nodegroup_job(
                 session, ng, project_id, {"action": "provision", "nodegroup": _ng_to_dict(ng),
-                                         "add_count": node_count}, user_id, username,
+                                         "add_count": node_count}, user_id, username, delegation,
             )
         await session.commit()
         await session.refresh(ng, ["vms"])
@@ -268,7 +268,7 @@ async def create_nodegroup(
 
 async def update_nodegroup(
     cluster_id: str, nodegroup_id: str, updates: dict, *, project_id: str | None = None,
-    user_id: str | None = None, username: str | None = None,
+    user_id: str | None = None, username: str | None = None, delegation=None,
 ) -> dict | None:
     """노드그룹 부분 업데이트. 없으면 None."""
     if not is_db_available():
@@ -331,7 +331,7 @@ async def update_nodegroup(
                 payload = {"action": "delete_vms", "nodegroup": _ng_to_dict(ng),
                            "remove_entries": list(reversed(_ng_to_dict(ng)["vms"]))[:current - next_count]}
             if payload:
-                await _enqueue_manual_nodegroup_job(session, ng, project_id, payload, user_id, username)
+                await _enqueue_manual_nodegroup_job(session, ng, project_id, payload, user_id, username, delegation)
         await session.commit()
         await session.refresh(ng, ["vms"])
         return _ng_to_dict(ng)
@@ -356,12 +356,14 @@ async def merge_stampede_state(cluster_id: str, nodegroup_id: str, updates: dict
         return dict(ng.stampede_state)
 
 
-async def _enqueue_manual_nodegroup_job(session, ng, project_id, payload, user_id, username) -> str:
+async def _enqueue_manual_nodegroup_job(session, ng, project_id, payload, user_id, username, delegation) -> str:
     from drover.services import jobs
 
+    if delegation is None:
+        raise PermissionError("Manual nodegroup sizing requires an admitted requester delegation")
     job_id = await jobs.enqueue_job(
         cluster_id=ng.cluster_id, project_id=project_id, kind="nodegroup_reconcile", payload=payload,
-        user_id=user_id, username=username, session=session,
+        user_id=user_id, username=username, session=session, delegation=delegation,
     )
     if not job_id:
         raise RuntimeError("Nodegroup job was not persisted")
@@ -379,7 +381,7 @@ async def _enqueue_manual_nodegroup_job(session, ng, project_id, payload, user_i
 
 async def enqueue_nodegroup_delete(
     cluster_id: str, nodegroup_id: str, *, project_id: str,
-    user_id: str | None = None, username: str | None = None,
+    user_id: str | None = None, username: str | None = None, delegation=None,
 ) -> bool:
     """Guard and enqueue delete while holding the cluster and group row locks."""
     if not is_db_available():
@@ -401,7 +403,7 @@ async def enqueue_nodegroup_delete(
         await session.refresh(ng, ["vms"])
         payload = {"action": "delete_group", "nodegroup": _ng_to_dict(ng),
                    "remove_entries": _ng_to_dict(ng)["vms"]}
-        await _enqueue_manual_nodegroup_job(session, ng, project_id, payload, user_id, username)
+        await _enqueue_manual_nodegroup_job(session, ng, project_id, payload, user_id, username, delegation)
         return True
 
 

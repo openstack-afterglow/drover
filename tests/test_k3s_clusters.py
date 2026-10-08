@@ -1,9 +1,12 @@
 """k3s/clusters.py 엔드포인트 단위 테스트 (6개, k3s 서비스 필요)."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("admitted_authority", "credential_retirement")
+
 from httpx import ASGITransport, AsyncClient
 
 from drover.main import app
@@ -96,7 +99,7 @@ async def test_download_kubeconfig_not_ready(client):
     with patch("drover.api.clusters.k3s_cluster") as mock_db:
         mock_db.get_cluster = AsyncMock(return_value=_make_cluster_record())
         mock_db.get_kubeconfig = AsyncMock(return_value=None)
-        resp = await client.get("/v1/clusters/k3s-1/kubeconfig")
+        resp = await client.get("/v1/clusters/k3s-1/kubeconfig?grade=admin")
     assert resp.status_code == 404
 
 
@@ -105,7 +108,7 @@ async def test_download_kubeconfig_success(client):
     with patch("drover.api.clusters.k3s_cluster") as mock_db:
         mock_db.get_cluster = AsyncMock(return_value=_make_cluster_record())
         mock_db.get_kubeconfig = AsyncMock(return_value=b"apiVersion: v1\n...")
-        resp = await client.get("/v1/clusters/k3s-1/kubeconfig")
+        resp = await client.get("/v1/clusters/k3s-1/kubeconfig?grade=admin")
     assert resp.status_code == 200
 
 
@@ -121,13 +124,14 @@ async def test_head_kubeconfig_ready(client):
 
 
 @pytest.mark.asyncio
-async def test_head_kubeconfig_not_ready(client):
-    """kubeconfig 미준비 시 HEAD도 404를 반환해야 한다."""
+async def test_head_kubeconfig_does_not_read_stored_credentials(client):
+    """HEAD authorizes cluster metadata without decrypting or issuing credentials."""
     with patch("drover.api.clusters.k3s_cluster") as mock_db:
         mock_db.get_cluster = AsyncMock(return_value=_make_cluster_record())
         mock_db.get_kubeconfig = AsyncMock(return_value=None)
         resp = await client.request("HEAD", "/v1/clusters/k3s-1/kubeconfig")
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    mock_db.get_kubeconfig.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -156,6 +160,7 @@ async def test_scale_drover_cluster_success(client):
         payload={"desired_count": 1},
         user_id="test-user-123",
         username="testuser",
+        delegation=ANY,
     )
 
 @pytest.mark.asyncio
@@ -191,6 +196,7 @@ async def test_delete_drover_cluster_enqueues_durable_job(client):
         payload={"user_id": "test-user-123", "username": "testuser"},
         user_id="test-user-123",
         username="testuser",
+        delegation=ANY,
     )
     mock_db.update_cluster_status.assert_awaited_once_with(
         "test-project-123",

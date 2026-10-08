@@ -8,7 +8,7 @@ from drover.config import get_settings
 
 _DOMAIN_KUBECONFIG = b"kubeconfig"
 _DOMAIN_NODE_TOKEN = b"node_token"
-_DOMAIN_MANAGER_PASSWORD = b"manager_password"
+_DOMAIN_CLUSTER_APP_CREDENTIAL = b"cluster_app_credential"
 
 
 def _get_key() -> bytes:
@@ -44,9 +44,9 @@ def decrypt_node_token(ciphertext: str) -> str:
     return aesgcm.decrypt(_get_key(), _DOMAIN_NODE_TOKEN, ciphertext)
 
 
-def encrypt_manager_password(plaintext: str) -> str:
-    return aesgcm.encrypt(_get_key(), _DOMAIN_MANAGER_PASSWORD, plaintext)
+def encrypt_app_credential_secret(plaintext: str) -> str:
+    return aesgcm.encrypt(_get_key(), _DOMAIN_CLUSTER_APP_CREDENTIAL, plaintext)
 
 
-def decrypt_manager_password(ciphertext: str) -> str:
-    return aesgcm.decrypt(_get_key(), _DOMAIN_MANAGER_PASSWORD, ciphertext)
+def decrypt_app_credential_secret(ciphertext: str) -> str:
+    return aesgcm.decrypt(_get_key(), _DOMAIN_CLUSTER_APP_CREDENTIAL, ciphertext)

@@ -52,6 +52,7 @@ def _database(monkeypatch, cluster, groups):
     groups_result = MagicMock()
     groups_result.scalars.return_value.all.return_value = groups
     session.execute = AsyncMock(side_effect=[cluster_result, groups_result])
+    session.scalar = AsyncMock(return_value="credential-control")
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=None)
     session.begin.return_value = session
@@ -122,6 +123,18 @@ async def test_stampede_enable_persists_even_when_redis_auxiliary_fails(client, 
     assert response.status_code == 200
     assert response.json()["stampede_enabled"] is True
     assert cluster.stampede_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_stampede_enable_requires_reauthorized_control_credential(client, monkeypatch):
+    cluster = SimpleNamespace(status="ACTIVE", stampede_enabled=False)
+    session = _database(monkeypatch, cluster, [_group()])
+    session.scalar.return_value = None
+    response = await client.post(f"/v1/clusters/{CLUSTER_ID}/stampede/enable")
+    assert response.status_code == 409
+    assert "reauthorize" in response.json()["detail"]
+    assert cluster.stampede_enabled is False
+
 
 
 @pytest.mark.asyncio

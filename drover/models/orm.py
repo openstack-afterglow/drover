@@ -203,6 +203,9 @@ class DroverJob(Base):
     operation_id: Mapped[str | None] = mapped_column(
         CHAR(36), ForeignKey("drover_operations.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    delegation_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("drover_delegations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     operation: Mapped[DroverOperation | None] = relationship("DroverOperation", back_populates="jobs")
 
@@ -265,7 +268,8 @@ class DroverOperation(Base):
         Index("idx_drover_op_cluster_created", "cluster_id", "created_at"),
         Index("idx_drover_op_proj_idemp", "project_id", "idempotency_key", unique=True),
         CheckConstraint(
-            "kind IN ('create', 'scale', 'nodegroup_reconcile', 'delete', 'rotate_certificates', 'reconcile')",
+            "kind IN ('create', 'scale', 'nodegroup_reconcile', 'delete', 'rotate_certificates', 'reconcile', "
+            "'reauthorize')",
             name="ck_drover_op_kind",
         ),
         CheckConstraint(
@@ -317,3 +321,77 @@ class ManagedOpenStackResource(Base):
     operation: Mapped[DroverOperation | None] = relationship("DroverOperation", back_populates="resources")
 
     __table_args__ = (Index("idx_managed_res_identity", "service", "resource_type", "resource_id", unique=True),)
+
+
+class DroverDelegation(Base):
+    """Requester-owned Keystone trust admitted for one operation; never stores a token or password."""
+
+    __tablename__ = "drover_delegations"
+
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("k3s_clusters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    operation_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("drover_operations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    action: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    trust_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False, unique=True)
+    trustor_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    trustee_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    role_ids: Mapped[list] = mapped_column(JSON, nullable=False)
+    role_names: Mapped[list] = mapped_column(JSON, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    state: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="active")
+    state_reason: Mapped[str | None] = mapped_column(VARCHAR(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+    __table_args__ = (
+        Index("idx_drover_delegation_state_expiry", "state", "expires_at"),
+        CheckConstraint(
+            "state IN ('active', 'released', 'revoked', 'deleted', 'expired')", name="ck_drover_delegation_state"
+        ),
+    )
+
+
+class DroverClusterCredential(Base):
+    """User-owned restricted application credential granting a cluster continuous authority."""
+
+    __tablename__ = "drover_cluster_credentials"
+
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    cluster_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("k3s_clusters.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    generation: Mapped[int] = mapped_column(INT, nullable=False)
+    purpose: Mapped[str] = mapped_column(VARCHAR(16), nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64), nullable=True, index=True)
+    app_credential_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False, unique=True)
+    secret_encrypted: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    role_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    role_names: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    guest_plugins: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    state: Mapped[str] = mapped_column(VARCHAR(16), nullable=False)
+    state_reason: Mapped[str | None] = mapped_column(VARCHAR(255), nullable=True)
+    operation_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("drover_operations.id", ondelete="SET NULL"), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+    __table_args__ = (
+        Index("idx_drover_cluster_cred_generation", "cluster_id", "generation", "purpose", unique=True),
+        Index("idx_drover_cluster_cred_state", "cluster_id", "state"),
+        CheckConstraint("purpose IN ('control', 'guest')", name="ck_drover_cluster_cred_purpose"),
+        CheckConstraint(
+            "state IN ('staged', 'active', 'retiring', 'deleted')", name="ck_drover_cluster_cred_state"
+        ),
+    )

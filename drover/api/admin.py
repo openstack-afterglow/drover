@@ -12,6 +12,8 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 
+from drover.api.delegated import admitted_operation, require_cluster_project
+from drover.auth import require_token
 from drover.config import get_settings
 from drover.models.orm import ManagedOpenStackResource
 from drover.models.schemas import (
@@ -23,7 +25,7 @@ from drover.models.schemas import (
     ScaleK3sClusterRequest,
 )
 from drover.policy import require_policy
-from drover.services import cert_rotation, certs
+from drover.services import cert_rotation, certs, delegation
 from drover.services import inventory as _inventory_svc
 from drover.services import jobs as _jobs_svc
 from drover.services import store as k3s_cluster
@@ -81,58 +83,64 @@ async def download_admin_kubeconfig(cluster_id: str):
 
 
 @router.patch("/clusters/{cluster_id}/scale")
-async def scale_admin_cluster(cluster_id: str, req: ScaleK3sClusterRequest):
+async def scale_admin_cluster(
+    cluster_id: str, req: ScaleK3sClusterRequest, token_info: dict = Depends(require_token)
+):
     cluster = await k3s_cluster.get_cluster_admin(cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
-    project_id = cluster["project_id"]
+    project_id = require_cluster_project(token_info, cluster)
+    async with admitted_operation(
+        token_info, project_id=project_id, cluster_id=cluster_id, action=delegation.ACTION_SCALE
+    ) as admitted:
+        await _jobs_svc.enqueue_job(
+            cluster_id=cluster_id,
+            project_id=project_id,
+            kind="scale",
+            payload={"desired_count": req.agent_count},
+            user_id=token_info.get("user_id"),
+            username=token_info.get("username"),
+            delegation=admitted,
+        )
     await k3s_cluster.update_cluster_status(project_id, cluster_id, "SCALING", "에이전트 노드 스케일 변경 중")
-    await _jobs_svc.enqueue_job(
-        cluster_id=cluster_id,
-        project_id=project_id,
-        kind="scale",
-        payload={"desired_count": req.agent_count},
-        user_id="admin",
-        username="system-admin",
-    )
     return {"message": f"에이전트 노드가 {req.agent_count}개로 스케일 요청되었습니다", "target_count": req.agent_count}
 
 
+async def _enqueue_admin_delete(cluster_id: str, cluster: dict, token_info: dict) -> str:
+    project_id = require_cluster_project(token_info, cluster)
+    async with admitted_operation(
+        token_info, project_id=project_id, cluster_id=cluster_id, action=delegation.ACTION_DELETE
+    ) as admitted:
+        job_id = await _jobs_svc.enqueue_job(
+            cluster_id=cluster_id,
+            project_id=project_id,
+            kind="delete",
+            payload={"user_id": token_info.get("user_id"), "username": token_info.get("username")},
+            user_id=token_info.get("user_id"),
+            username=token_info.get("username"),
+            delegation=admitted,
+        )
+    await k3s_cluster.update_cluster_status(project_id, cluster_id, "DELETING", "관리자 삭제 요청")
+    return job_id
+
+
 @router.delete("/clusters/{cluster_id}", status_code=204)
-async def delete_admin_cluster(cluster_id: str):
+async def delete_admin_cluster(cluster_id: str, token_info: dict = Depends(require_token)):
     cluster = await k3s_cluster.get_cluster_admin(cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
-    project_id = cluster["project_id"]
     if cluster.get("deleted_at"):
         return
-    await _jobs_svc.enqueue_job(
-        cluster_id=cluster_id,
-        project_id=project_id,
-        kind="delete",
-        payload={"user_id": "admin", "username": "system-admin"},
-        user_id="admin",
-        username="system-admin",
-    )
-    await k3s_cluster.update_cluster_status(project_id, cluster_id, "DELETING", "관리자 삭제 요청")
+    await _enqueue_admin_delete(cluster_id, cluster, token_info)
 
 
 @router.post("/clusters/{cluster_id}/delete-async")
-async def delete_admin_cluster_async(cluster_id: str):
+async def delete_admin_cluster_async(cluster_id: str, token_info: dict = Depends(require_token)):
     cluster = await k3s_cluster.get_cluster_admin(cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
-    project_id = cluster["project_id"]
 
-    job_id = await _jobs_svc.enqueue_job(
-        cluster_id=cluster_id,
-        project_id=project_id,
-        kind="delete",
-        payload={"user_id": "admin", "username": "system-admin"},
-        user_id="admin",
-        username="system-admin",
-    )
-    await k3s_cluster.update_cluster_status(project_id, cluster_id, "DELETING", "관리자 삭제 요청")
+    job_id = await _enqueue_admin_delete(cluster_id, cluster, token_info)
 
     async def gen() -> AsyncGenerator[str, None]:
         yield ": " + " " * 2048 + "\n\n"

@@ -23,6 +23,13 @@ def clear_internal_keystone_endpoint_cache():
         yield
 
 
+@pytest.fixture(autouse=True)
+def synthetic_project_role_directory():
+    # This module tests token transport; current role graph behavior has its own tests.
+    with patch("drover.auth._current_project_roles", return_value=["member"]):
+        yield
+
+
 _TOKEN_INFO = {
     "token": "caller-scoped-token",
     "project_id": "project-1",
@@ -241,3 +248,29 @@ async def test_admin_keystone_client_uses_internal_identity_endpoint(catalog_end
         session=session,
         endpoint_override="https://keystone.internal.example/v3",
     )
+
+
+async def test_system_admin_requires_effective_system_assignment():
+    from drover.auth import _is_system_admin
+
+    client = MagicMock()
+    client.role_assignments.list.return_value = []
+    with patch("drover.auth._resolve_admin_role_id", return_value="real-admin-id"), patch("drover.auth._get_admin_ks_client", return_value=client):
+        assert _is_system_admin("tenant-service-admin") is False
+        client.role_assignments.list.assert_called_once_with(
+            user="tenant-service-admin", role="real-admin-id", system="all", effective=True,
+        )
+        client.role_assignments.list.return_value = [{"user": {"id": "verified-system-user"},
+            "role": {"id": "real-admin-id"}, "scope": {"system": {"all": True}}}]
+        assert _is_system_admin("verified-system-user") is True
+        client.role_assignments.list.return_value[0]["scope"] = {"project": {"id": "tenant"}}
+        assert _is_system_admin("verified-system-user") is False
+
+
+async def test_ambiguous_admin_role_resolution_fails_closed():
+    from drover.auth import _resolve_admin_role_id
+
+    client = MagicMock()
+    client.roles.list.return_value = [SimpleNamespace(id="a", domain_id=None), SimpleNamespace(id="b", domain_id=None)]
+    with patch("drover.auth._get_admin_ks_client", return_value=client):
+        assert _resolve_admin_role_id() is None

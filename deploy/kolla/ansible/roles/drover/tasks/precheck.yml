@@ -29,6 +29,20 @@
   tags: precheck
   when: enable_drover | bool
 
+- name: Precheck | Validate Drover delegated execution authority
+  ansible.builtin.assert:
+    that:
+      - drover_delegated_required_roles | length > 0
+      - (drover_delegated_required_roles + drover_delegated_optional_roles) | map('lower') | intersect(['admin', 'manager']) | length == 0
+      - drover_operation_trust_ttl_seconds | int >= 900
+      - drover_operation_trust_ttl_seconds | int <= 86400
+      - drover_operation_trust_min_remaining_seconds | int >= 60
+      - drover_operation_trust_min_remaining_seconds | int < drover_operation_trust_ttl_seconds | int
+    fail_msg: "Drover delegates requester roles only: at least one required role, never admin/manager, trust TTL 900-86400s"
+  run_once: true
+  tags: precheck
+  when: enable_drover | bool
+
 - name: Precheck | Validate Drover public route hostname
   ansible.builtin.assert:
     that:

@@ -29,6 +29,19 @@ async def _reconcile_worker_loop():
         await asyncio.sleep(interval)
 
 
+async def _delegation_worker_loop():
+    """Release idle operation trusts and record their Keystone expiry; never repeats cloud mutations."""
+    from drover.services import delegation
+
+    await asyncio.sleep(15)
+    while True:
+        try:
+            await delegation.sweep()
+        except Exception:
+            _logger.warning("Delegation cleanup loop failed")
+        await asyncio.sleep(300)
+
+
 async def _jobs_worker_loop():
     from drover.services.jobs import claim_and_run_jobs
 
@@ -107,6 +120,7 @@ async def _main_async():
         asyncio.create_task(_jobs_worker_loop()),
         asyncio.create_task(_health_worker_loop()),
         asyncio.create_task(_stampede_worker_loop()),
+        asyncio.create_task(_delegation_worker_loop()),
     ]
 
     await stop_event.wait()

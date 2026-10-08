@@ -48,54 +48,45 @@ def test_build_credentials():
     assert admin_creds["is_system_admin"] is True
 
 
-def test_member_allowed_denied_matrix():
-    member_info = {
-        "user_id": "user-member",
-        "project_id": "proj-alpha",
-        "roles": ["member"],
-        "is_system_admin": False,
-    }
-    admin_info = {
-        "user_id": "user-admin",
-        "project_id": "proj-admin",
-        "roles": ["admin"],
-        "is_system_admin": True,
-    }
+@pytest.mark.parametrize("role", ["member", "reader", "project_member", "project_admin", "project_owner", "admin", "manager"])
+def test_plain_project_roles_have_no_service_entitlement(role):
+    token = {"user_id": "u", "project_id": "p", "roles": [role], "is_system_admin": False}
+    assert not build_credentials(token)["is_system_admin"]
+    for action in ("get", "create", "scale", "delete"):
+        assert not authorize(f"drover:clusters:{action}", {"project_id": "p"}, token, do_raise=False)
+    assert not authorize("drover:admin", None, token, do_raise=False)
 
-    own_target = {"project_id": "proj-alpha"}
-    other_target = {"project_id": "proj-beta"}
 
-    # 1. drover:clusters:get
-    assert authorize("drover:clusters:get", own_target, member_info, do_raise=False) is True
-    assert authorize("drover:clusters:get", other_target, member_info, do_raise=False) is False
-    assert authorize("drover:clusters:get", other_target, admin_info, do_raise=False) is True
+@pytest.mark.parametrize(("role", "allowed"), [
+    ("drover_reader", set()),
+    ("drover_user", set()),
+    ("drover_editor", set()),
+    ("drover_admin", set()),
+    ("drover-inventory_reader", {"get"}),
+    ("drover-access_user", {"access"}),
+    ("drover-clusters_editor", {"create", "scale"}),
+    ("drover-workloads_editor", {"access", "workloads"}),
+    ("drover-access_admin", {"access", "full", "workloads"}),
+    ("drover-clusters_admin", {"delete", "rotate"}),
+])
+def test_service_grade_and_leaf_matrix(role, allowed):
+    token = {"user_id": "u", "project_id": "p", "roles": ["reader", "member", role]}
+    actions = {**{a: f"drover:clusters:{a}" for a in ("get", "create", "scale", "delete")},
+               "access": "drover:access:get", "full": "drover:access:admin",
+               "workloads": "drover:workloads:write", "rotate": "drover:certificates:rotate"}
+    for action, rule in actions.items():
+        assert authorize(rule, {"project_id": "p"}, token, do_raise=False) == (action in allowed)
+        assert not authorize(rule, {"project_id": "other"}, token, do_raise=False)
+    for rule in ("drover:admin", "drover:templates:manage"):
+        assert not authorize(rule, None, token, do_raise=False)
 
-    # 2. drover:clusters:create
-    assert authorize("drover:clusters:create", own_target, member_info, do_raise=False) is True
-    assert authorize("drover:clusters:create", other_target, member_info, do_raise=False) is False
 
-    # 3. drover:clusters:scale
-    assert authorize("drover:clusters:scale", own_target, member_info, do_raise=False) is True
-    assert authorize("drover:clusters:scale", other_target, member_info, do_raise=False) is False
-    assert authorize("drover:clusters:scale", other_target, admin_info, do_raise=False) is True
-
-    # 4. drover:clusters:delete
-    assert authorize("drover:clusters:delete", own_target, member_info, do_raise=False) is True
-    assert authorize("drover:clusters:delete", other_target, member_info, do_raise=False) is False
-    assert authorize("drover:clusters:delete", other_target, admin_info, do_raise=False) is True
-
-    # 5. drover:templates:manage
-    assert authorize("drover:templates:manage", own_target, member_info, do_raise=False) is False
-    assert authorize("drover:templates:manage", own_target, admin_info, do_raise=False) is True
-
-    # 6. drover:operations:get
-    assert authorize("drover:operations:get", own_target, member_info, do_raise=False) is True
-    assert authorize("drover:operations:get", other_target, member_info, do_raise=False) is False
-    assert authorize("drover:operations:get", other_target, admin_info, do_raise=False) is True
-
-    # 7. drover:admin
-    assert authorize("drover:admin", own_target, member_info, do_raise=False) is False
-    assert authorize("drover:admin", own_target, admin_info, do_raise=False) is True
+def test_service_roles_require_baseline_and_reject_raw_admin():
+    for roles in (["drover-access_user"], ["reader", "drover-access_user"], ["member", "reader", "admin", "drover-access_admin"], ["member", "manager", "drover-workloads_editor"]):
+        token = {"project_id": "p", "roles": roles}
+        assert not authorize("drover:access:get", None, token, do_raise=False)
+    verified = {"project_id": "p", "roles": ["admin"], "is_system_admin": True}
+    assert authorize("drover:admin", None, verified)
 
 
 def test_policy_file_override():
@@ -179,9 +170,9 @@ async def test_operation_access_security(monkeypatch):
 
     def mock_validate(token, project_id=""):
         if token == "tok-owner":
-            return {"user_id": "u1", "project_id": "proj-owner", "roles": ["member"], "is_system_admin": False}
+            return {"user_id": "u1", "project_id": "proj-owner", "roles": ["reader", "drover-inventory_reader"], "is_system_admin": False}
         if token == "tok-other":
-            return {"user_id": "u2", "project_id": "proj-other", "roles": ["member"], "is_system_admin": False}
+            return {"user_id": "u2", "project_id": "proj-other", "roles": ["reader", "drover-inventory_reader"], "is_system_admin": False}
         if token == "tok-admin":
             return {"user_id": "admin", "project_id": "proj-admin", "roles": ["admin"], "is_system_admin": True}
         raise Exception("Invalid token")

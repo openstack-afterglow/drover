@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-import secrets
 from typing import TYPE_CHECKING
 
 from keystoneauth1 import session as ks_session
@@ -305,32 +303,6 @@ def _connect_as_service(project_id: str) -> openstack.connection.Connection:
     )
 
 
-def get_admin_project_connection() -> openstack.connection.Connection:
-    """afterglow admin 크리덴셜로 admin 프로젝트에 스코프된 연결.
-
-    Barbican project-quotas 등 admin 프로젝트 스코프가 필요한 cross-project 관리 API에 사용.
-    사용자의 현재 프로젝트 선택과 무관하게 항상 admin 프로젝트로 스코프됨.
-    """
-    import openstack
-
-    settings = get_settings()
-    return openstack.connect(
-        load_envvars=False,
-        load_yaml_config=False,
-        auth_url=settings.os_auth_url,
-        auth_type="password",
-        username=settings.os_username,
-        password=settings.os_password,
-        project_name=settings.os_project_name,
-        user_domain_name=settings.os_user_domain_name,
-        project_domain_name=settings.os_project_domain_name,
-        region_name=settings.os_region_name,
-        interface=settings.os_interface,
-        api_timeout=30,
-        verify=settings.ssl_verify,
-    )
-
-
 def get_service_project_connection() -> openstack.connection.Connection:
     """Union Mount 전용 service 프로젝트로 스코프된 admin 자격 conn.
 
@@ -369,107 +341,6 @@ def get_user(conn: openstack.connection.Connection, user_id: str) -> dict:
     }
 
 
-def _ensure_cluster_manager_user_sync_with_admin_conn(project_id: str, admin_conn, settings) -> tuple[str, str, str]:
-    """Keystone 신규 사용자 생성 + 역할 부여 (sync). 반환: (user_id, username, password).
-
-    DB 저장은 호출자가 별도로 수행 (event loop 격리)."""
-    username = f"afterglow-cluster-mgr-{project_id[:8]}"
-    password = secrets.token_urlsafe(32)
-
-    domain_id = None
-    try:
-        domains = list(admin_conn.identity.domains(name=settings.os_user_domain_name))
-        if domains:
-            domain_id = domains[0].id
-    except Exception:
-        _logger.warning("도메인 ID 조회 실패, 기본 도메인 사용")
-
-    try:
-        create_kwargs: dict = {"name": username, "password": password, "enabled": True}
-        if domain_id:
-            create_kwargs["domain_id"] = domain_id
-        user = admin_conn.identity.create_user(**create_kwargs)
-        user_id = user.id
-    except Exception as e:
-        _logger.warning("관리 사용자 생성 실패 (이미 존재 가능성): %s", e)
-        existing = list(admin_conn.identity.users(name=username))
-        if not existing:
-            raise RuntimeError(f"관리 사용자 {username} 생성 및 조회 모두 실패") from e
-        user_id = existing[0].id
-        admin_conn.identity.update_user(user_id, password=password)
-
-    for role_name in ("member", "load-balancer_member"):
-        try:
-            roles = list(admin_conn.identity.roles(name=role_name))
-            if not roles:
-                raise RuntimeError(
-                    f"'{role_name}' 역할이 Keystone에 존재하지 않습니다. 운영자가 해당 role을 사전 생성해야 합니다."
-                )
-            admin_conn.identity.assign_project_role_to_user(project=project_id, user=user_id, role=roles[0].id)
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"역할 {role_name} 부여 실패: {e}") from e
-
-    return user_id, username, password
-
-
-async def ensure_cluster_manager_user(project_id: str) -> tuple[str, str]:
-    """프로젝트의 관리 사용자 (user_id, plaintext_password) 반환.
-
-    DB 캐시 우선, 없으면 admin conn 으로 신규 생성 후 DB 에 암호화 저장.
-    동시 생성 경쟁 시 Keystone Conflict → list 재조회 멱등 처리.
-
-    async 로 작성하여 호출자 event loop 의 SQLAlchemy connection pool 을 그대로 사용
-    (asyncio.run 으로 새 loop 를 생성하면 pool affinity 충돌 발생).
-    """
-    from drover.crypto import decrypt_manager_password, encrypt_manager_password
-    from drover.services.store import get_manager_credentials, save_manager_credentials
-
-    cached = await get_manager_credentials(project_id)
-    if cached:
-        return cached["user_id"], decrypt_manager_password(cached["encrypted_password"])
-
-    settings = get_settings()
-    admin_conn = await asyncio.to_thread(get_admin_project_connection)
-    try:
-        user_id, username, password = await asyncio.to_thread(
-            _ensure_cluster_manager_user_sync_with_admin_conn, project_id, admin_conn, settings
-        )
-        encrypted_pw = encrypt_manager_password(password)
-        await save_manager_credentials(project_id, user_id, username, encrypted_pw)
-        return user_id, password
-    finally:
-        await close_connection(admin_conn)
-
-
-def _connect_as_manager(project_id: str, password: str, settings):
-    import openstack
-
-    return openstack.connect(
-        load_envvars=False,
-        load_yaml_config=False,
-        auth_url=settings.os_auth_url,
-        auth_type="password",
-        username=f"afterglow-cluster-mgr-{project_id[:8]}",
-        password=password,
-        project_id=project_id,
-        user_domain_name=settings.os_user_domain_name,
-        project_domain_name=settings.os_project_domain_name,
-        region_name=settings.os_region_name,
-        interface=settings.os_interface,
-        api_timeout=30,
-        verify=settings.ssl_verify,
-    )
-
-
-async def get_project_manager_connection(project_id: str) -> openstack.connection.Connection:
-    """Return the durable per-project manager connection used by background jobs."""
-    _, password = await ensure_cluster_manager_user(project_id)
-    settings = get_settings()
-    return await asyncio.to_thread(_connect_as_manager, project_id, password, settings)
-
-
 def _close_connection_sync(conn) -> None:
     """Close both the keystoneauth HTTP pool and openstacksdk resources."""
     sdk_session = getattr(conn, "_session", None)
@@ -485,59 +356,6 @@ def _close_connection_sync(conn) -> None:
 async def close_connection(conn) -> None:
     """Release every resource held by an openstacksdk connection."""
     await asyncio.to_thread(_close_connection_sync, conn)
-
-
-@contextlib.asynccontextmanager
-async def project_manager_connection(project_id: str):
-    """Yield a durable per-project manager connection and ensure it is closed."""
-    conn = await get_project_manager_connection(project_id)
-    try:
-        yield conn
-    finally:
-        await close_connection(conn)
-
-
-def _create_app_cred_sync(project_id: str, cluster_name: str, user_id: str, password: str) -> dict:
-    settings = get_settings()
-    mgr_conn = _connect_as_manager(project_id, password, settings)
-    try:
-        app_cred = mgr_conn.identity.create_application_credential(
-            user=user_id,
-            name=f"drover-appcred-{cluster_name}",
-            description=f"Drover k3s cluster {cluster_name} application credential",
-            roles=[{"name": "member"}],
-        )
-        return {"id": app_cred.id, "secret": app_cred.secret, "user_id": user_id}
-    finally:
-        _close_connection_sync(mgr_conn)
-
-
-async def create_app_credential_for_cluster(project_id: str, cluster_name: str) -> dict:
-    """관리 사용자 자격으로 클러스터 전용 App Credential 발급.
-
-    Returns:
-        {"id": ..., "secret": ..., "user_id": ...}
-    """
-    user_id, password = await ensure_cluster_manager_user(project_id)
-    return await asyncio.to_thread(_create_app_cred_sync, project_id, cluster_name, user_id, password)
-
-
-def _delete_app_cred_sync(project_id: str, app_cred_id: str, user_id: str, password: str) -> None:
-    settings = get_settings()
-    mgr_conn = _connect_as_manager(project_id, password, settings)
-    try:
-        mgr_conn.identity.delete_application_credential(user_id, app_cred_id, ignore_missing=True)
-    finally:
-        _close_connection_sync(mgr_conn)
-
-
-async def delete_app_credential(project_id: str, app_cred_id: str) -> None:
-    """관리 사용자 자격으로 App Credential 회수 (best-effort)."""
-    try:
-        user_id, password = await ensure_cluster_manager_user(project_id)
-        await asyncio.to_thread(_delete_app_cred_sync, project_id, app_cred_id, user_id, password)
-    except Exception:
-        _logger.warning("App Credential %s 회수 실패 (best-effort)", app_cred_id, exc_info=True)
 
 
 def list_user_groups(token: str, user_id: str) -> list[dict]:

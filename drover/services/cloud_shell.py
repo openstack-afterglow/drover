@@ -1,150 +1,196 @@
-"""k3s Cloud Shell — ephemeral pod 세션 관리."""
+"""Isolated Cloud Shell pods with expiring, principal-bound workload credentials."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import logging
+import re
+import secrets
+import time
+from datetime import UTC, datetime
 
-import yaml
 from fastapi import HTTPException
 
+from drover.policy import authorize_workload_namespace
+from drover.services import credentials
 from drover.services import kube as k3s_kube
-from drover.services import store as k3s_db
-
-_logger = logging.getLogger(__name__)
+from drover.services.errors import K3sApiError
 
 SHELL_NAMESPACE = "afterglow-shell"
 SHELL_IMAGE = "bitnami/kubectl:1.31"
 IDLE_TIMEOUT_SECONDS = 15 * 60
+SESSION_MAX_SECONDS = 60 * 60
 
 
 def _user_hash(user_id: str) -> str:
-    """deterministic 12자 lowercase hex — K8s 이름 호환."""
     return hashlib.sha256(user_id.encode()).hexdigest()[:12]
 
 
 def pod_name(user_id: str) -> str:
-    return f"cloud-shell-{_user_hash(user_id)}"
+    return f"cloud-shell-v2-{_user_hash(user_id)}"
 
 
 def pvc_name(user_id: str) -> str:
-    return f"cloud-shell-home-{_user_hash(user_id)}"
+    # Never reuse a legacy home: it may contain copied administrator keys.
+    return f"cloud-shell-home-v2-{_user_hash(user_id)}"
 
 
-def kubeconfig_secret_name(user_id: str) -> str:
-    return f"cloud-shell-kc-{_user_hash(user_id)}"
+def kubeconfig_secret_name(pod: str) -> str:
+    return f"{pod}-kc"
 
 
-def k8s_user_name(user_id: str) -> str:
-    return f"afterglow-user-{_user_hash(user_id)}"
+def session_expires_at(token_info: dict) -> float:
+    try:
+        expires = datetime.fromisoformat(token_info["expires_at"].replace("Z", "+00:00"))
+        if expires.tzinfo is None:
+            raise ValueError("unscoped expiry")
+        expiry = expires.astimezone(UTC).timestamp()
+    except (KeyError, TypeError, AttributeError, ValueError):
+        raise HTTPException(401, "A Keystone token with expiration is required") from None
+    if expiry <= time.time():
+        raise HTTPException(401, "Keystone token expired")
+    return min(expiry, time.time() + SESSION_MAX_SECONDS)
 
 
-def build_shell_kubeconfig(admin_kubeconfig_yaml: str, user_id: str) -> str:
-    """admin kubeconfig 에 impersonation 필드 추가하여 반환."""
-    kc = yaml.safe_load(admin_kubeconfig_yaml)
-    kc["users"][0]["user"]["as"] = k8s_user_name(user_id)
-    return yaml.safe_dump(kc, default_flow_style=False)
-
-
-def build_pod_manifest(user_id: str, kc_secret_name: str, pvc_name_: str) -> dict:
-    """sleep infinity 로 유지되는 shell pod 매니페스트."""
+def build_pod_manifest(
+    user_id: str, kc_secret_name: str, pvc_name_: str, *, name: str, project_id: str,
+    workload_namespace: str, expires_at: float,
+) -> dict:
     return {
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
-            "name": pod_name(user_id),
+            "name": name,
             "namespace": SHELL_NAMESPACE,
             "labels": {"app": "cloud-shell", "afterglow-user": _user_hash(user_id)},
+            "annotations": {
+                "drover.io/user-id": user_id,
+                "drover.io/project-id": project_id,
+                "drover.io/workload-namespace": workload_namespace,
+                "drover.io/credential-expiry": str(expires_at),
+            },
         },
         "spec": {
             "automountServiceAccountToken": False,
+            "activeDeadlineSeconds": max(1, int(expires_at - time.time())),
             "restartPolicy": "Never",
-            "containers": [
-                {
-                    "name": "shell",
-                    "image": SHELL_IMAGE,
-                    "command": ["sh", "-c", "sleep infinity"],
-                    "stdin": True,
-                    "tty": True,
-                    "env": [
-                        {"name": "HOME", "value": "/home/afterglow"},
-                        {"name": "KUBECONFIG", "value": "/root/.kube/config"},
-                    ],
-                    "volumeMounts": [
-                        {"name": "home", "mountPath": "/home/afterglow"},
-                        {"name": "kubeconfig", "mountPath": "/root/.kube", "readOnly": True},
-                    ],
-                    "resources": {
-                        "limits": {"memory": "256Mi", "cpu": "200m"},
-                        "requests": {"memory": "64Mi", "cpu": "50m"},
-                    },
-                }
-            ],
+            "securityContext": {"runAsNonRoot": True, "runAsUser": 1001, "fsGroup": 1001},
+            "containers": [{
+                "name": "shell",
+                "image": SHELL_IMAGE,
+                "command": ["sh", "-c", "sleep infinity"],
+                "stdin": True,
+                "tty": True,
+                "securityContext": {
+                    "allowPrivilegeEscalation": False,
+                    "capabilities": {"drop": ["ALL"]},
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "env": [
+                    {"name": "HOME", "value": "/home/afterglow"},
+                    {"name": "KUBECONFIG", "value": "/etc/drover/config"},
+                ],
+                "volumeMounts": [
+                    {"name": "home", "mountPath": "/home/afterglow"},
+                    {"name": "kubeconfig", "mountPath": "/etc/drover", "readOnly": True},
+                ],
+                "resources": {
+                    "limits": {"memory": "256Mi", "cpu": "200m"},
+                    "requests": {"memory": "64Mi", "cpu": "50m"},
+                },
+            }],
             "volumes": [
-                {
-                    "name": "home",
-                    "persistentVolumeClaim": {"claimName": pvc_name_},
-                },
-                {
-                    "name": "kubeconfig",
-                    "secret": {
-                        "secretName": kc_secret_name,
-                        "items": [{"key": "config", "path": "config"}],
-                    },
-                },
+                {"name": "home", "persistentVolumeClaim": {"claimName": pvc_name_}},
+                {"name": "kubeconfig", "secret": {
+                    "secretName": kc_secret_name, "defaultMode": 0o440,
+                    "items": [{"key": "config", "path": "config"}],
+                }},
             ],
         },
     }
 
 
-async def ensure_session(cluster_id: str, user_id: str, *, project_id: str) -> str:
-    """Cloud Shell 세션 보장 — 없으면 생성, 있으면 Running 확인.
+async def _delete_resource(client, url: str) -> None:
+    response = await client.delete(url)
+    if response.status_code not in (200, 202, 404):
+        k3s_kube._raise_k8s_error(response, "remove obsolete shell resource")
+    # A 202 is not deletion: do not admit a replacement while old pods run.
+    deadline = time.monotonic() + 90
+    while response.status_code != 404:
+        response = await client.get(url)
+        if response.status_code == 404:
+            return
+        if response.status_code != 200:
+            k3s_kube._raise_k8s_error(response, "observe shell resource deletion")
+        if time.monotonic() >= deadline:
+            raise K3sApiError(504, "Obsolete shell resource deletion timed out")
+        await asyncio.sleep(1)
 
-    반환값: pod_name (str)
-    """
-    k8s_user = k8s_user_name(user_id)
-    p_name = pod_name(user_id)
-    pvc = pvc_name(user_id)
-    kc_secret = kubeconfig_secret_name(user_id)
 
-    # 1. 네임스페이스
-    await k3s_kube.ensure_namespace(cluster_id, SHELL_NAMESPACE, project_id=project_id)
-
-    # 2. ClusterRoleBinding (idempotent)
-    await k3s_kube.ensure_cluster_role_binding_for_user(cluster_id, k8s_user, project_id=project_id)
-
-    # 3. PVC (영속 홈 디렉터리)
-    await k3s_kube.ensure_pvc(cluster_id, SHELL_NAMESPACE, pvc, project_id=project_id)
-
-    # 4. kubeconfig Secret (매 세션마다 최신 kubeconfig 반영)
-    admin_kc_yaml = await k3s_db.get_kubeconfig(project_id=project_id, cluster_id=cluster_id)
-    if not admin_kc_yaml:
-        admin_kc_yaml = await k3s_db.get_kubeconfig_admin(cluster_id)
-    if not admin_kc_yaml:
-        raise HTTPException(502, "kubeconfig 없음 — 클러스터가 아직 준비되지 않았습니다")
-    shell_kc = build_shell_kubeconfig(admin_kc_yaml, user_id)
-    await k3s_kube.create_k8s_secret(
-        cluster_id, SHELL_NAMESPACE, kc_secret, {"config": shell_kc}, project_id=project_id
+async def retire_legacy_sessions(cluster_id: str, *, project_id: str) -> None:
+    """Retire admin-bearing pods/Secrets/bindings; quarantine old homes by non-use."""
+    paths = (
+        (f"/api/v1/namespaces/{SHELL_NAMESPACE}/pods", r"cloud-shell-[0-9a-f]{12}"),
+        ("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings", r"afterglow-shell-afterglow-user-[0-9a-f]{12}"),
+        (f"/api/v1/namespaces/{SHELL_NAMESPACE}/secrets", r"cloud-shell-kc-[0-9a-f]{12}"),
     )
+    async with k3s_kube._kube_client(cluster_id, project_id=project_id) as (client, server):
+        for path, pattern in paths:
+            response = await client.get(server + path)
+            if response.status_code == 404:
+                continue
+            if response.status_code != 200:
+                k3s_kube._raise_k8s_error(response, "inventory obsolete shell resources")
+            for item in response.json().get("items", []):
+                name = item.get("metadata", {}).get("name", "")
+                if re.fullmatch(pattern, name):
+                    await _delete_resource(client, f"{server}{path}/{name}")
 
-    # 5. Pod 존재 확인
-    existing = await k3s_kube.get_pod(cluster_id, SHELL_NAMESPACE, p_name, project_id=project_id)
-    if existing:
-        phase = existing.get("status", {}).get("phase", "")
-        if phase == "Running":
-            return p_name
-        if phase == "Pending":
-            ready = await k3s_kube.wait_pod_ready(
-                cluster_id, SHELL_NAMESPACE, p_name, timeout=90.0, project_id=project_id
-            )
-            if ready:
-                return p_name
-        # Failed / Succeeded / Unknown 또는 timeout → 재생성
-        await k3s_kube.delete_pod(cluster_id, SHELL_NAMESPACE, p_name, project_id=project_id)
 
-    manifest = build_pod_manifest(user_id, kc_secret, pvc)
-    await k3s_kube.create_pod(cluster_id, SHELL_NAMESPACE, manifest, project_id=project_id)
-    ready = await k3s_kube.wait_pod_ready(cluster_id, SHELL_NAMESPACE, p_name, timeout=120.0, project_id=project_id)
-    if not ready:
-        raise HTTPException(504, "Shell pod 가 준비되지 않았습니다 (timeout)")
-    return p_name
+async def delete_session(cluster_id: str, pod: str, *, project_id: str) -> None:
+    async with k3s_kube._kube_client(cluster_id, project_id=project_id) as (client, server):
+        base = f"{server}/api/v1/namespaces/{SHELL_NAMESPACE}"
+        await _delete_resource(client, f"{base}/pods/{pod}")
+        await _delete_resource(client, f"{base}/secrets/{kubeconfig_secret_name(pod)}")
+
+
+async def ensure_session(cluster_id: str, token_info: dict, *, project_id: str) -> str:
+    """Issue a fresh restricted credential and pod, without sharing mutable Secrets."""
+    user_id = token_info.get("user_id")
+    if not user_id or token_info.get("project_id") != project_id:
+        raise HTTPException(403, "Shell principal/project mismatch")
+    namespace = credentials.workload_namespace(project_id, user_id)
+    authorize_workload_namespace(namespace, token_info)
+    expires_at = session_expires_at(token_info)
+    await k3s_kube.ensure_namespace(cluster_id, SHELL_NAMESPACE, project_id=project_id)
+    await retire_legacy_sessions(cluster_id, project_id=project_id)
+    issued = await credentials.issue_kubeconfig(cluster_id, token_info, grade="editor")
+    if issued.namespace != namespace:
+        raise HTTPException(403, "Issued workload namespace mismatch")
+    expires_at = min(expires_at, issued.expires_at.timestamp())
+    if expires_at <= time.time():
+        raise HTTPException(401, "Shell credential expired")
+    pod = f"{pod_name(user_id)}-{secrets.token_hex(6)}"
+    secret = kubeconfig_secret_name(pod)
+    pvc = pvc_name(user_id)
+    await k3s_kube.ensure_pvc(cluster_id, SHELL_NAMESPACE, pvc, project_id=project_id)
+    try:
+        await k3s_kube.create_k8s_secret(
+            cluster_id, SHELL_NAMESPACE, secret, {"config": issued.kubeconfig}, project_id=project_id,
+        )
+        manifest = build_pod_manifest(
+            user_id, secret, pvc, name=pod, project_id=project_id,
+            workload_namespace=namespace, expires_at=expires_at,
+        )
+        await k3s_kube.create_pod(cluster_id, SHELL_NAMESPACE, manifest, project_id=project_id)
+        ready = await k3s_kube.wait_pod_ready(
+            cluster_id, SHELL_NAMESPACE, pod, timeout=120.0, project_id=project_id,
+        )
+        if not ready:
+            raise HTTPException(504, "Shell pod readiness timed out")
+        if expires_at <= time.time():
+            raise HTTPException(401, "Shell credential expired during provisioning")
+    except BaseException:
+        await asyncio.shield(delete_session(cluster_id, pod, project_id=project_id))
+        raise
+    return pod

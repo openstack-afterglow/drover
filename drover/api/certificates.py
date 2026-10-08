@@ -10,6 +10,7 @@ from fastapi.responses import Response, StreamingResponse
 from drover.auth import CacheMode, cache_mode, get_token_info
 from drover.config import get_settings
 from drover.models.schemas import CertificateExpiryResponse, CertificateInfo
+from drover.policy import require_inventory, require_policy
 from drover.services import store as k3s_db
 from drover.services.cache import cached_call
 from drover.services.cache import keys as cache_keys
@@ -41,7 +42,7 @@ async def _get_kubeconfig_for_user(project_id: str, cluster_id: str) -> str:
     return kc
 
 
-@router.get("/{cluster_id}/ca-certificate")
+@router.get("/{cluster_id}/ca-certificate", dependencies=[Depends(require_inventory)])
 async def download_ca_certificate(
     cluster_id: str,
     token_info: dict = Depends(get_token_info),
@@ -68,7 +69,7 @@ async def download_ca_certificate(
     )
 
 
-@router.get("/{cluster_id}/certificate-expiry", response_model=CertificateExpiryResponse)
+@router.get("/{cluster_id}/certificate-expiry", response_model=CertificateExpiryResponse, dependencies=[Depends(require_inventory)])
 async def get_certificate_expiry(
     cluster_id: str,
     token_info: dict = Depends(get_token_info),
@@ -120,7 +121,7 @@ async def get_certificate_expiry(
     )
 
 
-@router.post("/{cluster_id}/rotate-certs")
+@router.post("/{cluster_id}/rotate-certs", dependencies=[Depends(require_policy("drover:certificates:rotate"))])
 async def rotate_cluster_certs(
     cluster_id: str,
     token_info: dict = Depends(get_token_info),

@@ -16,6 +16,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
@@ -44,7 +45,7 @@ from drover.services import jobs as _jobs
 from drover.services import nova, operations, resource_policies
 from drover.services import store as k3s_cluster
 from drover.services.activity import rec
-from drover.services.cache import cached_call, invalidate, ttl_normal, ttl_slow
+from drover.services.cache import cached_call, invalidate, ttl_normal
 from drover.services.cache import invalidation as cache_invalidation
 from drover.services.cache import keys as cache_keys
 from drover.services.deletion import delete_cluster_progress as _delete_cluster_progress
@@ -160,56 +161,35 @@ async def download_kubeconfig(
     cluster_id: str,
     token_info: dict = Depends(get_token_info),
     cm: CacheMode = Depends(cache_mode),
+    grade: Literal["user", "editor", "admin"] = Query(default="user"),
 ):
-    """kubeconfig YAML 파일 다운로드. 아직 준비되지 않으면 404.
+    """Return an uncached grade-specific credential; certificates require access_admin."""
+    from drover.services import credentials
 
-    매 호출마다 audit log 기록 — 토큰 탈취 시 다운로드 추적이 가능하도록.
-    None 결과는 캐시하지 않는다 (초기화 중인 클러스터 UX 보호).
-    """
-    import json as _json
-
-    from drover.services.cache import get_backend
-
-    project_id = token_info["project_id"]
-    authorize("drover:clusters:get", {"project_id": project_id}, token_info)
+    project_id = token_info.get("project_id")
+    credentials.workload_namespace(project_id, token_info.get("user_id"))
+    if credentials._expiry(token_info.get("expires_at")) <= datetime.now(UTC):
+        raise HTTPException(401, "Token expired")
+    rule = {"user": "drover:access:read", "editor": "drover:workloads:write", "admin": "drover:access:admin"}[grade]
+    authorize(rule, {"project_id": project_id}, token_info)
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
-    if not cluster:
-        raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
-
-    cache_key = cache_keys.project_key("k3s", project_id, "clusters", sub=f"{cluster_id}:kubeconfig")
-    kubeconfig: bytes | None = None
-
-    # 캐시 조회 (캐시 활성 + 강제 갱신 아님일 때만)
-    if cm.enabled and not cm.refresh:
-        try:
-            backend = get_backend()
-            cached_raw = await backend.get(cache_key)
-            if cached_raw is not None:
-                kubeconfig = _json.loads(cached_raw).encode()
-        except Exception:
-            pass  # 캐시 장애 → fallthrough
-
-    if kubeconfig is None:
+    if not cluster or cluster.get("project_id") != project_id:
+        raise HTTPException(404, "Cluster not found")
+    headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+    if grade == "admin":
         try:
             kubeconfig = await k3s_cluster.get_kubeconfig(project_id, cluster_id)
-        except Exception as e:
-            _logger.error("kubeconfig 복호화 실패: %s", e)
-            raise HTTPException(status_code=500, detail="kubeconfig 복호화에 실패했습니다. 관리자에게 문의하세요.")
-
-        # None이 아닐 때만, 캐시 활성 시에만 저장
-        if kubeconfig is not None and cm.enabled:
-            try:
-                backend = get_backend()
-                await backend.set(cache_key, _json.dumps(kubeconfig.decode()), ttl_slow())
-            except Exception:
-                pass  # 캐시 장애 → silent fail
-
-    if not kubeconfig:
-        raise HTTPException(
-            status_code=404, detail="kubeconfig가 아직 준비되지 않았습니다. 클러스터가 초기화 중입니다."
-        )
-
+        except Exception:
+            raise HTTPException(502, "Cluster credential retrieval failed") from None
+        if not kubeconfig:
+            raise HTTPException(404, "Cluster credentials are not ready")
+    else:
+        issued = await credentials.issue_kubeconfig(cluster_id, token_info, grade=grade)
+        kubeconfig = issued.kubeconfig
+        headers["X-Credential-Expires-At"] = issued.expires_at.isoformat()
+        headers["X-Workload-Namespace"] = issued.namespace
     cluster_name = cluster.get("name", cluster_id)
+    headers["Content-Disposition"] = f'attachment; filename="kubeconfig-{cluster_id}.yaml"'
 
     # audit log — HEAD 는 보통 브라우저 사전 요청이라 GET 일 때만 기록
     if request.method == "GET":
@@ -224,7 +204,7 @@ async def download_kubeconfig(
                 action="kubeconfig_download",
                 resource_id=cluster_id,
                 resource_name=cluster_name,
-                extra={"source_ip": source_ip},
+                extra={"source_ip": source_ip, "credential_grade": grade},
             )
         except Exception:
             _logger.warning("kubeconfig 다운로드 audit 기록 실패", exc_info=True)
@@ -232,7 +212,7 @@ async def download_kubeconfig(
     return Response(
         content=kubeconfig,
         media_type="application/yaml",
-        headers={"Content-Disposition": f'attachment; filename="kubeconfig-{cluster_name}.yaml"'},
+        headers=headers,
     )
 
 
@@ -242,9 +222,21 @@ async def head_kubeconfig(
     cluster_id: str,
     token_info: dict = Depends(get_token_info),
     cm: CacheMode = Depends(cache_mode),
+    grade: Literal["user", "editor", "admin"] = Query(default="user"),
 ):
-    """kubeconfig 메타데이터 조회 (HEAD)."""
-    return await download_kubeconfig(request, cluster_id, token_info, cm)
+    """Authorize metadata only: HEAD never reads, decrypts, or issues credentials."""
+    from drover.services import credentials
+
+    project_id = token_info.get("project_id")
+    credentials.workload_namespace(project_id, token_info.get("user_id"))
+    if credentials._expiry(token_info.get("expires_at")) <= datetime.now(UTC):
+        raise HTTPException(401, "Token expired")
+    rule = {"user": "drover:access:read", "editor": "drover:workloads:write", "admin": "drover:access:admin"}[grade]
+    authorize(rule, {"project_id": project_id}, token_info)
+    cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
+    if not cluster or cluster.get("project_id") != project_id:
+        raise HTTPException(404, "Cluster not found")
+    return Response(media_type="application/yaml", headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 
 def compute_request_hash(req: CreateK3sClusterRequest) -> str:
@@ -279,6 +271,9 @@ async def create_k3s_cluster_async(
     """k3s 클러스터 생성 — SSE 스트리밍 진행률 반환."""
     project_id = conn._afterglow_project_id
     authorize("drover:clusters:create", {"project_id": project_id}, token_info)
+    if req.key_name:
+        # Node SSH can read the stored K3s administrator certificate/key.
+        authorize("drover:access:admin", {"project_id": project_id}, token_info)
 
     idempotency_key = request.headers.get("idempotency-key") or request.headers.get("Idempotency-Key")
     req_hash = compute_request_hash(req)
@@ -454,23 +449,53 @@ async def create_k3s_cluster_async(
             "allowed_cidrs": req.allowed_cidrs,
         }
 
-        await k3s_cluster.create_cluster_record(project_id, cluster_id, cluster_data)
+        from drover.api.delegated import admitted_operation, issue_credentials
+        from drover.db import get_session_factory
+        from drover.services import cluster_authority, delegation
+        from drover.services import plugins as k3s_plugins
 
         request_id = getattr(request.state, "correlation_id", None) or request.headers.get("x-openstack-request-id")
         job_payload = dict(cluster_data)
-
-        await _jobs.enqueue_job(
-            cluster_id=cluster_id,
-            project_id=project_id,
-            kind="create",
-            payload=job_payload,
-            user_id=_creator_user_id,
-            username=_creator_username,
-            request_id=request_id,
-            idempotency_key=idempotency_key,
-            request_hash=req_hash,
-            op_kind="create",
+        guest_plugins = cluster_authority.guest_plugin_names(
+            k3s_plugins.with_resource_policy_snapshot(get_settings(), policy_snapshot)
         )
+        purposes = [cluster_authority.CONTROL] + ([cluster_authority.GUEST] if guest_plugins else [])
+        factory = get_session_factory()
+        if factory is None:
+            raise HTTPException(status_code=503, detail="Durable job storage is unavailable")
+
+        # The requester's own trust drives creation; its restricted credentials grant the cluster continuous
+        # authority. Nothing is created for a service or manager identity.
+        async with admitted_operation(
+            token_info, project_id=project_id, cluster_id=cluster_id, action=delegation.ACTION_CREATE
+        ) as admitted:
+            issued = await issue_credentials(
+                conn, token_info, project_id=project_id, cluster_id=cluster_id, generation=1, purposes=purposes
+            )
+            try:
+                await k3s_cluster.create_cluster_record(project_id, cluster_id, cluster_data)
+                async with factory() as session, session.begin():
+                    cluster_authority.add_generation(
+                        session, cluster_id=cluster_id, project_id=project_id, generation=1, issued=issued,
+                        state="active", operation_id=None, guest_plugins=guest_plugins,
+                    )
+                    await _jobs.enqueue_job(
+                        cluster_id=cluster_id,
+                        project_id=project_id,
+                        kind="create",
+                        payload=job_payload,
+                        user_id=_creator_user_id,
+                        username=_creator_username,
+                        request_id=request_id,
+                        idempotency_key=idempotency_key,
+                        request_hash=req_hash,
+                        op_kind="create",
+                        session=session,
+                        delegation=admitted,
+                    )
+            except BaseException:
+                await cluster_authority.discard_issued(conn, issued)
+                raise
 
         try:
             await invalidate(f"afterglow:k3s:{project_id}:*")
@@ -581,20 +606,27 @@ async def scale_k3s_cluster(
     if desired == current:
         return {"message": "변경 없음", "agent_count": current}
 
+    from drover.api.delegated import admitted_operation
+    from drover.services import delegation
+
+    async with admitted_operation(
+        token_info, project_id=project_id, cluster_id=cluster_id, action=delegation.ACTION_SCALE
+    ) as admitted:
+        await _jobs.enqueue_job(
+            cluster_id=cluster_id,
+            project_id=project_id,
+            kind="scale",
+            payload={"desired_count": desired},
+            user_id=token_info.get("user_id"),
+            username=token_info.get("username"),
+            delegation=admitted,
+        )
     await k3s_cluster.update_cluster_status(project_id, cluster_id, "SCALING")
     try:
         await invalidate(f"afterglow:k3s:{project_id}:*")
         await cache_invalidation.invalidate_mutation_count("k3s", project_id)
     except Exception:
         pass
-    await _jobs.enqueue_job(
-        cluster_id=cluster_id,
-        project_id=project_id,
-        kind="scale",
-        payload={"desired_count": desired},
-        user_id=token_info.get("user_id"),
-        username=token_info.get("username"),
-    )
     await rec(
         token_info,
         None,
@@ -630,18 +662,35 @@ async def delete_k3s_cluster(
     except Exception:
         pass
 
-    await _jobs.enqueue_job(
-        cluster_id=cluster_id,
-        project_id=project_id,
-        kind="delete",
-        payload={
-            "user_id": token_info.get("user_id"),
-            "username": token_info.get("username"),
-        },
-        user_id=token_info.get("user_id"),
-        username=token_info.get("username"),
-    )
+    from drover.api.delegated import admitted_operation
+    from drover.services import cluster_authority, delegation
+
+    # Deletion runs under the current actor's own trust; the creator's grant is never needed.
+    async with admitted_operation(
+        token_info, project_id=project_id, cluster_id=cluster_id, action=delegation.ACTION_DELETE
+    ) as admitted:
+        await _jobs.enqueue_job(
+            cluster_id=cluster_id,
+            project_id=project_id,
+            kind="delete",
+            payload={
+                "user_id": token_info.get("user_id"),
+                "username": token_info.get("username"),
+            },
+            user_id=token_info.get("user_id"),
+            username=token_info.get("username"),
+            delegation=admitted,
+        )
     await k3s_cluster.update_cluster_status(project_id, cluster_id, "DELETING")
+    # Keystone forbids delegated tokens from deleting application credentials, so the actor's own credentials
+    # are revoked now with the actor's token; others are erased and reported by the delete job.
+    try:
+        await cluster_authority.retire_owned(
+            conn, cluster_id=cluster_id, owner_user_id=token_info.get("user_id") or "",
+            states=("staged", "active", "retiring"),
+        )
+    except Exception:
+        _logger.warning("k3s cluster %s: caller-owned credential revocation deferred to owner", cluster_id)
 
 
 @router.post("/{cluster_id}/delete-async")
@@ -654,6 +703,7 @@ async def delete_k3s_cluster_async(
 ):
     """k3s 클러스터 삭제 — SSE 스트리밍 진행률 반환."""
     project_id = conn._afterglow_project_id
+    authorize("drover:clusters:delete", {"project_id": project_id}, token_info)
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
@@ -677,7 +727,9 @@ async def delete_k3s_cluster_async(
             yield f"data: {msg.model_dump_json()}\n\n"
             return
         try:
-            async for msg in _delete_cluster_progress(conn, project_id, cluster, token_info):
+            async for msg in _delete_cluster_progress(
+                conn, project_id, cluster, token_info, credential_owner_user_id=token_info.get("user_id") or None
+            ):
                 msg.elapsed_seconds = round(time.monotonic() - start, 1)
                 yield f"data: {msg.model_dump_json()}\n\n"
         except Exception as e:
@@ -713,8 +765,10 @@ async def list_node_interfaces(
     cluster_id: str,
     vm_id: str,
     conn: openstack.connection.Connection = Depends(get_os_conn),
+    token_info: dict = Depends(get_token_info),
 ):
     project_id = conn._afterglow_project_id
+    authorize("drover:clusters:get", {"project_id": project_id}, token_info)
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
@@ -743,6 +797,7 @@ async def attach_node_interface(
     token_info: dict = Depends(get_token_info),
 ):
     project_id = conn._afterglow_project_id
+    authorize("drover:clusters:scale", {"project_id": project_id}, token_info)
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
@@ -821,6 +876,7 @@ async def detach_node_interface(
     token_info: dict = Depends(get_token_info),
 ):
     project_id = conn._afterglow_project_id
+    authorize("drover:clusters:delete", {"project_id": project_id}, token_info)
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
@@ -935,6 +991,13 @@ async def _set_stampede_enabled(project_id: str, cluster_id: str, enabled: bool,
             if enabled:
                 if cluster.status != "ACTIVE":
                     raise HTTPException(status_code=409, detail="ACTIVE 상태의 클러스터만 Stampede를 활성화할 수 있습니다")
+                from drover.services import cluster_authority
+
+                if not await cluster_authority.has_active_control(session, cluster_id):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Stampede requires cluster resource authority; reauthorize the cluster first",
+                    )
                 groups = (await session.execute(select(K3sNodegroup).where(
                     K3sNodegroup.cluster_id == cluster_id,
                     K3sNodegroup.deleted_at.is_(None), K3sNodegroup.stampede_enabled.is_(True),

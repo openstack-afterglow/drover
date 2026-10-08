@@ -1,5 +1,6 @@
 """Tests for file-backed credential loading, Kolla secret path rendering, and cloud-init secret exclusions."""
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -86,6 +87,7 @@ def test_kolla_drover_conf_renders_only_secret_paths():
 
     env = jinja2.Environment(undefined=jinja2.StrictUndefined)
     env.filters["bool"] = bool
+    env.filters["to_json"] = json.dumps
     template = env.from_string(template_text)
 
     rendered = template.render(
@@ -129,6 +131,11 @@ def test_kolla_drover_conf_renders_only_secret_paths():
         drover_barbican_kms_enabled=False,
         drover_barbican_kms_image="registry.k8s.io/provider-os/barbican-kms-plugin:v1.34.1",
         drover_barbican_kms_kek_id="",
+        drover_operation_trust_ttl_seconds=14400,
+        drover_operation_trust_min_remaining_seconds=300,
+        drover_delegated_required_roles=["member"],
+        drover_delegated_optional_roles=["load-balancer_member"],
+        drover_guest_rollout_timeout_seconds=600,
         drover_cert_rotation_node_timeout_sec=300,
         drover_cert_rotation_job_image="registry.k8s.io/util-linux/util-linux:latest",
         drover_stampede_enabled=False,
