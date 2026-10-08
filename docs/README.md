@@ -43,7 +43,7 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - 0.4.2 patch: runc가 PATH에 없는 신규 GPU worker의 join 실패(`nvidia-container-runtime --version`) 수정
    - 0.4.3 patch: 남은 boot volume 안전 정리, 미등록 worker Node 예약과 join/GPU 실패 구분
    - [v0.4.3 실제 발행·Kolla 배포·외부 연결 검증](release-0.4.0.md#tagged-043-verification-2026-10-06): 세 controller, 공개 HTTPS/인증/Swagger, 격리 자원 정리와 검증 한계
-   - [0.4.4 patch(미발행 candidate)](release-0.4.0.md#044-patch): scoped service grade, requester trust·restricted control/guest credential 실행 권한, migration 004, provisioning intent 제거와 순서 있는 cutover·rollback 전제조건
+   - [0.4.4 patch(발행 완료, 운영 cutover 보류)](release-0.4.0.md#044-patch): scoped service grade, requester trust·restricted control/guest credential 실행 권한, migration 004, provisioning intent 제거와 순서 있는 cutover·rollback 전제조건
 
 6. **[Drover 0.3.0 및 0.3.1 준비 기록](release-0.3.0.md)**
    - 구조화 요청/job 로그, opt-in `LOG_LEVEL=DEBUG`, Redis 5 종료 API 수정과 당시 검증 기록

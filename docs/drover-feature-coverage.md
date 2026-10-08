@@ -101,7 +101,7 @@ drover wheel
         └── drover-migrate.json.j2# Pre-start Migration 컨테이너 템플릿
 ```
 
-소스 role은 `deploy/kolla/ansible/roles/drover`에 있으며 root `drover` wheel의 shared data로 설치됩니다. 기본 wheel은 Kolla-Ansible 및 API/Worker runtime dependency를 포함하지 않으며 서비스에는 `drover[service]` extra가 필요합니다. `drover_image_tag` 기본값은 미발행 patch candidate `v0.4.4`입니다(`defaults/main.yml`). 실제 GHCR 발행/digest 확인 없이 소스 기본값만으로 배포 완료를 판단하지 않습니다. source-build pin과 SDK 버전(`0.2.21`)은 독립적입니다. 역사적 릴리스 문서는 새 execution-authority cutover의 검증 증거가 아닙니다.
+소스 role은 `deploy/kolla/ansible/roles/drover`에 있으며 root `drover` wheel의 shared data로 설치됩니다. 기본 wheel은 Kolla-Ansible 및 API/Worker runtime dependency를 포함하지 않으며 서비스에는 `drover[service]` extra가 필요합니다. `drover_image_tag` 기본값은 발행 tag `v0.4.4`입니다(`defaults/main.yml`). 실제 GHCR 발행/digest 확인 없이 소스 기본값만으로 배포 완료를 판단하지 않습니다. source-build pin과 SDK 버전(`0.2.21`)은 독립적입니다. 역사적 릴리스 문서는 새 execution-authority cutover의 검증 증거가 아닙니다.
 
 ### Schema Readiness 및 Pre-start Migration
 - API/Worker보다 `drover-migrate`를 먼저 실행하여 manifest checksum ledger의 001–004를 적용합니다. `004_execution_authority.sql`은 delegations, control/guest credential generations, job delegation FK와 `reauthorize` operation kind를 추가합니다. 기존 manager rows/password는 authority로 전환하지 않습니다. [004 upgrade runbook](../drover/migrations/README.md#execution-authority-upgrade-004)을 따릅니다.
