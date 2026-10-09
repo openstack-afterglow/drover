@@ -253,7 +253,7 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 3. 실제 source와 테스트 정의를 검토한 뒤 review marker를 `python3 scripts/check_architecture.py --stamp --summary "..."`로 갱신한다. staged 범위만 검토할 때는 `--stamp --staged --summary "..."`를 사용한다.
 4. 완료/commit 전 `python3 scripts/check_architecture.py` 또는 staged 제출 범위의 `python3 scripts/check_architecture.py --staged`를 실행한다. source가 문서보다 우선하며 stale이면 먼저 문서를 고친다.
 
-2026-10-09 patch review: direct system-admin 조회, structured TOML의 JSON/명시적 환경 키 precedence, app-credential create의 검증된 configured-root implied-role closure를 수정한다. 서비스/DB/API topology, project role-map 결과, unsafe tenant-role 정책과 credential lifecycle은 그대로다. 로컬 Python3.13.12에서 config23건, native installed-SDK credential19건, final 서비스1201건(3 skip), SDK114건 및 root/SDK Ruff가 통과했다. 기존 owner POST201→DELETE204와 provider source는 roots-only defect의 증거이지 재인가/guest activation 성공이 아니다. 새 immutable image/wheel, current recovery와 모든 controller runtime/source parity 이후에만 실제 owner 재인가를 실행한다.
+2026-10-09 patch review: direct system-admin 조회, structured TOML의 JSON/명시적 환경 키 precedence, app-credential create의 검증된 configured-root implied-role closure를 수정한다. 서비스/DB/API topology, project role-map 결과, unsafe tenant-role 정책과 credential lifecycle은 그대로다. 로컬 Python3.13.12에서 config18건, native installed-SDK credential19건, final 서비스1201건(3 skip), SDK114건 및 root/SDK Ruff가 통과했다. 기존 owner POST201→DELETE204와 provider source는 roots-only defect의 증거이지 재인가/guest activation 성공이 아니다. 새 immutable image/wheel, current recovery와 모든 controller runtime/source parity 이후에만 실제 owner 재인가를 실행한다.
 
 <!-- architecture-review:start -->
 ```json
