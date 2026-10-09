@@ -88,17 +88,23 @@ def _get_admin_ks_client():
 def _resolve_admin_role_id() -> str | None:
     try:
         roles = _get_admin_ks_client().roles.list(name="admin")
-        global_roles = [role for role in roles if not getattr(role, "domain_id", None)]
+        global_roles = []
+        for role in roles:
+            row = role if isinstance(role, dict) else role.to_dict()
+            if row.get("name") == "admin" and row.get("domain_id") is None and not row.get("domain"):
+                global_roles.append(row)
         if len(global_roles) == 1:
-            return global_roles[0].id
+            role_id = global_roles[0].get("id")
+            if isinstance(role_id, str) and role_id:
+                return role_id
     except Exception:
         _logger.warning("Failed to resolve Keystone admin role")
     return None
 
 
 def _is_system_admin(user_id: str) -> bool:
-    """Fail closed unless the user has admin on Keystone system scope."""
-    if not user_id:
+    """Fail closed unless the user has an exact direct global admin system grant."""
+    if not isinstance(user_id, str) or not user_id:
         return False
     try:
         role_id = _resolve_admin_role_id()
@@ -108,15 +114,17 @@ def _is_system_admin(user_id: str) -> bool:
             user=user_id,
             role=role_id,
             system="all",
-            effective=True,
         )
-        for assignment in assignments:
-            row = assignment if isinstance(assignment, dict) else assignment.to_dict()
-            if (row.get("user", {}).get("id") == user_id
-                    and row.get("role", {}).get("id") == role_id
-                    and row.get("scope", {}).get("system", {}).get("all") is True):
-                return True
-        return False
+        if len(assignments) != 1:
+            return False
+        assignment = assignments[0]
+        row = assignment if isinstance(assignment, dict) else assignment.to_dict()
+        scope = row.get("scope", {})
+        return (row.get("user", {}).get("id") == user_id
+                and "group" not in row
+                and row.get("role", {}).get("id") == role_id
+                and scope == {"system": {"all": True}}
+                and scope["system"]["all"] is True)
     except Exception:
         _logger.warning("Keystone system-admin check failed")
         return False
@@ -129,6 +137,16 @@ def _current_project_roles(user_id: str, project_id: str) -> list[str]:
 
 def current_project_role_map(user_id: str, project_id: str) -> dict[str, str]:
     """Return effective unique global role names mapped to their IDs for one current project assignment."""
+    role_map, _ = current_project_role_state(user_id, project_id)
+    return role_map
+
+
+def current_project_role_state(user_id: str, project_id: str) -> tuple[dict[str, str], dict[str, set[str]]]:
+    """Read the current global role map and validated inference edges in one directory snapshot.
+
+    Domain targets remain in the graph so credential delegation can reject them;
+    they still confer no global project authority.
+    """
     if not user_id or not project_id:
         raise ValueError("Project-scoped principal required")
     client = _get_admin_ks_client()
@@ -170,8 +188,7 @@ def current_project_role_map(user_id: str, project_id: str) -> dict[str, str]:
             continue
         for child in children:
             rid = field(child, "id")
-            if not is_global_role(rid):
-                continue
+            is_global_role(rid)  # Validate the identity even for a domain target.
             graph[prior].add(rid)
     pending = []
     for assignment in client.role_assignments.list(user=user_id, project=project_id, effective=True):
@@ -188,11 +205,11 @@ def current_project_role_map(user_id: str, project_id: str) -> dict[str, str]:
     effective = set()
     while pending:
         rid = pending.pop()
-        if rid not in effective:
+        if rid not in effective and is_global_role(rid):
             effective.add(rid)
             pending.extend(graph[rid])
     # Only unique global IDs can assert native names; domain aliases confer nothing.
-    return {name: rid for name, rid in global_names.items() if rid in effective}
+    return {name: rid for name, rid in global_names.items() if rid in effective}, graph
 
 
 def current_principal_state(user_id: str, project_id: str) -> tuple[bool, bool]:

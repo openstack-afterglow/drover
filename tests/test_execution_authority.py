@@ -324,13 +324,15 @@ def test_issued_credentials_reject_excess_authority(changes):
     created = SimpleNamespace(**{**dict(id="credential", secret="secret", unrestricted=False,
                                       project_id="project", user_id="operator", roles=[{"id": "member-id"}]), **changes})
     with pytest.raises(cluster_authority.CredentialIssueError):
-        cluster_authority._verify_issued(created, owner_user_id="operator", project_id="project", role_ids=["member-id"])
+        cluster_authority._verify_issued(created, owner_user_id="operator", project_id="project",
+                                         required_role_ids=["member-id"], allowed_role_ids={"member-id"})
 
 
 def test_issued_credentials_accept_restricted_owner_project_and_roles():
     created = SimpleNamespace(id="credential", secret="secret", unrestricted=False, project_id="project",
                               user_id="operator", roles=[{"id": "member-id"}])
-    cluster_authority._verify_issued(created, owner_user_id="operator", project_id="project", role_ids=["member-id"])
+    assert cluster_authority._verify_issued(created, owner_user_id="operator", project_id="project",
+                                            required_role_ids=["member-id"], allowed_role_ids={"member-id"}) == {"member-id"}
 
 
 @pytest.mark.asyncio

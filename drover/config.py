@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from functools import lru_cache
@@ -420,8 +421,8 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     for key, value in _load_toml().items():
-        if not os.environ.get(key.upper()):
-            os.environ[key.upper()] = str(value)
+        if key.upper() not in os.environ:
+            os.environ[key.upper()] = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
     return Settings()
 
 

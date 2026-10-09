@@ -74,7 +74,8 @@ def guest_plugin_names(settings) -> list[str]:
     return [plugin.name for plugin in k3s_plugins.get_active_plugins(settings) if plugin.name in GUEST_PLUGIN_NAMES]
 
 
-def _verify_issued(created, *, owner_user_id: str, project_id: str, role_ids: list[str]) -> None:
+def _verify_issued(created, *, owner_user_id: str, project_id: str,
+                   required_role_ids: list[str], allowed_role_ids: set[str]) -> set[str]:
     roles = {(role.get("id") if isinstance(role, dict) else getattr(role, "id", None)) for role in (created.roles or [])}
     if (
         not created.id
@@ -83,13 +84,15 @@ def _verify_issued(created, *, owner_user_id: str, project_id: str, role_ids: li
         or (created.project_id and created.project_id != project_id)
         or (getattr(created, "user_id", None) and created.user_id != owner_user_id)
         or not roles
-        or not roles <= set(role_ids)
+        or not set(required_role_ids) <= roles
+        or not roles <= allowed_role_ids
     ):
         raise CredentialIssueError("Keystone returned an application credential outside the requested authority")
+    return roles
 
 
 def _issue_sync(conn, *, owner_user_id: str, project_id: str, cluster_id: str, generation: int,
-                purposes: list[str], role_ids: list[str], role_names: list[str]) -> list[IssuedCredential]:
+                purposes: list[str], role_ids: list[str], allowed_role_map: dict[str, str]) -> list[IssuedCredential]:
     issued: list[IssuedCredential] = []
     try:
         for purpose in purposes:
@@ -102,9 +105,15 @@ def _issue_sync(conn, *, owner_user_id: str, project_id: str, cluster_id: str, g
             )
             issued.append(IssuedCredential(
                 purpose=purpose, app_credential_id=created.id, owner_user_id=owner_user_id,
-                role_ids=list(role_ids), role_names=list(role_names), secret=created.secret or "",
+                role_ids=list(role_ids), role_names=[], secret=created.secret or "",
             ))
-            _verify_issued(created, owner_user_id=owner_user_id, project_id=project_id, role_ids=role_ids)
+            accepted = _verify_issued(
+                created, owner_user_id=owner_user_id, project_id=project_id,
+                required_role_ids=role_ids, allowed_role_ids=set(allowed_role_map.values()),
+            )
+            accepted_names = sorted(name for name, rid in allowed_role_map.items() if rid in accepted)
+            issued[-1].role_names = accepted_names
+            issued[-1].role_ids = [allowed_role_map[name] for name in accepted_names]
     except Exception:
         _delete_owned_sync(conn, owner_user_id, [item.app_credential_id for item in issued])
         raise
@@ -131,11 +140,24 @@ async def issue(conn, token_info: dict, *, project_id: str, cluster_id: str, gen
     owner = token_info.get("user_id") or ""
     if not owner or token_info.get("project_id") != project_id:
         raise PermissionError("A project-scoped requester token for the cluster project is required")
-    role_map = await asyncio.to_thread(auth.current_project_role_map, owner, project_id)
-    names, ids = select_delegated_roles(role_map)
+    role_map, graph = await asyncio.to_thread(auth.current_project_role_state, owner, project_id)
+    _, ids = select_delegated_roles(role_map)
+    held_names = {rid: name for name, rid in role_map.items()}
+    closure: set[str] = set()
+    pending = list(ids)
+    while pending:
+        rid = pending.pop()
+        if rid in closure:
+            continue
+        name = held_names.get(rid)
+        if name is None or name.lower() in {"admin", "manager"}:
+            raise CredentialIssueError("Delegated role inference exceeds the requester's safe global authority")
+        closure.add(rid)
+        pending.extend(graph[rid])
+    allowed_role_map = {name: rid for name, rid in role_map.items() if rid in closure}
     return await asyncio.to_thread(
         _issue_sync, conn, owner_user_id=owner, project_id=project_id, cluster_id=cluster_id,
-        generation=generation, purposes=purposes, role_ids=ids, role_names=names,
+        generation=generation, purposes=purposes, role_ids=ids, allowed_role_map=allowed_role_map,
     )
 
 
