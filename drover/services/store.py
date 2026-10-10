@@ -287,7 +287,11 @@ async def update_cluster_reconciliation(
     status: str | None = None,
     status_reason: str | None = None,
 ) -> None:
-    """Update cluster reconciliation timestamp, drift_status, and optional status/status_reason."""
+    """Persist drift only while the locked target remains established and undeleted.
+
+    Reconciliation observes cloud state outside this transaction. Deletion/provisioning may
+    change lifecycle meanwhile; the current locking read must never overwrite those transitions.
+    """
     if not is_db_available():
         from drover.services import redis_store as _redis
 
@@ -302,7 +306,15 @@ async def update_cluster_reconciliation(
         return
 
     async with factory() as session:
-        stmt = select(K3sCluster).where(K3sCluster.id == cluster_id)
+        stmt = (
+            select(K3sCluster)
+            .where(
+                K3sCluster.id == cluster_id,
+                K3sCluster.deleted_at.is_(None),
+                K3sCluster.status.in_(["ACTIVE", "ERROR"]),
+            )
+            .with_for_update()
+        )
         result = await session.execute(stmt)
         cluster = result.scalar_one_or_none()
         if cluster is not None:

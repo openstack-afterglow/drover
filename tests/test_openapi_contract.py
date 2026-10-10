@@ -98,6 +98,52 @@ async def test_public_discovery_endpoints_runtime():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("peer", "trusted_proxies", "proto", "expected_scheme"),
+    [
+        ("192.0.2.10", "192.0.2.10/32", "https", "https"),
+        ("2001:db8::10", "2001:db8::10/128", "https", "https"),
+        ("127.0.0.1", "127.0.0.1/32", "https", "https"),
+        ("192.0.2.10", "192.0.2.10/32", "http", "http"),
+        ("192.0.2.10", "192.0.2.10/32", None, "http"),
+        ("192.0.2.10", "192.0.2.10/32", "https, http", "http"),
+        ("192.0.2.10", "192.0.2.10/32", "wss", "http"),
+        ("203.0.113.50", "192.0.2.10/32", "https", "http"),
+        ("127.0.0.1", "192.0.2.10/32", "https", "http"),
+        ("203.0.113.50", " ", "https", "http"),
+        ("203.0.113.50", "*", "https", "http"),
+    ],
+)
+async def test_discovery_and_slash_redirect_use_only_trusted_proxy_scheme(
+    monkeypatch, peer, trusted_proxies, proto, expected_scheme,
+):
+    monkeypatch.setenv("TRUSTED_PROXIES", trusted_proxies)
+    headers = {
+        "X-Openstack-Request-Id": "req-proxy-discovery",
+        "X-Forwarded-For": "192.0.2.10",
+        "X-Real-IP": "192.0.2.10",
+        "X-Forwarded-Host": "spoof.example",
+        "Forwarded": 'for=192.0.2.10;proto=https;host="spoof.example"',
+    }
+    if proto is not None:
+        headers["X-Forwarded-Proto"] = proto
+    transport = ASGITransport(app=app, client=(peer, 43210))
+    async with AsyncClient(transport=transport, base_url="http://api.example:8011") as client:
+        for path, document_key in [("/", "versions"), ("/v1/", "version")]:
+            response = await client.get(path, headers=headers)
+            assert response.status_code == 200
+            document = response.json()[document_key]
+            if document_key == "versions":
+                document = document[0]
+            assert document["links"] == [{"rel": "self", "href": f"{expected_scheme}://api.example:8011/v1/"}]
+            assert response.headers["X-Openstack-Request-Id"] == "req-proxy-discovery"
+        response = await client.get("/v1?probe=1", headers=headers, follow_redirects=False)
+        assert response.status_code == 307
+        assert response.headers["location"] == f"{expected_scheme}://api.example:8011/v1/?probe=1"
+        assert response.headers["X-Openstack-Request-Id"] == "req-proxy-discovery"
+
+
+@pytest.mark.asyncio
 async def test_repaired_cluster_health_list_route():
     """Verify GET /v1/clusters/health is authenticated and routed to list_cluster_health."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.dialects import mysql
 
-from drover.models.orm import DroverJob, K3sCluster
+from drover.models.orm import DroverJob, DroverOperation, DroverOperationEvent, K3sCluster
 from drover.services import jobs
 
 pytestmark = pytest.mark.asyncio
@@ -264,3 +265,36 @@ async def test_worker_lost_fence_does_not_log_completion(monkeypatch, caplog, fa
 
     assert job.status == "running"
     assert not any("Drover job completion" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.parametrize("missing_evidence", ["server", "kubeconfig", "deleted", "project", None])
+async def test_create_completion_requires_provisioned_live_matching_cluster(monkeypatch, missing_evidence):
+    now = datetime.now(UTC)
+    job = DroverJob(
+        id="job-create", project_id="project-1", cluster_id="cluster-1", kind="create",
+        status="running", attempts=1, claimed_at=now, operation_id="op-create", payload_json={},
+    )
+    op = DroverOperation(
+        id="op-create", project_id="project-1", cluster_id="cluster-1", kind="create",
+        status="RUNNING", created_at=now,
+    )
+    cluster = K3sCluster(
+        id="cluster-1", project_id="other-project" if missing_evidence == "project" else "project-1",
+        name="test-cluster", status="ACTIVE",
+        server_vm_id=None if missing_evidence == "server" else "server-1",
+        kubeconfig_encrypted=None if missing_evidence == "kubeconfig" else "encrypted-config",
+        deleted_at=now if missing_evidence == "deleted" else None,
+    )
+    session = _Session(objects={
+        (DroverJob, job.id): job, (DroverOperation, op.id): op, (K3sCluster, cluster.id): cluster,
+    })
+    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+
+    assert await jobs._complete(job.id, attempt=1) is True
+    assert job.status == "completed"
+    assert op.status == ("SUCCEEDED" if missing_evidence is None else "RUNNING")
+    assert (op.finished_at is not None) is (missing_evidence is None)
+    events = [event for event in session.added if isinstance(event, DroverOperationEvent)]
+    assert len(events) == 1
+    assert events[0].phase == ("job_completed" if missing_evidence is None else "server_boot_ready")
+    assert events[0].payload_json["op_status"] == op.status

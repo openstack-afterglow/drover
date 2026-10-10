@@ -571,7 +571,7 @@ async def _claim_one() -> tuple[str, int, str, str, str, dict] | None:
 
 
 async def _complete(job_id: str, *, attempt: int) -> bool:
-    """Complete only the lease attempt owned by this worker."""
+    """Complete the owned lease attempt; create success also requires live provisioning outputs."""
     factory = get_session_factory()
     if factory is None:
         return False
@@ -594,6 +594,10 @@ async def _complete(job_id: str, *, attempt: int) -> bool:
                     op.kind == "create"
                     and cluster is not None
                     and cluster.status == "ACTIVE"
+                    and cluster.project_id == job.project_id
+                    and cluster.deleted_at is None
+                    and bool(cluster.server_vm_id)
+                    and bool(cluster.kubeconfig_encrypted)
                     and op.status not in {"FAILED", "CANCELLED", "SUCCEEDED"}
                 )
                 if create_is_active or (op.kind != "create" and op.status not in {"FAILED", "CANCELLED", "SUCCEEDED"}):

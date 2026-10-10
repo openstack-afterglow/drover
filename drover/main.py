@@ -37,7 +37,7 @@ from drover.cache import _get_redis, close_cache
 from drover.config import get_settings, validate_config
 from drover.db import check_db, close_db, get_session_factory, init_db
 from drover.logging import configure_logging
-from drover.middleware import CorrelationMiddleware
+from drover.middleware import CorrelationMiddleware, TrustedProxySchemeMiddleware
 from drover.models.schemas import (
     HealthResponse,
     ReadinessResponse,
@@ -125,6 +125,8 @@ async def k3s_api_error_handler(request: Request, exc: K3sApiError):
 
 
 app.add_middleware(SlowAPIMiddleware)
+# Keep the socket peer intact for client-IP checks; Uvicorn parsing is disabled.
+app.add_middleware(TrustedProxySchemeMiddleware)
 app.add_middleware(CorrelationMiddleware)
 
 # Routers mounted under /v1 (health router included BEFORE clusters router so /v1/clusters/health matches before /{cluster_id})
@@ -215,4 +217,4 @@ async def readiness_check():
 
 
 def run() -> None:
-    uvicorn.run("drover.main:app", host="0.0.0.0", port=8011)
+    uvicorn.run("drover.main:app", host="0.0.0.0", port=8011, proxy_headers=False)

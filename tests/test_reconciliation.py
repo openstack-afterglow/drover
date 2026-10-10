@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 pytest_plugins = ("pytest_asyncio",)
 
 import pytest
+from sqlalchemy.dialects import mysql
 
-from drover.models.orm import DroverOperationEvent, ManagedOpenStackResource
-from drover.services import inventory, jobs, operations, reconciliation, store
+from drover.models.orm import DroverOperation, DroverOperationEvent, K3sCluster, ManagedOpenStackResource
+from drover.services import cluster_authority, execution, inventory, jobs, operations, reconciliation, store
+
+_persist_cluster_reconciliation = store.update_cluster_reconciliation
 
 
 class DummyServer:
@@ -46,6 +49,7 @@ class ReconciliationTestStore:
         self.managed_resources = {}
         self.events = {}
         self.jobs = {}
+        self.create_operations = {}
 
     def add_cluster(self, project_id: str, cluster_id: str, data: dict):
         cl = {
@@ -55,6 +59,7 @@ class ReconciliationTestStore:
             "status": data.get("status", "ACTIVE"),
             "status_reason": data.get("status_reason"),
             "server_vm_id": data.get("server_vm_id"),
+            "kubeconfig": data.get("kubeconfig", "apiVersion: v1\nkind: Config\n"),
             "security_group_id": data.get("security_group_id"),
             "api_lb_id": data.get("api_lb_id"),
             "api_fip_id": data.get("api_fip_id"),
@@ -102,7 +107,14 @@ def test_store():
 @pytest.fixture(autouse=True)
 def mock_services(monkeypatch, test_store):
     async def fake_get_cluster(project_id, cluster_id):
-        return test_store.clusters.get(cluster_id)
+        cluster = test_store.clusters.get(cluster_id)
+        return dict(cluster) if cluster else None
+
+    async def fake_get_kubeconfig(project_id, cluster_id):
+        return test_store.clusters[cluster_id]["kubeconfig"]
+
+    async def fake_latest_create(project_id, cluster_id):
+        return test_store.create_operations.get(cluster_id)
 
     async def fake_list_managed_resources(session_or_factory=None, cluster_id="", active_only=True):
         res_list = [r for (cid, *_), r in test_store.managed_resources.items() if cid == cluster_id]
@@ -172,6 +184,9 @@ def mock_services(monkeypatch, test_store):
         return ev
 
     monkeypatch.setattr(store, "get_cluster", fake_get_cluster)
+    monkeypatch.setattr(store, "get_kubeconfig", fake_get_kubeconfig)
+    monkeypatch.setattr(operations, "get_latest_create_operation", fake_latest_create)
+    monkeypatch.setattr(cluster_authority, "active_credentials", AsyncMock(return_value=[]))
     monkeypatch.setattr(inventory, "list_managed_resources", fake_list_managed_resources)
     monkeypatch.setattr(inventory, "record_resource", fake_record_resource)
     monkeypatch.setattr(store, "update_cluster_reconciliation", fake_update_cluster_reconciliation)
@@ -384,3 +399,226 @@ async def test_reconcile_orphan_report_no_delete(test_store):
     orphan_events = [e for e in events if e.phase == "reconcile_drift_orphan"]
     assert len(orphan_events) == 1
     assert orphan_events[0].payload_json["orphans"][0]["resource_id"] == orphan_vol_id
+
+
+def _empty_connection():
+    conn = MagicMock()
+    conn.compute.find_server.return_value = None
+    conn.compute.servers.return_value = []
+    conn.block_storage.volumes.return_value = []
+    conn.network.security_groups.return_value = []
+    conn.load_balancer.load_balancers.return_value = []
+    return conn
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_id,kubeconfig", [(None, None), ("server-1", None), (None, "config")])
+async def test_unprovisioned_cluster_cannot_recover_from_empty_inventory(test_store, server_id, kubeconfig):
+    cluster = test_store.add_cluster("project-1", "cluster-1", {
+        "status": "ERROR", "status_reason": "Cluster creation failed: token lifetime exceeded",
+        "server_vm_id": server_id, "kubeconfig": kubeconfig,
+    })
+    conn = _empty_connection()
+    if server_id:
+        conn.compute.find_server.return_value = DummyServer(server_id, "primary", "project-1", "cluster-1")
+
+    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=conn, operation_id="reconcile-1")
+
+    assert cluster["status"] == "ERROR"
+    assert drift["has_drift"] is True
+    assert {r["resource_type"] for r in drift["missing"]} == (
+        ({"server"} if not server_id else set()) | ({"kubeconfig"} if not kubeconfig else set())
+    )
+    assert all(r["is_required"] for r in drift["missing"])
+    assert "not provisioned or recorded" in cluster["status_reason"]
+    assert cluster["drift_status"] == drift
+    assert test_store.events["reconcile-1"][-1].payload_json == drift
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create_status", ["FAILED", "CANCELLED"])
+@pytest.mark.parametrize("provisioned", [False, True])
+async def test_failed_create_is_not_recovered_by_inventory(test_store, create_status, provisioned):
+    cluster = test_store.add_cluster("project-1", "cluster-1", {
+        "status": "ERROR", "server_vm_id": "server-1" if provisioned else None,
+        "kubeconfig": "config" if provisioned else None,
+        "status_reason": "Reconciliation failed: earlier missing server",
+    })
+    test_store.create_operations["cluster-1"] = DroverOperation(
+        id="create-1", project_id="project-1", cluster_id="cluster-1", kind="create",
+        status=create_status, error="Cloud-init failed", created_at=datetime.now(UTC),
+    )
+    conn = _empty_connection()
+    conn.compute.find_server.return_value = DummyServer("server-1", "primary", "project-1", "cluster-1")
+
+    for _ in range(2):
+        drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=conn)
+        assert cluster["status"] == "ERROR"
+        assert drift["has_drift"] is True
+        assert drift["missing_count"] == (0 if provisioned else 2)
+        assert drift["mismatches"][0]["state"] == create_status
+        assert "Cloud-init failed" in cluster["status_reason"]
+
+
+@pytest.mark.asyncio
+async def test_missing_resource_error_recovers_after_server_returns(test_store):
+    cluster = test_store.add_cluster("project-1", "cluster-1", {
+        "server_vm_id": "server-1", "kubeconfig": "config", "status": "ACTIVE",
+    })
+    conn = _empty_connection()
+    missing = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=conn)
+    assert missing["has_drift"] is True
+    assert cluster["status"] == "ERROR"
+
+    conn.compute.find_server.return_value = DummyServer("server-1", "primary", "project-1", "cluster-1")
+    recovered = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=conn)
+    assert recovered["has_drift"] is False
+    assert cluster["status"] == "ACTIVE"
+    assert not cluster["status_reason"]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_error_is_not_cleared_by_healthy_inventory(test_store):
+    cluster = test_store.add_cluster("project-1", "cluster-1", {
+        "server_vm_id": "server-1", "status": "ERROR", "status_reason": "Certificate rotation failed",
+    })
+    conn = _empty_connection()
+    conn.compute.find_server.return_value = DummyServer("server-1", "primary", "project-1", "cluster-1")
+    await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=conn)
+    assert cluster["status"] == "ERROR"
+    assert cluster["status_reason"] == "Certificate rotation failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["CREATING", "DELETING", "DELETED"])
+async def test_reconciliation_preserves_transition_boundaries(test_store, monkeypatch, status):
+    cluster = test_store.add_cluster("project-1", "cluster-1", {"status": status, "kubeconfig": None})
+    open_conn = AsyncMock()
+    monkeypatch.setattr(execution, "open_connection", open_conn)
+    await reconciliation.reconcile_cluster("project-1", "cluster-1")
+    assert cluster["status"] == status
+    assert cluster["last_reconciled_at"] is None
+    open_conn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provisioned", [False, True])
+async def test_missing_authority_preserves_provisioning_drift_and_active_reauthorization(test_store, monkeypatch, provisioned):
+    cluster = test_store.add_cluster("project-1", "cluster-1", {
+        "status": "ACTIVE" if provisioned else "ERROR",
+        "server_vm_id": "server-1" if provisioned else None,
+        "kubeconfig": "config" if provisioned else None,
+    })
+    monkeypatch.setattr(execution, "open_connection", AsyncMock(side_effect=execution.ReauthorizationRequired("reauthorize")))
+    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1")
+    assert drift["reauthorization_required"] is True
+    assert drift["has_drift"] is (not provisioned)
+    assert cluster["status"] == ("ACTIVE" if provisioned else "ERROR")
+    if not provisioned:
+        assert cluster["drift_status"] == drift
+
+
+@pytest.mark.asyncio
+async def test_missing_control_credential_keeps_healthy_cluster_active(test_store, monkeypatch):
+    cluster = test_store.add_cluster("project-1", "cluster-1", {"server_vm_id": "server-1"})
+    monkeypatch.setattr(cluster_authority, "active_credentials", AsyncMock(return_value=[{
+        "app_credential_id": "cred-1", "purpose": "control", "generation": 1,
+    }]))
+    conn = _empty_connection()
+    conn.compute.find_server.return_value = DummyServer("server-1", "primary", "project-1", "cluster-1")
+    conn.identity.get_application_credential.side_effect = reconciliation.ResourceNotFound("credential missing")
+    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=conn)
+    assert drift["has_drift"] is True
+    assert drift["missing_count"] == 1
+    assert drift["missing"][0]["is_required"] is False
+    assert cluster["status"] == "ACTIVE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["missing_resource", "recovered_resource", "missing_authority"])
+@pytest.mark.parametrize("next_status,soft_deleted", [("DELETING", False), ("DELETED", True), ("ACTIVE", True)])
+async def test_final_persistence_preserves_lifecycle_change_after_observation(
+    test_store, monkeypatch, path, next_status, soft_deleted,
+):
+    """Exercise the real store writer after the observed cluster starts/completes deletion.
+
+    The SQL-boundary double applies the locking-read eligibility predicates to a live row;
+    this defines consumer behavior, not a claim of real database concurrency verification.
+    """
+    cluster = test_store.add_cluster("project-1", "cluster-1", {
+        "status": "ACTIVE" if path == "missing_resource" else "ERROR",
+        "status_reason": "Reconciliation failed: earlier missing server",
+        "server_vm_id": None if path == "missing_authority" else "server-1",
+        "kubeconfig": None if path == "missing_authority" else "config",
+    })
+    row = K3sCluster(
+        id="cluster-1", project_id="project-1", name="cluster", status=cluster["status"],
+        status_reason=cluster["status_reason"], deleted_at=None,
+    )
+
+    def advance_lifecycle():
+        row.status = next_status
+        row.status_reason = "Deletion owns this state"
+        row.deleted_at = datetime.now(UTC) if soft_deleted else None
+        cluster.update(status=row.status, status_reason=row.status_reason, deleted_at=row.deleted_at)
+
+    class Result:
+        def scalar_one_or_none(self):
+            return row if row.deleted_at is None and row.status in {"ACTIVE", "ERROR"} else None
+
+    class Session:
+        commits = 0
+        statements = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def execute(self, statement):
+            compiled = statement.compile(dialect=mysql.dialect())
+            sql = str(compiled).upper()
+            assert "FOR UPDATE" in sql
+            assert "DELETED_AT IS NULL" in sql
+            assert ".STATUS IN " in sql
+            assert ["ACTIVE", "ERROR"] in compiled.params.values()
+            self.statements.append(statement)
+            return Result()
+
+        async def commit(self):
+            self.commits += 1
+
+    session = Session()
+    monkeypatch.setattr(store, "update_cluster_reconciliation", _persist_cluster_reconciliation)
+    monkeypatch.setattr(store, "is_db_available", lambda: True)
+    monkeypatch.setattr(store, "get_session_factory", lambda: lambda: session)
+
+    if path == "missing_authority":
+        async def no_authority(_project_id):
+            advance_lifecycle()
+            raise execution.ReauthorizationRequired("reauthorize")
+
+        monkeypatch.setattr(execution, "open_connection", no_authority)
+        drift = await reconciliation.reconcile_cluster("project-1", "cluster-1")
+        assert drift["reauthorization_required"] is True
+    else:
+        conn = _empty_connection()
+
+        def fetch_after_lifecycle_change(_server_id, ignore_missing=True):
+            advance_lifecycle()
+            if path == "recovered_resource":
+                return DummyServer("server-1", "primary", "project-1", "cluster-1")
+            return None
+
+        conn.compute.find_server.side_effect = fetch_after_lifecycle_change
+        drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=conn)
+
+    assert drift["has_drift"] is (path != "recovered_resource")
+    assert len(session.statements) == 1
+    assert session.commits == 0
+    assert row.status == next_status
+    assert row.status_reason == "Deletion owns this state"
+    assert row.last_reconciled_at is None
+    assert row.drift_status is None
+    assert row.updated_at is None

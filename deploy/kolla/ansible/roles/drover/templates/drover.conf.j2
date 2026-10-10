@@ -27,6 +27,7 @@ password_file = "{{ drover_redis_password_file }}"
 
 [drover]
 callback_base_url = "{{ drover_callback_base_url }}"
+trusted_proxies = "{{ drover_trusted_proxies }}"
 kubeconfig_encryption_key_file = "{{ drover_kubeconfig_encryption_key_file }}"
 boot_volume_size_gb = {{ drover_boot_volume_size_gb }}
 occm_enabled = {{ drover_occm_enabled | bool | lower }}

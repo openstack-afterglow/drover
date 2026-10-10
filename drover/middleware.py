@@ -14,6 +14,9 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import iter_route_contexts
 from starlette.routing import compile_path
 
+from drover.config import get_settings
+from drover.rate_limit import is_ip_in_cidrs
+
 _logger = logging.getLogger("drover.api")
 _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
 
@@ -85,6 +88,26 @@ class RequestIdFilter(logging.Filter):
         if not hasattr(record, "request_id") or record.request_id is None:
             record.request_id = req_id or ""
         return True
+
+
+class TrustedProxySchemeMiddleware:
+    """Honor a single HTTP scheme from a trusted socket peer, without rewriting client IP.
+
+    Disable Uvicorn proxy parsing so source-IP checks retain the original peer.
+    The trusted proxy must overwrite incoming X-Forwarded-Proto.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: MutableMapping[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and (peer := scope.get("client")):
+            schemes = [value.strip() for name, value in scope.get("headers", [])
+                       if name.lower() == b"x-forwarded-proto"]
+            if (len(schemes) == 1 and schemes[0] in {b"http", b"https"}
+                    and is_ip_in_cidrs(peer[0], get_settings().trusted_proxies)):
+                scope["scheme"] = schemes[0].decode("ascii")
+        await self.app(scope, receive, send)
 
 
 class CorrelationMiddleware:

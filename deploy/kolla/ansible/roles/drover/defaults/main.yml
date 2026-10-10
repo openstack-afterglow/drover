@@ -2,7 +2,7 @@
 # Drover kolla role defaults
 
 drover_image_namespace: "ghcr.io/openstack-afterglow"
-drover_image_tag: "v0.4.5"
+drover_image_tag: "v0.4.6"
 drover_api_image: "{{ drover_image_namespace }}/drover-api"
 drover_worker_image: "{{ drover_image_namespace }}/drover-worker"
 
@@ -21,6 +21,8 @@ drover_run_preconditions: true
 drover_api_port: 8011
 drover_api_listen_address: "{{ 'api' | kolla_address(inventory_hostname) }}"
 drover_api_listen_port: 18011
+# Trust only inspected HAProxy socket-peer addresses; never '*' or a global CIDR.
+drover_trusted_proxies: "127.0.0.1/32,::1/128"
 drover_database_name: "drover"
 drover_database_user: "drover"
 drover_database_address: "{{ database_address }}"
@@ -115,7 +117,7 @@ drover_services:
     enabled: "{{ enable_drover_api | bool }}"
     image: "{{ drover_api_image_ref }}"
     network_mode: host
-    command: ["uvicorn", "drover.main:app", "--host", "{{ drover_api_listen_address }}", "--port", "{{ drover_api_listen_port | string }}"]
+    command: ["uvicorn", "drover.main:app", "--host", "{{ drover_api_listen_address }}", "--port", "{{ drover_api_listen_port | string }}", "--no-proxy-headers"]
     restart_policy: unless-stopped
     volumes:
       - "{{ drover_config_dir }}/drover.conf:/app/drover.conf:ro"

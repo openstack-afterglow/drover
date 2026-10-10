@@ -324,11 +324,13 @@ def test_callback_script_exits_on_restart_loop():
 async def test_trusted_client_ip_resolution_direct_untrusted():
     from unittest.mock import MagicMock
 
+    from starlette.datastructures import Headers
+
     from drover.rate_limit import get_trusted_client_ip
 
     req = MagicMock()
     req.client.host = "203.0.113.50"
-    req.headers = {"X-Forwarded-For": "10.0.0.1, 10.0.0.2", "X-Real-IP": "10.0.0.1"}
+    req.headers = Headers({"X-Forwarded-For": "10.0.0.1, 10.0.0.2", "X-Real-IP": "10.0.0.1"})
 
     # Direct peer 203.0.113.50 is not in trusted_proxies ("127.0.0.1/32")
     resolved_ip = get_trusted_client_ip(req, trusted_proxies="127.0.0.1/32")
@@ -339,11 +341,13 @@ async def test_trusted_client_ip_resolution_direct_untrusted():
 async def test_trusted_client_ip_resolution_trusted_proxy_chain():
     from unittest.mock import MagicMock
 
+    from starlette.datastructures import Headers
+
     from drover.rate_limit import get_trusted_client_ip
 
     req = MagicMock()
     req.client.host = "127.0.0.1"
-    req.headers = {"X-Forwarded-For": "198.51.100.10, 10.0.0.1"}
+    req.headers = Headers({"X-Forwarded-For": "198.51.100.10, 10.0.0.1"})
 
     # Direct peer 127.0.0.1 is trusted proxy, 10.0.0.1 is trusted proxy in 10.0.0.0/8
     resolved_ip = get_trusted_client_ip(req, trusted_proxies="127.0.0.1/32,10.0.0.0/8")

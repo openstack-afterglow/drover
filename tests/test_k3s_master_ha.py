@@ -551,7 +551,10 @@ async def test_three_master_topology_inventory_deletion_reconciliation(monkeypat
             return lb
     with (
         patch("drover.services.reconciliation.fetch_recorded_resource", side_effect=mock_fetch),
-        patch("drover.services.store.get_cluster", new=AsyncMock(return_value=cluster_info)),
+        patch("drover.services.store.get_cluster", new=AsyncMock(return_value={**cluster_info, "status": "ACTIVE"})),
+        patch("drover.services.store.get_kubeconfig", new=AsyncMock(return_value="apiVersion: v1\nkind: Config\n")),
+        patch("drover.services.operations.get_latest_create_operation", new=AsyncMock(return_value=None)),
+        patch("drover.services.cluster_authority.active_credentials", new=AsyncMock(return_value=[])),
         patch("drover.services.store.update_cluster_reconciliation", new=AsyncMock()),
         patch("drover.services.operations.append_operation_event", new=AsyncMock()),
     ):

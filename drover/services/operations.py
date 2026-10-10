@@ -8,11 +8,11 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from drover.db import get_session_factory
-from drover.models.orm import DroverOperation, DroverOperationEvent, K3sCluster
+from drover.models.orm import DroverJob, DroverOperation, DroverOperationEvent, K3sCluster
 
 _logger = logging.getLogger("drover.operations")
 
@@ -120,11 +120,16 @@ async def _append_event_impl(
     message: str | None = None,
     payload_json: dict | list | None = None,
 ) -> DroverOperationEvent:
+    # Serialize max(sequence) + 1 with every other writer for this operation.
+    await session.get(DroverOperation, operation_id, with_for_update=True)
+    # Distinct first-event writers can share an InnoDB index gap; a deadlock must abort
+    # the caller's transaction, never leave a partial event/status update.
     stmt = (
         select(DroverOperationEvent.sequence)
         .where(DroverOperationEvent.operation_id == operation_id)
         .order_by(DroverOperationEvent.sequence.desc())
         .limit(1)
+        .with_for_update()
     )
     res = await session.execute(stmt)
     last_seq = res.scalar_one_or_none()
@@ -288,6 +293,133 @@ async def get_operation_events(
     async with factory() as session:
         res = await session.execute(stmt)
         return list(res.scalars().all())
+
+
+async def get_latest_create_operation(project_id: str, cluster_id: str) -> DroverOperation | None:
+    """Read the latest create attempt for this project/cluster, including terminal failures."""
+    factory = get_session_factory()
+    if factory is None:
+        return None
+    async with factory() as session:
+        stmt = (
+            select(DroverOperation)
+            .where(
+                DroverOperation.project_id == project_id,
+                DroverOperation.cluster_id == cluster_id,
+                DroverOperation.kind == "create",
+            )
+            .order_by(DroverOperation.created_at.desc(), DroverOperation.id.desc())
+            .limit(1)
+        )
+        return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def recover_deleted_cluster_operations(
+    *, project_id: str | None = None, operation_id: str | None = None, batch_size: int = 100,
+) -> list[str]:
+    """Cancel orphaned RUNNING operations on same-project soft-deleted clusters, without cloud work.
+
+    Any queued/running job targeting the cluster or linked to the operation vetoes recovery,
+    regardless of project, kind, or lease age. Serializable job-range locks fence new admissions;
+    each cancellation and sequenced event commit together. Nonblocking cluster/operation locks
+    avoid inversion with job retry locks.
+    InnoDB deadlock aborts roll back the candidate; periodic maintenance revisits it.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    factory = get_session_factory()
+    if factory is None:
+        return []
+
+    active_job = exists(select(DroverJob.id).where(
+        DroverJob.status.in_(["queued", "running"]),
+        or_(
+            DroverJob.cluster_id == DroverOperation.cluster_id,
+            DroverJob.operation_id == DroverOperation.id,
+        ),
+    ))
+    stmt = (
+        select(DroverOperation)
+        .join(K3sCluster, K3sCluster.id == DroverOperation.cluster_id)
+        .where(
+            DroverOperation.status == "RUNNING",
+            K3sCluster.project_id == DroverOperation.project_id,
+            K3sCluster.deleted_at.is_not(None),
+            ~active_job,
+        )
+        .order_by(DroverOperation.created_at, DroverOperation.id)
+        .limit(batch_size)
+    )
+    if project_id is not None:
+        stmt = stmt.where(DroverOperation.project_id == project_id)
+    if operation_id is not None:
+        stmt = stmt.where(DroverOperation.id == operation_id)
+    async with factory() as session:
+        candidates = [
+            (op.id, op.project_id, op.cluster_id)
+            for op in (await session.execute(stmt)).scalars().all()
+        ]
+
+    recovered: list[str] = []
+    for op_id, op_project_id, cluster_id in candidates:
+        async with factory() as session, session.begin():
+            # Set isolation before the first connection/statement, independently of server defaults.
+            await session.connection(execution_options={"isolation_level": "SERIALIZABLE"})
+            # Locking reads see current job state, not the candidate scan's snapshot.
+            # Do not skip locked jobs: a busy/stale lease is still active work.
+            job_stmt = (
+                select(DroverJob)
+                .where(
+                    DroverJob.status.in_(["queued", "running"]),
+                    or_(DroverJob.cluster_id == cluster_id, DroverJob.operation_id == op_id),
+                )
+                .order_by(DroverJob.id)
+                .with_for_update()
+            )
+            if (await session.execute(job_stmt)).scalars().all():
+                continue
+
+            # Claims use job -> cluster -> operation; retries use job -> operation -> cluster.
+            # Never wait for either parent row while holding the other parent/job range locks.
+            cluster_stmt = (
+                select(K3sCluster)
+                .where(
+                    K3sCluster.id == cluster_id,
+                    K3sCluster.project_id == op_project_id,
+                    K3sCluster.deleted_at.is_not(None),
+                )
+                .with_for_update(skip_locked=True)
+            )
+            if (await session.execute(cluster_stmt)).scalar_one_or_none() is None:
+                continue
+            op_stmt = (
+                select(DroverOperation)
+                .where(
+                    DroverOperation.id == op_id,
+                    DroverOperation.project_id == op_project_id,
+                    DroverOperation.cluster_id == cluster_id,
+                    DroverOperation.status == "RUNNING",
+                )
+                .with_for_update(skip_locked=True)
+            )
+            op = (await session.execute(op_stmt)).scalar_one_or_none()
+            if op is None:
+                continue
+
+            reason = "Target cluster was deleted before the operation completed"
+            op.status = "CANCELLED"
+            op.finished_at = _now()
+            op.error = op.error or reason
+            await _append_event_impl(
+                session, op.id, phase="deleted_cluster_recovered", message=reason,
+                payload_json={
+                    "cluster_id": cluster_id, "project_id": op_project_id,
+                    "previous_status": "RUNNING", "status": "CANCELLED",
+                },
+            )
+            recovered.append(op.id)
+    return recovered
+
 
 
 async def recover_expired_callback_operations(timeout_seconds: int = 1800) -> list[str]:

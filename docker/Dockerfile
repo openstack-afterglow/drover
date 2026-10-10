@@ -36,7 +36,7 @@ ENV PATH="/app/.venv/bin:$PATH"
 USER appuser
 
 FROM drover-runtime AS drover-api
-CMD ["uvicorn", "drover.main:app", "--host", "0.0.0.0", "--port", "8011"]
+CMD ["uvicorn", "drover.main:app", "--host", "0.0.0.0", "--port", "8011", "--no-proxy-headers"]
 
 FROM drover-runtime AS drover-worker
 CMD ["python", "-m", "drover.worker"]

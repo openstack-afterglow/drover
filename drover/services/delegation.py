@@ -387,9 +387,31 @@ def _verify_trust_access(access, snap: _DelegationSnapshot) -> None:
         or access.trustee_user_id != snap.trustee_user_id
         or not token_roles_within_delegation(access, snap.role_ids)
         or expires is None
-        or _aware(expires) > snap.expires_at + _EXPIRY_SKEW
+        or _aware(expires) <= _now()
     ):
         raise AuthorityRevoked("The trust-scoped token does not match the admitted delegation")
+
+
+class _TrustPassword(v3.Password):
+    """Keep every authenticated request inside the delegation lifetime, including cached-token reuse."""
+
+    def __init__(self, snap: _DelegationSnapshot):
+        settings = get_settings()
+        super().__init__(
+            auth_url=settings.os_auth_url, user_id=snap.trustee_user_id,
+            password=settings.os_password, trust_id=snap.trust_id,
+        )
+        self._delegation = snap
+
+    def get_access(self, session, **kwargs):
+        minimum = get_settings().drover_operation_trust_min_remaining_seconds
+        if (self._delegation.expires_at - _now()).total_seconds() < minimum:
+            raise AuthorityRevoked("The operation delegation is expired or too close to expiry")
+        access = super().get_access(session, **kwargs)
+        _verify_trust_access(access, self._delegation)
+        if (self._delegation.expires_at - _now()).total_seconds() < minimum:
+            raise AuthorityRevoked("The operation delegation is expired or too close to expiry")
+        return access
 
 
 def _connect_sync(snap: _DelegationSnapshot):
@@ -406,20 +428,14 @@ def _connect_sync(snap: _DelegationSnapshot):
     if trustee != snap.trustee_user_id:
         raise AuthorityRevoked("The configured trustee is not the admitted trustee")
     # Trust-scoped password authentication carries no project selector: the service is never tenant-scoped.
-    plugin = v3.Password(
-        auth_url=settings.os_auth_url,
-        user_id=trustee,
-        password=settings.os_password,
-        trust_id=snap.trust_id,
-    )
+    plugin = _TrustPassword(snap)
     session = ks_session.Session(auth=plugin, timeout=30, verify=settings.ssl_verify)
     try:
-        access = plugin.get_access(session)
+        plugin.get_access(session)
     except (ks_exc.Unauthorized, ks_exc.Forbidden, ks_exc.NotFound) as exc:
         raise AuthorityRevoked("Keystone no longer honors the admitted trust") from exc
     except ks_exc.ClientException as exc:
         raise ExecutionAuthorityUnavailable("Keystone trust authentication is unavailable") from exc
-    _verify_trust_access(access, snap)
     return openstack.connection.Connection(
         session=session,
         region_name=settings.os_region_name,

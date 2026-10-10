@@ -66,7 +66,7 @@ def get_trusted_client_ip(request: Request, trusted_proxies: str | Sequence[str]
     if not peer_is_trusted:
         return peer_host
 
-    x_forwarded_for = request.headers.get("X-Forwarded-For")
+    x_forwarded_for = ",".join(request.headers.getlist("X-Forwarded-For"))
     if x_forwarded_for:
         hops = [h.strip() for h in x_forwarded_for.split(",") if h.strip()]
         for hop in reversed(hops):

@@ -14,6 +14,7 @@ _logger = logging.getLogger("drover.worker")
 
 
 async def _reconcile_worker_loop():
+    """Recover idle deleted-target operations and callback timeouts before scheduling reconciliation."""
     from drover.services import operations, reconciliation
 
     s = get_settings()
@@ -23,6 +24,7 @@ async def _reconcile_worker_loop():
     while True:
         try:
             await operations.recover_expired_callback_operations(timeout_seconds=1800)
+            await operations.recover_deleted_cluster_operations()
             await reconciliation.schedule_worker_reconciliations(max_per_project=concurrency)
         except Exception:
             _logger.warning("Reconcile worker loop failed")

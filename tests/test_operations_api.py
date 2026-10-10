@@ -83,7 +83,7 @@ async def test_own_project_operation_success(mock_operations_store):
         created_at=now,
     )
     ev1 = DroverOperationEvent(
-        id="ev-1",
+        id=101,
         operation_id="op-100",
         sequence=1,
         phase="security_group",
@@ -109,6 +109,7 @@ async def test_own_project_operation_success(mock_operations_store):
         assert res_events.status_code == 200
         events_data = res_events.json()
         assert len(events_data) == 1
+        assert events_data[0]["id"] == "101"
         assert events_data[0]["sequence"] == 1
         assert events_data[0]["phase"] == "security_group"
 
@@ -154,9 +155,9 @@ async def test_ordered_events_and_since_sequence(mock_operations_store):
     mock_operations_store["add_op"](op)
 
     # Add events out of order to verify sorting
-    ev3 = DroverOperationEvent(id="ev-3", operation_id="op-300", sequence=3, phase="done", message="Finished", created_at=now)
-    ev1 = DroverOperationEvent(id="ev-1", operation_id="op-300", sequence=1, phase="init", message="Init", created_at=now)
-    ev2 = DroverOperationEvent(id="ev-2", operation_id="op-300", sequence=2, phase="boot", message="Booting", created_at=now)
+    ev3 = DroverOperationEvent(id=303, operation_id="op-300", sequence=3, phase="done", message="Finished", created_at=now)
+    ev1 = DroverOperationEvent(id=301, operation_id="op-300", sequence=1, phase="init", message="Init", created_at=now)
+    ev2 = DroverOperationEvent(id=302, operation_id="op-300", sequence=2, phase="boot", message="Booting", created_at=now)
 
     mock_operations_store["add_event"](ev3)
     mock_operations_store["add_event"](ev1)
@@ -168,6 +169,7 @@ async def test_ordered_events_and_since_sequence(mock_operations_store):
         assert res_all.status_code == 200
         data_all = res_all.json()
         assert [e["sequence"] for e in data_all] == [1, 2, 3]
+        assert [e["id"] for e in data_all] == ["301", "302", "303"]
 
         res_since = await client.get("/v1/operations/op-300/events?since_sequence=1", headers=headers)
         assert res_since.status_code == 200

@@ -295,6 +295,7 @@ def test_drover_conf_template_render():
         drover_database_url="mysql+aiomysql://drover@127.0.0.1:3306/drover",
         drover_redis_url="redis://127.0.0.1:6379/7",
         drover_callback_base_url="http://127.0.0.1:8011",
+        drover_trusted_proxies="127.0.0.1/32,192.0.2.10/32,2001:db8::10/128",
         drover_boot_volume_size_gb=30,
         drover_occm_enabled=True,
         drover_cinder_csi_enabled=True,

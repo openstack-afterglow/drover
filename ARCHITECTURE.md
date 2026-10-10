@@ -6,7 +6,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: candidate `drover==0.4.5`는 immutable 발행 `v0.4.4` (`30bba3e`) 이후 direct-system-admin, TOML JSON bridge 및 제한된 credential의 검증된 implied-role closure만 수정한다. `drover-sdk==0.2.21`은 별도 버전으로 유지한다. 기존 hotpatch는 새 발행/운영 이미지의 증거가 아니다.
+- 패키지: candidate `drover==0.4.6`은 immutable 발행 `v0.4.4` (`30bba3e`) 이후 direct-system-admin, TOML JSON bridge 및 제한된 credential closure를 포함하며, trust 수명 만료 경계(`_TrustPassword`), operation event ID string serialization, reconciliation 라이프사이클 불변식(빈 inventory 미생성 cluster의 ERROR 보존, reconciler-owned ERROR만 복구, deleted cluster race 보호), 삭제된 클러스터 잔여 RUNNING operation 복구, scheme-only trusted proxy 미들웨어, duplicate XFF 결합을 조치한다. `drover-sdk==0.2.21`은 별도 버전으로 유지한다.
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -253,15 +253,15 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 3. 실제 source와 테스트 정의를 검토한 뒤 review marker를 `python3 scripts/check_architecture.py --stamp --summary "..."`로 갱신한다. staged 범위만 검토할 때는 `--stamp --staged --summary "..."`를 사용한다.
 4. 완료/commit 전 `python3 scripts/check_architecture.py` 또는 staged 제출 범위의 `python3 scripts/check_architecture.py --staged`를 실행한다. source가 문서보다 우선하며 stale이면 먼저 문서를 고친다.
 
-2026-10-09 patch review: direct system-admin 조회, structured TOML의 JSON/명시적 환경 키 precedence, app-credential create의 검증된 configured-root implied-role closure를 수정한다. 서비스/DB/API topology, project role-map 결과, unsafe tenant-role 정책과 credential lifecycle은 그대로다. 로컬 Python3.13.12에서 config18건, native installed-SDK credential19건, final 서비스1201건(3 skip), SDK114건 및 root/SDK Ruff가 통과했다. 기존 owner POST201→DELETE204와 provider source는 roots-only defect의 증거이지 재인가/guest activation 성공이 아니다. 새 immutable image/wheel, current recovery와 모든 controller runtime/source parity 이후에만 실제 owner 재인가를 실행한다.
+2026-10-10 patch review: trust 만료 경계(`_TrustPassword`), event ID string serialization, reconciliation 라이프사이클 불변식(미생성 cluster ERROR 유지, reconciler-owned ERROR 복구, deleted race guard), 삭제된 클러스터 RUNNING operation 복구(`recover_deleted_cluster_operations`), scheme-only proxy 미들웨어 및 duplicate XFF 결합을 수정한다. 서비스/DB/API topology와 authority ceiling은 그대로다. 로컬 Python3.13.12에서 non-integration 1293건(1 skip), SDK 114건, Ruff 및 multi-arch API/Worker Docker 빌드가 통과했다.
 
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9d1610c8718d9735ea4f667dfce7c0922c380ff7ccf65307213b5e30f341de0a",
-  "reviewed_at": "2026-10-09T08:07:04Z",
-  "summary": "Drover0.4.5 direct system-admin lookup, structured TOML JSON/explicit-key precedence, validated configured-root credential closure and accepted role snapshots; source/native SDK/parser regressions reviewed; topology/schema/authority ceiling unchanged"
+  "source_sha256": "0de9c0b1ee4133bae42ccf505a0e8b685d2cb50705ed97bc80156d947475fe11",
+  "reviewed_at": "2026-10-10T08:20:01Z",
+  "summary": "Drover0.4.6 trust lifetime bound, event ID string serialization, reconciliation lifecycle invariants, deleted cluster operation recovery, scheme-only proxy middleware, duplicate XFF handling"
 }
 ```
 <!-- architecture-review:end -->

@@ -364,7 +364,9 @@ async def reconcile_cluster(
 
     Queries service adapters by recorded IDs.
     Persists last_seen_at for present resources, drift_status for cluster, and appends operation events.
-    Transitions cluster to ERROR with actionable status_reason if missing required resources.
+    Transitions established clusters to ERROR with actionable status_reason if required resources
+    or provisioning evidence are missing. Only reconciler-owned missing-resource ERROR can recover;
+    a failed create is not evidence of health even when its inventory is empty.
     Reports unknown tagged resources as orphans (report-only, no deletion).
     Bubbles up transient service errors for job retry behavior.
     """
@@ -397,6 +399,40 @@ async def reconcile_cluster(
             "reconciled_at": _now().isoformat(),
         }
 
+    # Provisioning and deletion own these transitions; reconciliation must not race their stages.
+    if cluster_dict.get("status") not in {"ACTIVE", "ERROR"}:
+        if operation_id:
+            await operations.append_operation_event(
+                None, operation_id, phase="reconcile_complete",
+                message=f"Reconciliation skipped while cluster is {cluster_dict.get('status')}",
+            )
+        return {
+            "has_drift": False, "missing_count": 0, "orphan_count": 0, "mismatch_count": 0,
+            "missing": [], "orphans": [], "mismatches": [], "reconciled_at": _now().isoformat(),
+        }
+
+    # These are required provisioning outputs, not optional inventory entries. A create can fail
+    # before recording any OpenStack IDs, or after booting Nova but before receiving kubeconfig.
+    missing_resources: list[dict[str, Any]] = []
+    for service, resource_type, present, name in (
+        ("nova", "server", bool(cluster_dict.get("server_vm_id")), "Primary server"),
+        ("drover", "kubeconfig", bool(await store.get_kubeconfig(project_id, cluster_id)), "Kubeconfig"),
+    ):
+        if not present:
+            missing_resources.append({
+                "service": service, "resource_type": resource_type, "resource_id": None,
+                "name": name, "is_required": True,
+                "reason": f"Required {name} was not provisioned or recorded",
+            })
+
+    state_mismatches: list[dict[str, Any]] = []
+    create_op = await operations.get_latest_create_operation(project_id, cluster_id)
+    if create_op is not None and create_op.status in {"FAILED", "CANCELLED"}:
+        state_mismatches.append({
+            "service": "drover", "resource_type": "provisioning", "resource_id": create_op.id,
+            "name": "Create operation", "state": create_op.status,
+            "reason": f"Create operation {create_op.status.lower()}: {create_op.error or 'provisioning did not complete'}",
+        })
     # Load active recorded resources from DB
     managed_resources = await inventory.list_managed_resources(None, cluster_id=cluster_id, active_only=True)
 
@@ -473,22 +509,30 @@ async def reconcile_cluster(
             conn = await execution.open_connection(project_id)
         except execution.ReauthorizationRequired:
             _logger.info("Cluster %s has no resource authority; reconciliation requires reauthorization", cluster_id)
+            drift_summary = {
+                "has_drift": bool(missing_resources or state_mismatches),
+                "missing_count": len(missing_resources), "orphan_count": 0,
+                "mismatch_count": len(state_mismatches),
+                "missing": missing_resources, "orphans": [], "mismatches": state_mismatches,
+                "reconciled_at": _now().isoformat(), "reauthorization_required": True,
+            }
+            if drift_summary["has_drift"]:
+                reasons = [r["reason"] for r in missing_resources + state_mismatches]
+                await store.update_cluster_reconciliation(
+                    cluster_id=cluster_id, last_reconciled_at=_now(), drift_status=drift_summary,
+                    status="ERROR", status_reason=f"Reconciliation failed: {'; '.join(reasons)}",
+                )
             if operation_id:
                 await operations.append_operation_event(
                     None, operation_id, phase="reconcile_complete",
-                    message="Reconciliation skipped: cluster requires reauthorization",
-                    payload_json={"reauthorization_required": True},
+                    message="Cloud inventory check skipped: cluster requires reauthorization",
+                    payload_json=drift_summary,
                 )
-            return {
-                "has_drift": False, "missing_count": 0, "orphan_count": 0, "mismatch_count": 0,
-                "missing": [], "orphans": [], "mismatches": [], "reconciled_at": _now().isoformat(),
-                "reauthorization_required": True,
-            }
+            return drift_summary
         created_conn = True
 
     try:
-        missing_resources: list[dict[str, Any]] = []
-        state_mismatches: list[dict[str, Any]] = []
+        # Local provisioning gaps remain drift even when there are no cloud targets to check.
         checked_count = 0
 
         for target in targets_map.values():
@@ -574,13 +618,18 @@ async def reconcile_cluster(
         # Update cluster record status and drift_status
         new_status = None
         status_reason = None
-        if has_missing_required:
+        if has_missing_required or state_mismatches:
             new_status = "ERROR"
             reasons = [m["reason"] for m in missing_resources if m.get("is_required", True)]
+            reasons.extend(m["reason"] for m in state_mismatches)
             status_reason = f"Reconciliation failed: {'; '.join(reasons)}"
-        elif cluster_dict.get("status") == "ERROR" and not has_missing_required:
+        elif (
+            cluster_dict.get("status") == "ERROR"
+            and (cluster_dict.get("status_reason") or "").startswith("Reconciliation failed:")
+        ):
             new_status = "ACTIVE"
-            status_reason = None
+            # The store only writes non-None reasons; explicitly clear the resolved error.
+            status_reason = ""
 
         await store.update_cluster_reconciliation(
             cluster_id=cluster_id,
@@ -656,7 +705,7 @@ async def schedule_worker_reconciliations(max_per_project: int = 2) -> list[str]
     async with factory() as session:
         stmt = select(K3sCluster).where(
             K3sCluster.deleted_at.is_(None),
-            K3sCluster.status.not_in(["DELETED"]),
+            K3sCluster.status.in_(["ACTIVE", "ERROR"]),
         )
         res = await session.execute(stmt)
         clusters = list(res.scalars().all())

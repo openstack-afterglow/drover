@@ -32,6 +32,8 @@ class _Keystone:
         self.trust_tokens: dict[str, str] = {}
         self.revoked = False
         self.requests: list[tuple[str, str, dict]] = []
+        self.token_expiry: str | None = None
+        self.resource_reads = 0
 
 
 def _handler(state: _Keystone):
@@ -52,6 +54,12 @@ def _handler(state: _Keystone):
         def _body(self) -> dict:
             length = int(self.headers.get("Content-Length") or 0)
             return json.loads(self.rfile.read(length) or b"{}")
+
+        def do_GET(self):
+            if self.path == "/resource" and self.headers.get("X-Auth-Token") in state.trust_tokens:
+                state.resource_reads += 1
+                return self._send(200, {"project_id": PROJECT})
+            return self._send(404, {"error": {"code": 404}})
 
         def do_POST(self):
             body = self._body()
@@ -77,7 +85,7 @@ def _handler(state: _Keystone):
                     return self._send(401, {"error": {"code": 401, "message": "trustor lost a delegated role"}})
                 token = uuid.uuid4().hex
                 state.trust_tokens[token] = trust["id"]
-                expires = trust["expires_at"]
+                expires = state.token_expiry or trust["expires_at"]
                 roles = [*trust["roles"], {"id": "reader-id", "name": "reader"}]  # Keystone adds implied roles.
                 return self._send(201, {"token": {
                     "methods": ["password"],
@@ -169,3 +177,22 @@ def test_native_trust_revoked_role_is_terminal(keystone, monkeypatch):
     keystone.revoked = False
     with pytest.raises(execution.AuthorityRevoked, match="capability"):
         delegation._connect_sync(_snapshot(admitted))
+
+
+@pytest.mark.parametrize("remaining", [299, 0, -1])
+def test_cached_trust_token_cannot_outlive_delegation(keystone, monkeypatch, remaining):
+    now = datetime.now(UTC)
+    monkeypatch.setattr(delegation, "_now", lambda: now)
+    keystone.token_expiry = (now + timedelta(days=1)).isoformat()
+    admitted = delegation._admit_sync(_token_info(), PROJECT, "cluster", delegation.ACTION_CREATE)
+    conn = delegation._connect_sync(_snapshot(admitted))
+    try:
+        url = conn.session.auth.auth_url.rsplit("/v3", 1)[0] + "/resource"
+        assert conn.session.get(url).json() == {"project_id": PROJECT}
+        monkeypatch.setattr(delegation, "_now", lambda: admitted.expires_at - timedelta(seconds=remaining))
+        with pytest.raises(execution.AuthorityRevoked, match="expiry"):
+            conn.session.get(url)
+        assert keystone.resource_reads == 1
+    finally:
+        conn.close()
+        delegation._delete_trust_with_caller_token(CALLER_TOKEN, admitted.trust_id)

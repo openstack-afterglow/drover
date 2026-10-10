@@ -111,6 +111,7 @@ def test_kolla_drover_conf_renders_only_secret_paths():
         drover_redis_url="redis://127.0.0.1:6379/7",
         drover_redis_password_file="/etc/drover/secrets/redis_password",
         drover_callback_base_url="http://127.0.0.1:8011",
+        drover_trusted_proxies="127.0.0.1/32,::1/128",
         drover_kubeconfig_encryption_key_file="/etc/drover/secrets/kubeconfig_encryption_key",
         drover_afterglow_admission_url="http://afterglow.internal:8000",
         drover_afterglow_admission_token_file="/etc/drover/secrets/afterglow_admission_token",

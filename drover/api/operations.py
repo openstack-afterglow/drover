@@ -44,7 +44,7 @@ def _operation_to_info(op: DroverOperation) -> DroverOperationInfo:
 
 def _event_to_info(ev: DroverOperationEvent) -> DroverOperationEventInfo:
     return DroverOperationEventInfo(
-        id=ev.id,
+        id=str(ev.id),
         operation_id=ev.operation_id,
         sequence=ev.sequence,
         phase=ev.phase,

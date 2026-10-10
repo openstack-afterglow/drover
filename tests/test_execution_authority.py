@@ -52,12 +52,23 @@ def test_trust_token_accepts_keystone_implied_roles():
     )
 
 
+
+def test_trust_token_accepts_provider_lifetime_longer_than_delegation():
+    delegation._verify_trust_access(trust_access(expires=NOW + timedelta(days=1)), snapshot())
+
+
+@pytest.mark.parametrize("seconds", [-1, 0])
+def test_trust_token_rejects_expired_token(monkeypatch, seconds):
+    monkeypatch.setattr(delegation, "_now", lambda: NOW)
+    with pytest.raises(execution.AuthorityRevoked):
+        delegation._verify_trust_access(trust_access(expires=NOW + timedelta(seconds=seconds)), snapshot())
+
 @pytest.mark.parametrize("changes", [
     {"project_id": "foreign"}, {"trustee_user_id": "foreign"}, {"user_id": "service"},
     {"trustor_user_id": "foreign"}, {"trust_id": "foreign"}, {"trust_scoped": False},
     {"role_ids": ["member-id", "admin-id"], "role_names": ["member", "admin"]},
     {"role_ids": ["reader-id"], "role_names": ["reader"]}, {"role_ids": [], "role_names": []},
-    {"expires": None}, {"expires": NOW + timedelta(hours=1, seconds=61)},
+    {"expires": None},
 ])
 def test_trust_token_rejects_authority_drift(changes):
     with pytest.raises(execution.AuthorityRevoked):
