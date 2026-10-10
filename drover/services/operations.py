@@ -17,7 +17,7 @@ from drover.models.orm import DroverJob, DroverOperation, DroverOperationEvent, 
 _logger = logging.getLogger("drover.operations")
 
 VALID_OP_KINDS = frozenset(
-    {"create", "scale", "nodegroup_reconcile", "delete", "rotate_certificates", "reconcile"}
+    {"create", "scale", "nodegroup_reconcile", "delete", "rotate_certificates", "reconcile", "reauthorize"}
 )
 
 VALID_OP_STATUSES = frozenset(

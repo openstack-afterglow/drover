@@ -103,7 +103,8 @@ def _factory(session):
 
 
 @pytest.mark.asyncio
-async def test_enqueue_job_links_operation_transactionally(monkeypatch):
+@pytest.mark.parametrize("kind", ["scale", "reauthorize"])
+async def test_enqueue_job_links_operation_transactionally(monkeypatch, kind):
     """enqueue_job must create DroverOperation and DroverJob linked in one transaction."""
     session = _TestSession()
     monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
@@ -111,7 +112,7 @@ async def test_enqueue_job_links_operation_transactionally(monkeypatch):
     job_id = await jobs.enqueue_job(
         cluster_id="cluster-100",
         project_id="proj-1",
-        kind="scale",
+        kind=kind,
         payload={"desired_count": 3},
         request_id="req-555",
         idempotency_key="idemp-123",
@@ -135,7 +136,7 @@ async def test_enqueue_job_links_operation_transactionally(monkeypatch):
     assert job.operation_id == op.id
     assert op.cluster_id == "cluster-100"
     assert op.project_id == "proj-1"
-    assert op.kind == "scale"
+    assert op.kind == kind
     assert op.status == "QUEUED"
     assert op.request_id == "req-555"
     assert op.idempotency_key == "idemp-123"

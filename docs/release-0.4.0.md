@@ -160,7 +160,7 @@ Publication: the tag `v0.4.4` triggers `release.yml` (wheel lockstep with `drove
 - Final local Python3.13.12 gates: config18 passed; native installed-SDK credential19 passed; full service1201 passed/3 skips; independent SDK114 passed; root/SDK Ruff passed. Earlier fixture setup and import-order failures were corrected, and the explicit empty-env precedence blocker was resolved before this final service gate. The wheel builds with patch0.4.5. Exact-SHA CI, immutable image/wheel publication, current recovery and production runtime/owner acceptance remain separate; old0.4.4 receipts do not qualify this repair.
 - Owner-cluster reauthorization has **not succeeded**. The parent supplied an existing-request access log showing POST 201 followed by owner-path DELETE 204; creation succeeded and postcreate cleanup occurred. SDK create/delete signatures and resource attributes are compatible. Combined with provider source, this establishes the roots-only verification defect, but the deployed graph/failed-response metadata still need qualification without reissuance. No live retry, credential export, role widening or cleanup of legacy credentials was performed. Keep legacy-user/credential retirement after successful activation and guest rollout, as in the ordered cutover above.
 
-## 0.4.6 patch — runtime remediation (candidate, 2026-10-10)
+## 0.4.6 patch — runtime remediation (published and deployed, 2026-10-10)
 
 - `drover/services/delegation.py`: `_TrustPassword(v3.Password)` bounds every authenticated request (including cached-token reuse via `get_access`) to the admitted delegation lifetime and remaining margin (`drover_operation_trust_min_remaining_seconds`). Prevents token rejection when Keystone issues a token whose provider expiration exceeds the trust TTL.
 - `drover/api/operations.py`: serialize numeric ledger `DroverOperationEvent.id` to string (`str(ev.id)`) at the API boundary, matching OpenAPI schema and preventing 500 serialization errors.
@@ -169,4 +169,31 @@ Publication: the tag `v0.4.4` triggers `release.yml` (wheel lockstep with `drove
 - `drover/middleware.py`, `drover/main.py`, `docker/Dockerfile`, `deploy/kolla/...`: `TrustedProxySchemeMiddleware` honors scheme from configured `trusted_proxies` without altering client IP; Uvicorn proxy parsing disabled (`--no-proxy-headers`) across all invocation paths; `drover_trusted_proxies` added to Kolla role defaults and `drover.conf.j2`.
 - `drover/rate_limit.py`: `get_trusted_client_ip` combines duplicate `X-Forwarded-For` header occurrences via `Headers.getlist` preserving right-to-left resolution order.
 - Qualification: full non-integration suite 1293 passed / 1 skipped; SDK suite 114 passed; Ruff clean; root wheel built as `drover-0.4.6-py3-none-any.whl`; multi-arch Docker build (`linux/amd64` and `linux/arm64`) for both `drover-api` and `drover-worker` targets succeeded.
+
+### Tagged 0.4.6 and DMS Lab evidence (2026-10-10)
+
+Immutable `v0.4.6` is `c130d8a`. Tag Docker [38037678879](https://github.com/openstack-afterglow/drover/actions/runs/38037678879) and wheel Release [38037685981](https://github.com/openstack-afterglow/drover/actions/runs/38037685981) succeeded. Published images are amd64-only (plus attestations), not the separately built local multi-arch artifacts. Operator wheel/role/lock pin v0.4.6; Kolla `pull`, `genconfig`, `reconfigure --tags drover` returned RC 0 with no failed/unreachable hosts. Explicit trusted proxy addresses are the inspected HAProxy peers `172.30.0.11/32,172.30.0.12/32,172.30.0.13/32`.
+
+| Container | Deployed index digest |
+| --- | --- |
+| API | `sha256:46090cfa470818dd628c1b7fd6c41037d8d01158387df29d55b400424083d16d` |
+| Worker | `sha256:883ade17e882c742083362a96d4a1d31a5f10db50b37668455fb5ca1a222fde2` |
+
+All three API/worker packages and relevant source hashes match 0.4.6; APIs are Docker-healthy, workers running. Node-local, VIP and public readiness returned 200. Public `/` and `/v1/` discovery advertise HTTPS, `/v1` redirects 307 to HTTPS, and the authenticated operation events endpoint returned 200 with string ledger ID `"22935"`. Nine idle RUNNING operations on deleted clusters became CANCELLED. After its interrupted rollout-time reconcile lease expired, failed cluster `78ba1d31-ea1e-48a1-b8c9-6573626d7045` naturally became ERROR at `2026-10-10T08:44:44Z`; no manual completion or reset was applied.
+
+The existing `test-cluster` reauthorization POST returned 500. A mandatory-rollback native MariaDB enqueue probe isolated `ValueError: Invalid operation kind: 'reauthorize'`; no staged generation remained. This is a newly identified admission defect, not successful guest rollout. Stampede remains disabled. Image readiness does not establish retry creation, LB repair or legacy credential retirement. Trivy remains non-blocking and wheel publication remains independent of the tag suite.
+
+## 0.4.7 patch — reauthorization operation admission
+
+- `drover/services/operations.py:VALID_OP_KINDS` now includes `reauthorize`, matching migration 004 and the existing API/worker path. No new API, schema, credential authority or topology is introduced.
+- The existing transactional enqueue regression now exercises both scale and reauthorization. The first local run accidentally imported the original worktree's editable package; explicitly setting `PYTHONPATH` to this worktree exercised the changed source and both cases passed.
+- Root package/runtime/lock and packaged Kolla image default move together to 0.4.7. Exact-tag publication, deployment and successful live reauthorization require their own receipt below; the 0.4.6 rollout is not evidence for this repair.
+
+Qualification on the final 0.4.7 worktree with explicit `PYTHONPATH`: `uv run --frozen --no-sync pytest tests` **1294 passed / 3 skipped**, SDK **114 passed**, root/SDK Ruff passed, wheel `drover-0.4.7-py3-none-any.whl` built and source-linked architecture guard passed. Skipped live integration is not included as live evidence.
+
+### Approved same-ID recreation on deployed 0.4.6
+
+Original cluster `78ba1d31-ea1e-48a1-b8c9-6573626d7045` (`k3s-8af46e85`) was retained with its failed create `3490766b-dbb4-4afa-acb9-fd891fd0749b` unchanged. A normal current operator token admitted a new bounded requester trust; a locked transaction required ERROR, no provisioned primary IDs, no active jobs and no active non-credential inventory before enqueuing the original creation snapshot. Existing owner resource generation 1 was retained; no credential or role widening occurred. The first password-auth probe used a guessed user ID and failed 401 before admission or DB mutation; the successful retry used the actual configured operator username. Native create made only this cluster's dedicated SG, boot volumes and VMs.
+
+New create Operation `d22c6aca-365f-412e-9fa5-43d787e69c7a` is **SUCCEEDED**, cluster **ACTIVE** with empty status reason and stored kubeconfig, while the original Operation remains **FAILED**. Nova ID reads show server `5a2202db-1b40-40ef-80d7-4cf92258ca52` and agent `c1498dda-4653-4744-9583-d01a2bf217d7` both ACTIVE. Authenticated K3s `/api/v1/nodes` shows both nodes Ready on `v1.34.1+k3s1`, `/healthz` returned 200, with stored CA and hostname verification enabled. The initial observer used the nonexistent ORM `agent_vm_ids` attribute; the corrected observation queried `K3sAgentVM.vm_id`. Those probe errors are not service success evidence. Existing `test-cluster` was not recreated or opted into Stampede.
 

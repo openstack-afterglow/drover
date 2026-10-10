@@ -6,7 +6,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: candidate `drover==0.4.6`은 immutable 발행 `v0.4.4` (`30bba3e`) 이후 direct-system-admin, TOML JSON bridge 및 제한된 credential closure를 포함하며, trust 수명 만료 경계(`_TrustPassword`), operation event ID string serialization, reconciliation 라이프사이클 불변식(빈 inventory 미생성 cluster의 ERROR 보존, reconciler-owned ERROR만 복구, deleted cluster race 보호), 삭제된 클러스터 잔여 RUNNING operation 복구, scheme-only trusted proxy 미들웨어, duplicate XFF 결합을 조치한다. `drover-sdk==0.2.21`은 별도 버전으로 유지한다.
+- 패키지: candidate `drover==0.4.7`은 발행·배포한 `v0.4.6` (`c130d8a`)의 trust 수명, event ID, reconciliation, deleted Operation 복구 및 proxy scheme 조치 위에 `reauthorize` Operation 허용 목록 누락을 수정한다. API·DB schema가 이미 지원한 kind를 service validation에도 허용하며 topology·권한 ceiling·credential rollout 계약은 바꾸지 않는다. `drover-sdk==0.2.21`은 별도 버전으로 유지한다.
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -108,6 +108,7 @@ HA joiner(server 2·3)는 `cloud_conf=None`으로 OCCM/CSI manifest용 cloud.con
 - **Resource authority**: caller token으로 `unrestricted=False`, held delegated-role subset의 user-owned `control`과 플러그인용 별도 `guest` credential을 만든다. secret은 전용 `cluster_app_credential` AES-GCM domain으로 암호화 저장하며 control은 guest에 렌더링하지 않는다. Stampede planner/job은 owner의 현재 `drover:clusters:scale`, reconcile/health는 `drover:clusters:get`과 token owner/project/credential ID/role 검증을 매 connection에 수행한다. active control 없는 legacy cluster는 재인가 필요이고 Stampede enable은 409다. reconcile periodic scan은 authorized cluster만 대상으로 하고 explicit reconcile은 `reauthorization_required`를 반환한다. reconcile job의 authority failure나 credential missing drift 자체는 cluster를 ERROR로 만들지 않아 ACTIVE-only 재인가를 막지 않는다. health Nova floating-IP lookup 실패는 private IP를 유지하며 다른 identity를 쓰지 않는다.
 - **Credential issuance role closure**: `auth.current_project_role_state`는 기존 current-project map의 catalog/assignment/실제 inference graph 검증을 공유한다. `cluster_authority.issue`는 configured delegated roots의 current global-ID closure만 허용하고 unsafe (`admin`/`manager`), unknown/domain/ambiguous/unheld role을 거부한다. `_verify_issued`는 반환 roles에 roots가 모두 있으며 closure를 벗어나지 않음을 확인하고 accepted full IDs/names를 snapshot한다. 별도로 보유한 caller 역할은 허용 기준이 아니다. [Keystone stable/2025.2 `_get_roles`](https://github.com/openstack/keystone/blob/stable/2025.2/keystone/api/users.py)는 create 응답에도 implied roles를 넣으므로 이전 roots-only subset 검사는 정상 응답을 거부했다. `tests/test_native_app_credentials.py`는 installed SDK/실제 synthetic HTTP로 expansion 성공과 잘못된 응답의 cleanup을 정의한다(`test-defined`).
 - **재인가와 rollout**: `GET/POST /v1/clusters/{id}/authorization`, `POST .../authorization/retire`를 제공한다. POST는 `ACTIVE` cluster에서 다른 mutation이 없을 때 caller-owned credentials를 staged generation으로 저장하고 202와 job/operation ID를 반환한다. worker는 현재 reauthorize capability와 staged token을 확인한다. guest가 있으면 `cloud-config`, `manila-cloud-secret` Secret과 Octavia Ingress `octavia-ingress-controller-config` ConfigMap의 credential keys만 교체한다. 참조하는 `kube-system` Deployment/DaemonSet/StatefulSet을 generation annotation으로 restart하고 rollout 완료를 기다린다. KMS required 또는 legacy detect 모드에서는 각 control-plane host에 privileged hostPID Job을 실행해 Secret 환경변수와 `nsenter`로 `/etc/kubernetes/cloud.conf`(있으면), `/etc/kubernetes/barbican-cloud.conf`를 rewrite하고 `barbican-kms.service` restart/active/socket을 확인한다. 마지막 Secret-write probe까지 성공해야 atomic activation한다.
+- **재인가 Operation admission**: `operations.VALID_OP_KINDS`는 migration 004와 reauthorize API/worker가 쓰는 `reauthorize`를 허용한다. 누락 시 credential 발급 뒤 durable enqueue에서 `ValueError`와 HTTP 500이 발생하고 신규 credential을 owner token으로 회수했다. `tests/test_operations_jobs.py:test_enqueue_job_links_operation_transactionally`는 scale/reauthorize의 operation/job/event 원자적 연결을 정의한다.
 - **Activation/retirement**: 성공 시 staged를 active로, 이전 active/다른 staged를 retiring으로 바꾸고 이전 secret을 지운다. rollout 부분 실패는 staged `last_error`를 기록하고 이전 active generation은 유지한다; 이미 바뀐 guest 객체를 자동 원복한다고 보장하지 않는다. retiring credential의 원격 폐기는 owner token이 필요하다. owner retire endpoint는 caller 소유 retiring 항목만 삭제하며 legacy owner 없는 항목은 operator out-of-band 회수가 필요하다. 상태 응답에는 reference/state/backlog만 있고 secret은 없다.
 - **삭제**: creator가 떠났어도 현재 delete 권한 actor의 새 operation trust로 자원을 삭제한다. tenant admission에서 caller 소유 credential을 caller token으로 동기 회수 시도한다. 삭제 완료 시 남은 모든 secret을 지우고 다른 owner/legacy credential은 `owner_revocation_required`로 보고한다; cluster 삭제가 모든 원격 credential 회수를 보장하지 않는다.
 
@@ -259,9 +260,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "0de9c0b1ee4133bae42ccf505a0e8b685d2cb50705ed97bc80156d947475fe11",
-  "reviewed_at": "2026-10-10T08:20:01Z",
-  "summary": "Drover0.4.6 trust lifetime bound, event ID string serialization, reconciliation lifecycle invariants, deleted cluster operation recovery, scheme-only proxy middleware, duplicate XFF handling"
+  "source_sha256": "53884621c87b5f34afa3359c9fc349b22e070b2baa5b751f5493f5292d2acc12",
+  "reviewed_at": "2026-10-10T08:50:57Z",
+  "summary": "0.4.7 services/operations.py admits existing reauthorize API/worker kind; transactional regression plus package/Kolla versions; no topology/schema/authority change"
 }
 ```
 <!-- architecture-review:end -->
