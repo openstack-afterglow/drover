@@ -1,23 +1,17 @@
-"""Redis 기반 캐시 레이어 — Phase A' 패키지 진입점.
+"""Drover cache and raw Redis access share one process-local backend.
 
-레거시 cache.py 와 동일한 import 경로를 유지하기 위한 backwards-compat wrapper.
+Readiness, callback tokens, locks and Stampede events use the same configured writer.
 
 키 형식: afterglow:{service}:{project_id}:{resource}
 예시: afterglow:nova:abc123:servers
 
-레거시 API (계속 동작 — ~85 call sites):
+캐시 API:
 - cached_call(key, ttl, fn, *, refresh=False, enabled=True)
-- invalidate(pattern)
-- invalidate_project(project_id, service="*")
+- invalidate(pattern) / invalidate_project(project_id, service="*")
 - ttl_fast / ttl_normal / ttl_slow / ttl_static
-- _get_redis() / _get_client() (object_storage, instance_health, admin_identity 등)
-
-신규 API:
-- backend (전역 RedisBackend 싱글톤)
-- get_backend() (테스트 주입용 접근자)
-- base.Cache (ABC)
-- redis_backend.RedisBackend
-- keys.* / metrics / invalidation
+- get_backend() / set_backend() — lazy backend 및 테스트 주입
+- _get_redis() / _get_client() — 동일 RedisBackend의 raw client; 장애는 caller에 전달
+- base.Cache / redis_backend.RedisBackend / keys.* / metrics / invalidation
 - write_through(key, ttl, value) — terminal mutation 직후 known-value 직접 set
 - patch_list(key, ttl, *, match, update/remove/add) — list 엔트리 surgical 패치
 
@@ -84,10 +78,7 @@ def _make_serializable(obj: Any) -> Any:
 
 
 def _get_client() -> aioredis.Redis:
-    """레거시 호환 — 동기 진입점에서도 raw redis 클라이언트를 반환.
-
-    cache.py 시절 일부 호출부 (compute/instance_health.py) 가 사용.
-    """
+    """Return the configured backend's raw Redis client without cache fallbacks."""
     backend = _get_backend()
     if isinstance(backend, RedisBackend):
         return backend.raw_client()

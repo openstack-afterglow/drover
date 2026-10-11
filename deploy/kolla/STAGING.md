@@ -14,6 +14,8 @@ The workflow requires HTTPS `OS_AUTH_URL` and `DROVER_API_URL`, `OS_USERNAME`, `
 
 Local readiness smoke proves database, Redis, and migration-ledger readiness. It deliberately reports `503` while Keystone is unavailable; a `200` readiness response requires reachable configured Keystone service credentials.
 
+Native Kolla enables Drover Sentinel discovery by default: `drover_sentinel_hosts` derives API addresses from `groups['valkey']` and `valkey_sentinel_port`; `drover_sentinel_master_name` uses `valkey_sentinel_monitor_name`. Both API and Worker read these existing `[cache]` Settings. The data Redis URL retains its DB index (default 7), password-file authentication and TLS/query options; Sentinel discovery does not receive the data password. For an external standalone Redis, set `drover_sentinel_enabled: false` explicitly. Readiness PING is not a write-capability test: qualify callback creation/one-time consumption and DB isolation using owned expiring keys, never force failover of shared Valkey merely for Drover acceptance.
+
 ## Execution-authority cutover qualification
 
 **Not live-verified.** OpenSpec tasks 4.3/4.4 are complete with local evidence only (2026-10-07: non-integration suite 1123 passed / 1 skipped, SDK proxy 114 passed, real-SDK loopback trust test, disposable MariaDB 11.4 ledger 001–004). Existing lifecycle tests and that local evidence are not acceptance evidence for the new trust/guest-rollout behavior on a real cloud.

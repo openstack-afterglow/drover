@@ -24,6 +24,9 @@ pool_timeout = 10
 [cache]
 redis_url = "{{ drover_redis_url }}"
 password_file = "{{ drover_redis_password_file }}"
+sentinel_enabled = {{ drover_sentinel_enabled | bool | lower }}
+sentinel_master_name = {{ drover_sentinel_master_name | tojson }}
+sentinel_hosts = {{ drover_sentinel_hosts | tojson }}
 
 [drover]
 callback_base_url = "{{ drover_callback_base_url }}"

@@ -2,7 +2,7 @@
 # Drover kolla role defaults
 
 drover_image_namespace: "ghcr.io/openstack-afterglow"
-drover_image_tag: "v0.4.8"
+drover_image_tag: "v0.4.9"
 drover_api_image: "{{ drover_image_namespace }}/drover-api"
 drover_worker_image: "{{ drover_image_namespace }}/drover-worker"
 
@@ -35,6 +35,10 @@ drover_valkey_port: "{{ valkey_server_port }}"
 drover_valkey_password: "{{ valkey_master_password }}"
 drover_redis_db_index: 7
 drover_redis_url: "redis://{{ drover_valkey_host }}:{{ drover_valkey_port }}/{{ drover_redis_db_index }}"
+# Kolla Valkey Sentinel follows the writer after failover; the URL retains DB/auth.
+drover_sentinel_enabled: true
+drover_sentinel_master_name: "{{ valkey_sentinel_monitor_name }}"
+drover_sentinel_hosts: "{% for host in groups['valkey'] %}{{ 'api' | kolla_address(host) }}:{{ valkey_sentinel_port }}{% if not loop.last %},{% endif %}{% endfor %}"
 
 drover_secrets_dir: "{{ drover_config_dir }}/secrets"
 drover_container_secrets_dir: "/etc/drover/secrets"

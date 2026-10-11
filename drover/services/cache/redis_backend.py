@@ -11,9 +11,9 @@
 from __future__ import annotations
 
 import logging
-from urllib.parse import unquote, urlsplit
 
 import redis.asyncio as aioredis
+from redis.asyncio.connection import SSLConnection, UnixDomainSocketConnection, parse_url
 
 from drover.config import get_settings
 from drover.services.cache import metrics
@@ -30,6 +30,7 @@ class RedisBackend(Cache):
 
     def __init__(self, *, client: aioredis.Redis | None = None) -> None:
         self._client = client
+        self._sentinel = None
 
     # ── 클라이언트 lazy 초기화 ────────────────────────────────────────────────
     def _get_client(self) -> aioredis.Redis:
@@ -49,14 +50,13 @@ class RedisBackend(Cache):
                 )
         return self._client
 
-    @staticmethod
-    def _build_sentinel_client(settings) -> aioredis.Redis:
+    def _build_sentinel_client(self, settings) -> aioredis.Redis:
         """Redis Sentinel HA 클라이언트를 빌드한다.
 
         sentinel_hosts: 콤마 구분 "host:port" 목록.
         master_for() kwargs로 decode_responses=True 를 전달해 str 반환 보장.
         """
-        from redis.asyncio.sentinel import Sentinel
+        from redis.asyncio.sentinel import Sentinel, SentinelManagedSSLConnection
 
         hosts = []
         for entry in settings.sentinel_hosts.split(","):
@@ -69,21 +69,25 @@ class RedisBackend(Cache):
             else:
                 hosts.append((entry, 26379))
 
-        password = unquote(urlsplit(settings.redis_url).password or "")
-
-        sentinel = Sentinel(
-            hosts,
-            socket_timeout=5,
-            socket_connect_timeout=3,
-        )
+        # Preserve the same database, credentials and URL options as from_url().
+        # Sentinel supplies only the current master's address, not its identity.
+        options = parse_url(settings.redis_url)
+        options.pop("host", None)
+        options.pop("port", None)
+        connection_class = options.pop("connection_class", None)
+        if connection_class is UnixDomainSocketConnection:
+            raise ValueError("Sentinel requires a TCP Redis URL")
+        if connection_class is SSLConnection:
+            options["connection_class"] = SentinelManagedSSLConnection
+        self._sentinel = Sentinel(hosts, socket_timeout=5, socket_connect_timeout=3)
         master_kwargs = {
+            "encoding": "utf-8",
             "decode_responses": True,
             "socket_keepalive": True,
             "health_check_interval": 30,
+            **options,
         }
-        if password:
-            master_kwargs["password"] = password
-        return sentinel.master_for(settings.sentinel_master_name, **master_kwargs)
+        return self._sentinel.master_for(settings.sentinel_master_name, **master_kwargs)
 
     # ── 기본 ABC 구현 ────────────────────────────────────────────────────────
     async def get(self, key: str) -> bytes | None:
@@ -173,15 +177,17 @@ class RedisBackend(Cache):
             return False
 
     async def close(self) -> None:
-        if self._client is not None:
+        client, sentinel = self._client, self._sentinel
+        self._client = self._sentinel = None
+        clients = ([client] if client is not None else [])
+        if sentinel is not None:
+            clients.extend(sentinel.sentinels)
+        for owned_client in clients:
             try:
-                # redis-py 5.x 는 aclose(), fakeredis 등 일부 구현은 close() 만 제공
-                close_fn = getattr(self._client, "aclose", None) or getattr(self._client, "close", None)
-                if close_fn is not None:
-                    await close_fn()
+                # Sentinel supplies a pool; explicitly close that pool on redis-py 5.0.
+                await owned_client.close(close_connection_pool=True)
             except Exception:
                 pass
-            self._client = None
 
     # ── 레거시 호환 (ABC 외부) ────────────────────────────────────────────────
     async def _scan(self, pattern: str) -> list[str]:
@@ -201,7 +207,7 @@ class RedisBackend(Cache):
         return keys
 
     def raw_client(self) -> aioredis.Redis:
-        """레거시 _get_redis() / _get_client() 호환용 raw 핸들."""
+        """Return the same writer used by cache, callback and lock consumers."""
         return self._get_client()
 
     # ── 내부 ─────────────────────────────────────────────────────────────────

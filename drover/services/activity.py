@@ -7,7 +7,7 @@ import logging
 import time
 from typing import Any
 
-from drover.cache import _get_client
+from drover.services.cache import _get_client
 
 _logger = logging.getLogger("drover.activity")
 

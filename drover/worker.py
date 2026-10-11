@@ -9,6 +9,7 @@ import signal
 from drover.config import get_settings, validate_config
 from drover.db import close_db, init_db
 from drover.logging import configure_logging
+from drover.services import cache
 
 _logger = logging.getLogger("drover.worker")
 
@@ -129,6 +130,7 @@ async def _main_async():
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+    await cache.get_backend().close()
     await close_db()
     _logger.info("Drover worker stopped cleanly.")
 

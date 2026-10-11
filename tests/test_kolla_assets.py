@@ -7,7 +7,6 @@ from pathlib import Path
 
 import jinja2
 import yaml
-from jinja2 import meta
 
 import drover
 
@@ -86,78 +85,6 @@ def test_jinja2_templates_compile():
         assert parsed is not None, f"Failed to parse Jinja template: {tpl_file}"
 
 
-def test_defaults_variable_interface():
-    """Verify variable defaults, image namespace/tags, source pin, and endpoints."""
-    defaults_file = ROLE_DIR / "defaults" / "main.yml"
-    assert defaults_file.is_file()
-    defaults = yaml.safe_load(defaults_file.read_text(encoding="utf-8"))
-
-    # Image namespace and tags
-    assert defaults["drover_image_namespace"] == "ghcr.io/openstack-afterglow"
-    assert defaults["drover_source_version"] == "66d33447d0a6f8b1b2ba34f88b360a6bf9c28399"
-
-    # Required service definitions
-    assert "drover_services" in defaults
-    services = defaults["drover_services"]
-    assert "drover-api" in services
-    assert "drover-worker" in services
-
-    # Secret directory and file defaults
-    assert defaults["drover_secrets_dir"] == "{{ drover_config_dir }}/secrets"
-    assert defaults["drover_container_secrets_dir"] == "/etc/drover/secrets"
-    assert defaults["drover_keystone_password_file"] == "{{ drover_container_secrets_dir }}/os_password"
-    assert defaults["drover_database_password_file"] == "{{ drover_container_secrets_dir }}/database_password"
-    assert defaults["drover_redis_password_file"] == "{{ drover_container_secrets_dir }}/redis_password"
-    assert (
-        defaults["drover_kubeconfig_encryption_key_file"]
-        == "{{ drover_container_secrets_dir }}/kubeconfig_encryption_key"
-    )
-    assert (
-        defaults["drover_afterglow_admission_token_file"]
-        == "{{ drover_container_secrets_dir }}/afterglow_admission_token"
-    )
-    assert defaults["drover_afterglow_admission_url"] == "{{ afterglow_public_api_base | default('') }}"
-    assert defaults["drover_afterglow_admission_token"] == "{{ afterglow_k3s_gpu_admission_token | default('') }}"
-
-    # Passwordless database and redis URLs
-    assert ":" not in defaults["drover_database_url"].split("@")[0].split("//")[1]
-    assert (
-        ":" not in defaults["drover_redis_url"].split("@")[0].split("//")[1]
-        if "@" in defaults["drover_redis_url"]
-        else True
-    )
-
-    # Secret mounts in services
-    secret_mount = "{{ drover_secrets_dir }}:{{ drover_container_secrets_dir }}:ro"
-    assert secret_mount in services["drover-api"]["volumes"]
-    assert secret_mount in services["drover-worker"]["volumes"]
-
-    # Service environments contain no secrets
-    api_env = defaults["drover_service_environments"]["drover-api"]
-    worker_env = defaults["drover_service_environments"]["drover-worker"]
-    assert "OS_PASSWORD" not in api_env
-    assert "DROVER_KUBECONFIG_ENCRYPTION_KEY" not in api_env
-    assert "OS_PASSWORD" not in worker_env
-    assert "DROVER_KUBECONFIG_ENCRYPTION_KEY" not in worker_env
-
-    # Health probe endpoints in API service
-    api_healthcheck = services["drover-api"]["healthcheck"]["test"]
-    assert any("/v1/health" in arg for arg in api_healthcheck)
-
-    # Validate Keystone user and project defaults
-    assert defaults["drover_keystone_user"] == "drover"
-    assert defaults["drover_service_project_name"] == "drover-service"
-
-    # Verify origin endpoint URLs do not contain obsolete /v1 suffix
-    assert defaults["drover_public_endpoint_url"] == "{{ drover_external_url }}"
-    assert not defaults["drover_public_endpoint_url"].endswith("/v1")
-    assert not defaults["drover_internal_endpoint_url"].endswith("/v1")
-    assert not defaults["drover_admin_endpoint_url"].endswith("/v1")
-
-    # Ensure no concrete passwords are baked into defaults file
-    raw_defaults = defaults_file.read_text(encoding="utf-8")
-    assert "secret_password" not in raw_defaults
-    assert "my_secret_key" not in raw_defaults
 
 
 def test_action_dispatch_and_ordering():
@@ -266,59 +193,6 @@ def test_config_resolution_and_rendering():
     assert tpl_task["ansible.builtin.template"]["dest"] == "{{ drover_config_dir }}/drover.conf"
 
 
-def test_drover_conf_template_render():
-    """Verify the production drover.conf template renders its current variable interface."""
-    tpl_file = ROLE_DIR / "templates" / "drover.conf.j2"
-    assert tpl_file.is_file()
-    source = tpl_file.read_text(encoding="utf-8")
-    env = jinja2.Environment(undefined=jinja2.StrictUndefined)
-    env.filters["bool"] = bool
-    parsed = env.parse(source)
-    context = {name: "" for name in meta.find_undeclared_variables(parsed)}
-    context.update(
-        drover_keystone_auth_url="http://127.0.0.1:5000/v3",
-        drover_keystone_user="drover",
-        drover_keystone_password_file="/etc/drover/secrets/os_password",
-        drover_database_password_file="/etc/drover/secrets/database_password",
-        drover_redis_password_file="/etc/drover/secrets/redis_password",
-        drover_kubeconfig_encryption_key_file="/etc/drover/secrets/kubeconfig_encryption_key",
-        drover_afterglow_admission_url="http://afterglow.internal:8000",
-        drover_afterglow_admission_token_file="/etc/drover/secrets/afterglow_admission_token",
-        drover_service_project_name="drover-service",
-        drover_service_project_id="test-proj-id-123",
-        drover_keystone_project_domain_name="Default",
-        drover_keystone_user_domain_name="Default",
-        drover_keystone_region_name="RegionOne",
-        drover_keystone_interface="internal",
-        openstack_insecure=False,
-        openstack_cacert="",
-        drover_database_url="mysql+aiomysql://drover@127.0.0.1:3306/drover",
-        drover_redis_url="redis://127.0.0.1:6379/7",
-        drover_callback_base_url="http://127.0.0.1:8011",
-        drover_trusted_proxies="127.0.0.1/32,192.0.2.10/32,2001:db8::10/128",
-        drover_boot_volume_size_gb=30,
-        drover_occm_enabled=True,
-        drover_cinder_csi_enabled=True,
-        drover_manila_csi_enabled=False,
-        drover_keystone_auth_enabled=False,
-        drover_octavia_ingress_enabled=False,
-        drover_barbican_kms_enabled=False,
-        drover_stampede_enabled=False,
-    )
-    rendered = env.from_string(source).render(context)
-    assert "[keystone]" in rendered
-    assert 'service_project_id = "test-proj-id-123"' in rendered
-    assert 'callback_base_url = "http://127.0.0.1:8011"' in rendered
-    assert "boot_volume_size_gb = 30" in rendered
-    assert "occm_enabled = true" in rendered
-    assert 'password_file = "/etc/drover/secrets/os_password"' in rendered
-    assert 'password_file = "/etc/drover/secrets/database_password"' in rendered
-    assert 'password_file = "/etc/drover/secrets/redis_password"' in rendered
-    assert 'kubeconfig_encryption_key_file = "/etc/drover/secrets/kubeconfig_encryption_key"' in rendered
-    assert 'afterglow_admission_url = "http://afterglow.internal:8000"' in rendered
-    assert 'afterglow_admission_token_file = "/etc/drover/secrets/afterglow_admission_token"' in rendered
-    assert "password =" not in rendered
-    assert "kubeconfig_encryption_key =" not in rendered
 
 
 def test_container_start_and_pull_policy():

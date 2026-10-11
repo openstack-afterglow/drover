@@ -33,7 +33,6 @@ from drover.api import (
     templates,
     workloads,
 )
-from drover.cache import _get_redis, close_cache
 from drover.config import get_settings, validate_config
 from drover.db import check_db, close_db, get_session_factory, init_db
 from drover.logging import configure_logging
@@ -46,14 +45,14 @@ from drover.models.schemas import (
 )
 from drover.rate_limit import limiter
 from drover.scripts.migrate import load_manifest
-from drover.services import keystone
+from drover.services import cache, keystone
 from drover.services.errors import K3sApiError
 
 _logger = logging.getLogger(__name__)
 
 
 async def _check_redis() -> bool:
-    await _get_redis().ping()
+    await cache._get_client().ping()
     return True
 
 
@@ -110,7 +109,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
-        await close_cache()
+        await cache.get_backend().close()
         await close_db()
 
 
