@@ -260,7 +260,7 @@ The new native zero-worker create on 0.4.8 failed at callback-token `SETEX` befo
 - Reuse existing `sentinel_enabled`, `sentinel_master_name`, `sentinel_hosts` Settings. Kolla renders discovery from its native Valkey inventory, monitor name and Sentinel port, enabled by default. External standalone Redis requires explicit `drover_sentinel_enabled: false`.
 - Preserve the Redis URL database, decoded data credentials, query options and data TLS connection class during master discovery. Previously the Sentinel builder discarded `/7` and would write to shared DB 0. Native Sentinel has no configured client password; data authentication remains separate and its password is not sent to Sentinel.
 - Remove the independent fixed-endpoint Redis provider. Readiness and Stampede activity use the callback/cache/lock backend. API and Worker shutdown close the owned data and discovery pools using pinned Redis 5.0.0's `close(close_connection_pool=True)`.
-- Root runtime/package/lock and registry image tag are `0.4.9` / `v0.4.9`; SDK `0.2.21` and migrations are unchanged. Source-build SHA remains independently pinned.
+- Root runtime/package/lock and registry image tag are `0.4.9` / `v0.4.9`; SDK `0.2.21` and migrations are unchanged. The source-build SHA is independently pinned to corrected code commit `044efe99ab5d86f7a1d92f52efae3547066c913f`, avoiding a circular self-commit reference.
 
 The database-boundary regression failed before the fix because the callback was absent from DB 7, then passed after correction. Constructor/mock-forwarding and incidental template/default-copy tests were removed instead of re-pinning implementation details.
 

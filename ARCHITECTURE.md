@@ -275,9 +275,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "d6088818ad5ea621cb42c03e42c025d4e4f23270c24e31a64d05fa615e99cbc3",
-  "reviewed_at": "2026-10-11T17:49:35Z",
-  "summary": "Reviewed Sentinel writer routing, DB7/auth/TLS preservation, API/Worker shared-backend shutdown, native role configuration and callback/event smoke; restored test import grouping after LSP misclassification; root 0.4.9"
+  "source_sha256": "98c0dd121683ff3a64fc3d4b761eeaa134d96fc26153f84b15ae1aeb46d3523f",
+  "reviewed_at": "2026-10-11T17:54:42Z",
+  "summary": "Kolla source_build immutable SHA updated to corrected 0.4.9 code commit 044efe99ab5d86f7a1d92f52efae3547066c913f; registry tag and independently pinned source mode both contain Sentinel writer/DB7 fix"
 }
 ```
 <!-- architecture-review:end -->
