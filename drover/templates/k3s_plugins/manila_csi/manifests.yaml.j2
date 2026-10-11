@@ -57,6 +57,32 @@ roleRef:
   name: manila-csi-controller-role
   apiGroup: rbac.authorization.k8s.io
 ---
+# The provisioner reads only this credential Secret, not arbitrary cluster Secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: manila-csi-secret-reader
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["manila-cloud-secret"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: manila-csi-secret-reader
+  namespace: kube-system
+subjects:
+  - kind: ServiceAccount
+    name: manila-csi-controller-sa
+    namespace: kube-system
+roleRef:
+  kind: Role
+  name: manila-csi-secret-reader
+  apiGroup: rbac.authorization.k8s.io
+---
 # CSIDriver: Manila NFS
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
@@ -159,9 +185,7 @@ spec:
               mountPath: /var/lib/kubelet/plugins/manila.csi.openstack.org
       volumes:
         - name: plugin-dir
-          hostPath:
-            path: /var/lib/kubelet/plugins/manila.csi.openstack.org
-            type: DirectoryOrCreate
+          emptyDir: {}
         - name: fwd-plugin-dir
           hostPath:
             path: /var/lib/kubelet/plugins/nfs.csi.k8s.io
@@ -281,6 +305,8 @@ parameters:
   csi.storage.k8s.io/provisioner-secret-namespace: kube-system
   csi.storage.k8s.io/node-stage-secret-name: manila-cloud-secret
   csi.storage.k8s.io/node-stage-secret-namespace: kube-system
-  type: default_share_type
+  csi.storage.k8s.io/node-publish-secret-name: manila-cloud-secret
+  csi.storage.k8s.io/node-publish-secret-namespace: kube-system
+  type: {{ share_type | tojson }}
 reclaimPolicy: Delete
 allowVolumeExpansion: false

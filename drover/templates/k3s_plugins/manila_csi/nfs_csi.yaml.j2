@@ -121,9 +121,7 @@ spec:
               name: socket-dir
       volumes:
         - name: socket-dir
-          hostPath:
-            path: /var/lib/kubelet/plugins/nfs.csi.k8s.io
-            type: DirectoryOrCreate
+          emptyDir: {}
 ---
 # NFS CSI Node DaemonSet
 apiVersion: apps/v1

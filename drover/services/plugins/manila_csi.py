@@ -49,6 +49,7 @@ class ManilaCsiPlugin:
             manila_csi_image=settings.drover_manila_csi_image,
             cluster_name=cluster_name,
             share_protocol=settings.drover_manila_csi_share_protocol,
+            share_type=settings.drover_manila_csi_share_type,
             os_auth_url=settings.os_auth_url,
             os_region=settings.os_region_name,
             app_credential_id=app_credential["id"],

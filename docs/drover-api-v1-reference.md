@@ -206,6 +206,7 @@ LOG_LEVEL=DEBUG drover-worker
 - **설명**: 클러스터의 Stampede 오토스케일링 모드를 활성화합니다.
 - **선행 조건**: 클러스터 상태가 `ACTIVE`여야 하며, `stampede_enabled=true`인 agent 노드그룹(유효한 flavor_id 및 min_size <= node_count <= max_size)이 최소 1개 이상 존재해야 합니다. 노드그룹 `flavor_id`는 요청 프로젝트 scope의 Nova 조회로 검증하므로 프로젝트에 공유된 private flavor(예: GPU passthrough)도 허용되고, 보이지 않는 flavor는 `422`입니다. `image_id`는 `k3s.server_image` 정책(public/community image)을 따릅니다. 노드그룹 생성·수정(`POST`/`PATCH /v1/clusters/{id}/nodegroups`)도 같은 규칙을 적용합니다.
 - **Resource authority**: active control credential이 없으면 409로 거부합니다(legacy cluster는 먼저 재인가). planner와 job은 credential owner의 현재 scale capability를 재검증하며 `reauthorization_required`/`authority_revoked` 차단은 다른 identity로 우회하지 않습니다.
+- **zero-size 수요 선택**: Pod의 `nodeSelector: {afterglow.io/nodegroup: <nodegroup_id>}` 또는 지원되는 required nodeAffinity가 후보 그룹을 선택하면 native affinity/selector mismatch도 scale-up 수요로 처리합니다. 그룹 label/taint·CPU/RAM/GPU fit 및 min/max를 계속 검사하며 selector 없는 실패, PVC 지연, pinned node와 unsupported constraints를 우회하지 않습니다. ready_count만으로 GPU 성공을 판정하지 말고 Operation `SUCCEEDED`, 실제 `nvidia.com/gpu` allocatable과 GPU Pod 실행을 확인합니다.
 - **응답 (200 OK - `StampedeMutationResponse`)**:
   ```json
   {

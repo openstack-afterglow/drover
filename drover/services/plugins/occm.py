@@ -52,6 +52,7 @@ class OccmPlugin:
             project_id=project_id,
             ca_file="" if settings.os_insecure else (settings.os_cacert or ""),
             floating_network_id=settings.resource_id("k3s.occm_floating_network"),
+            internal_lb=settings.drover_occm_internal_lb,
             public_network_name=public_network_name,
             lb_subnet_id=settings.resource_id("k3s.lb_subnet"),
             internal_network_name=internal_network_name,

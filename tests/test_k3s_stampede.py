@@ -89,6 +89,55 @@ def test_gpu_selector_matches_bootstrap_label_without_user_label_duplication():
     assert blocked == []
 
 
+@pytest.mark.parametrize("gpu,selection", [
+    (0, {"node_selector": {"afterglow.io/nodegroup": "cpu"}}),
+    (1, {"node_selector": {"afterglow.io/gpu": "true"}}),
+    (1, {"affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
+        "nodeSelectorTerms": [{"matchExpressions": [{"key": "afterglow.io/gpu", "operator": "In", "values": ["true"]}]}],
+    }}}}),
+])
+async def test_selected_zero_group_reserves_cpu_or_gpu_demand_without_insufficient_message(monkeypatch, gpu, selection):
+    group = _group("gpu" if gpu else "cpu")
+    flavor = _flavor(group["id"], gpu=gpu)
+    pods = [_pod(str(index), cpu=1000, gpu=gpu, **selection,
+                 message="0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector. "
+                         "preemption: 0/1 nodes are available: 1 Preemption is not helpful for scheduling.")
+            for index in range(2)]
+    monkeypatch.setattr(stampede, "_update_stampede_state", AsyncMock())
+    monkeypatch.setattr(stampede, "_record_stampede_event", AsyncMock())
+    enqueue = AsyncMock(return_value={"count": 2, "job_id": "job", "operation_id": "operation"})
+    monkeypatch.setattr(jobs, "enqueue_stampede_job", enqueue)
+
+    await stampede._decide("cluster", "project", [group], {flavor["id"]: flavor}, pods,
+                           [_node("server")], [], _settings())
+
+    enqueue.assert_awaited_once()
+    assert enqueue.call_args.kwargs["direction"] == "up"
+    assert enqueue.call_args.kwargs["expected_node_count"] == 0
+    assert enqueue.call_args.kwargs["requested_count"] == 2
+    assert enqueue.call_args.kwargs["payload"]["gpu_required"] is bool(gpu)
+    assert enqueue.call_args.kwargs["payload"]["gpu_count"] == gpu
+    assert group["stampede_state"]["blocked_reasons"] == []
+    assert len(group["stampede_state"]["pending_assignments"]) == 2
+
+
+@pytest.mark.parametrize("extra,reason", [
+    ({"node_selector": {"pool": "missing"}}, "no_matching_nodegroup"),
+    ({"node_selector": {"pool": "new"}, "cpu": 3000}, "no_matching_nodegroup"),
+    ({"node_selector": {"pool": "new"}, "gpu": 1}, "no_matching_nodegroup"),
+    ({"node_selector": {"pool": "new"}, "node_name": "fixed"}, "pinned_missing_node"),
+    ({"node_selector": {"pool": "new"}, "host_ports": [{"port": 80}]}, "unsupported_host_ports"),
+    ({}, "not_resource_shortage"),
+])
+def test_selector_shortage_requires_supported_matching_template_and_capacity(extra, reason):
+    pod = _pod(message="0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector.", **extra)
+    assignments, blocked, _ = stampede._assign_pending_pods(
+        [pod], [_group(labels={"pool": "new"})], {"cpu": _flavor()}, [], [_node("server")],
+    )
+    assert assignments == {"cpu": []}
+    assert blocked[0]["reason"] == reason
+
+
 def test_pending_pods_consume_existing_capacity_once_cluster_wide():
     pods = [_pod("first", cpu=1500), _pod("second", cpu=1500)]
     group = _group()

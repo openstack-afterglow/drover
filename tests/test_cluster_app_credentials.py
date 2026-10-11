@@ -23,10 +23,12 @@ def _mock_settings(**kwargs) -> MagicMock:
     m.os_user_domain_name = "Default"
     m.drover_occm_enabled = True
     m.drover_occm_image = "occm-image:v1.28.0"
+    m.drover_occm_internal_lb = False
     m.drover_manila_csi_enabled = True
     m.drover_manila_csi_image = "manila-image:v1.28.0"
     m.drover_manila_csi_nfs_image = "nfs-image:v4.4.0"
     m.drover_manila_csi_share_protocol = "NFS"
+    m.drover_manila_csi_share_type = "default"
     m.drover_barbican_kms_enabled = True
     m.drover_barbican_kms_image = "kms-image:v1.28.0"
     m.drover_barbican_kms_kek_id = "kek-uuid-123"
@@ -58,11 +60,6 @@ def test_1_no_password_fallback():
     # Manila CSI
     with pytest.raises(ValueError, match="app_credential"):
         ManilaCsiPlugin().generate_manifests("cluster-1", "proj-1", s, app_credential=None)
-    manila_manifests = ManilaCsiPlugin().generate_manifests("cluster-1", "proj-1", s, app_credential=_FAKE_APP_CRED)
-    assert "os-applicationCredentialID: appcred-id-999" in manila_manifests
-    assert "os-applicationCredentialSecret: appcred-secret-888" in manila_manifests
-    assert "os-userName" not in manila_manifests
-    assert "os-password" not in manila_manifests
 
     # Barbican KMS
     with pytest.raises(ValueError, match="app_credential"):

@@ -3,6 +3,7 @@ auth-url={{ auth_url }}
 region={{ region }}
 application-credential-id={{ app_credential_id }}
 application-credential-secret={{ app_credential_secret }}
+tls-insecure={{ tls_insecure | lower }}
 {% if ca_file %}
 ca-file={{ ca_file }}
 {% endif %}

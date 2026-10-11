@@ -4,9 +4,11 @@ resources:
   - resources:
       - secrets
     providers:
+      # First provider encrypts every new write; KMS failure never writes plaintext.
       - kms:
           apiVersion: v2
           name: barbican-kms
           endpoint: unix:///var/lib/kms/kms.sock
           timeout: 3s
+      # Read compatibility for legacy plaintext only, not a write fallback.
       - identity: {}

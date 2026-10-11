@@ -7,10 +7,12 @@
 KMS sock 영원히 미생성 → 데드락).
 
 본 재설계는 KMS plugin 을 **k3s 외부 systemd service** 로 분리:
-1. k3s install (INSTALL_K3S_SKIP_START=true) — binary 만 준비, service 미시작
-2. install_kms.sh — podman 으로 KMS image pull + binary 추출 → /usr/local/bin/
-3. systemctl start barbican-kms.service → /var/lib/kms/kms.sock 생성
-4. systemctl start k3s.service → apiserver 가 이미 존재하는 sock 와 통신, 정상 부팅
+1. install_kms.sh — podman 으로 KMS image pull + binary 추출 → /usr/local/bin/
+2. systemctl enable --now barbican-kms.service → /var/lib/kms/kms.sock 생성 대기
+3. k3s install → apiserver 가 이미 존재하는 sock 와 통신, 정상 부팅
+
+The first encryption provider is KMS v2: every new write requires KMS. The second
+identity provider reads legacy plaintext only; it is not a write failover.
 
 statically linked Go binary 라 host install 가능 (libc 의존성 없음).
 """
@@ -67,11 +69,13 @@ class BarbicanKmsPlugin:
         app_credential: dict | None = None,
         kek_id: str | None = None,
     ) -> list[dict]:
-        """KMS 운영에 필요한 host file 4건 작성."""
+        """Write host service configuration and, when configured, its CA bundle."""
         if not app_credential or not app_credential.get("id") or not app_credential.get("secret"):
             raise ValueError("app_credential containing id and secret is required for Barbican KMS plugin")
         encryption_config = _jinja.get_template("k3s_plugins/barbican_kms/encryption_config.yaml.j2").render()
         effective_kek_id = kek_id or settings.drover_barbican_kms_kek_id
+        ca_file = "/etc/kubernetes/barbican-ca.crt" if settings.os_cacert and not settings.os_insecure else ""
+        ca_pem = Path(settings.os_cacert).read_text(encoding="utf-8") if ca_file else ""
         systemd_unit = _jinja.get_template("k3s_plugins/barbican_kms/systemd_unit.j2").render()
         install_script = _jinja.get_template("k3s_plugins/barbican_kms/install_kms.sh.j2").render(
             kms_image=settings.drover_barbican_kms_image,
@@ -81,10 +85,11 @@ class BarbicanKmsPlugin:
             region=settings.os_region_name,
             app_credential_id=app_credential["id"],
             app_credential_secret=app_credential["secret"],
-            ca_file="" if settings.os_insecure else (settings.os_cacert or ""),
+            ca_file=ca_file,
+            tls_insecure=settings.os_insecure,
             kek_id=effective_kek_id,
         )
-        return [
+        files = [
             {
                 "path": "/etc/kubernetes/encryption-config.yaml",
                 "permissions": "0600",
@@ -106,6 +111,13 @@ class BarbicanKmsPlugin:
                 "content": cloud_conf,
             },
         ]
+        if ca_file:
+            files.append({
+                "path": "/etc/kubernetes/barbican-ca.crt",
+                "permissions": "0644",
+                "content": ca_pem,
+            })
+        return files
 
     def server_install_args(self, settings: Settings) -> list[str]:
         """K3s 서버에 encryption-provider-config 만 전달.

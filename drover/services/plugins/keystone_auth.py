@@ -18,6 +18,7 @@ import datetime
 import ipaddress
 import logging
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
@@ -35,6 +36,15 @@ _jinja = Environment(
 
 _STATIC_POD_DIR = "/var/lib/rancher/k3s/agent/pod-manifests"
 _AUTH_DIR = "/etc/kubernetes/keystone-auth"
+
+
+def _keystone_v3_url(auth_url: str) -> str:
+    """Keep catalog path prefixes and exactly one native v3 suffix."""
+    url = urlsplit(auth_url)
+    path = url.path.rstrip("/")
+    while path.endswith("/v3"):
+        path = path[:-3].rstrip("/")
+    return urlunsplit(url._replace(path=f"{path}/v3"))
 
 
 def _generate_self_signed_cert() -> tuple[bytes, bytes]:
@@ -116,14 +126,24 @@ class KeystoneAuthPlugin:
         return ""
 
     def extra_write_files(self, project_id: str, cluster_name: str, settings: Settings) -> list[dict]:
-        """Static pod 운영에 필요한 host file 5건 작성.
+        """Write static pod host files, including an optional Keystone CA bundle.
 
         1. webhook config — apiserver가 부팅 시 읽음 (endpoint=127.0.0.1:8443)
         2. static pod manifest — kubelet이 감시 → keystone-auth pod 즉시 띄움
         3. tls.crt — webhook TLS 인증서 (host hostPath로 컨테이너에 마운트)
         4. tls.key — webhook TLS 개인키
         5. policy.json — 인증/인가 정책 (ConfigMap 의존 제거)
+        Only TokenReview authentication is installed; authorization stays with K8s RBAC.
+        Native v1.34.1 verifies HTTPS using system trust or the configured CA and has
+        no insecure HTTPS mode. The apiserver-to-webhook certificate remains pinned.
         """
+        if urlsplit(settings.os_auth_url).scheme == "https" and settings.os_insecure:
+            raise ValueError(
+                "Keystone webhook does not support insecure HTTPS; configure os_cacert "
+                "or system-trusted TLS with os_insecure=false"
+            )
+        ca_file = "/etc/pki/keystone-ca.crt" if settings.os_cacert and not settings.os_insecure else ""
+        ca_pem = Path(settings.os_cacert).read_text(encoding="utf-8") if ca_file else ""
         cert_pem, key_pem = self._get_or_create_cert(cluster_name)
         cert_b64 = base64.b64encode(cert_pem).decode()
 
@@ -132,11 +152,12 @@ class KeystoneAuthPlugin:
         )
         static_pod = _jinja.get_template("k3s_plugins/keystone_auth/static_pod.yaml.j2").render(
             keystone_auth_image=settings.drover_keystone_auth_image,
-            os_auth_url=settings.os_auth_url,
+            os_auth_url=_keystone_v3_url(settings.os_auth_url),
+            ca_file=ca_file,
         )
         policy_json = settings.drover_keystone_auth_policy.strip() or "[]"
 
-        return [
+        files = [
             {
                 "path": "/etc/kubernetes/keystone-webhook.yaml",
                 "permissions": "0600",
@@ -163,10 +184,18 @@ class KeystoneAuthPlugin:
                 "content": policy_json,
             },
         ]
+        if ca_file:
+            files.append({
+                "path": f"{_AUTH_DIR}/keystone-ca.crt",
+                "permissions": "0644",
+                "content": ca_pem,
+            })
+        return files
 
     def server_install_args(self, settings: Settings) -> list[str]:
         return [
             "--kube-apiserver-arg=authentication-token-webhook-config-file=/etc/kubernetes/keystone-webhook.yaml",
+            "--kube-apiserver-arg=authentication-token-webhook-version=v1beta1",
             f"--kubelet-arg=pod-manifest-path={_STATIC_POD_DIR}",
         ]
 

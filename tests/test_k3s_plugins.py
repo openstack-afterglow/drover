@@ -24,6 +24,7 @@ def _base_settings(**kwargs) -> MagicMock:
         # OCCM
         "drover_occm_enabled": False,
         "drover_occm_image": "registry.k8s.io/provider-os/openstack-cloud-controller-manager:v1.35.0",
+        "drover_occm_internal_lb": False,
         # Cinder CSI
         "drover_cinder_csi_enabled": False,
         "drover_cinder_csi_image": "registry.k8s.io/provider-os/cinder-csi-plugin:v1.31.0",
@@ -33,6 +34,7 @@ def _base_settings(**kwargs) -> MagicMock:
         "drover_manila_csi_image": "registry.k8s.io/provider-os/manila-csi-plugin:v1.31.0",
         "drover_manila_csi_nfs_image": "registry.k8s.io/sig-storage/nfsplugin:v4.9.0",
         "drover_manila_csi_share_protocol": "NFS",
+        "drover_manila_csi_share_type": "default",
         # Keystone Auth
         "drover_keystone_auth_enabled": False,
         "drover_keystone_auth_image": "registry.k8s.io/provider-os/k8s-keystone-auth:v1.31.0",
@@ -230,10 +232,11 @@ def test_manila_csi_manifests_valid_yaml():
     assert "CSIDriver" in kinds
     assert "StatefulSet" in kinds
     assert "StorageClass" in kinds
-    assert "os-applicationCredentialID" in manifests
-    assert "os-applicationCredentialSecret" in manifests
-    assert "os-userName" not in manifests
-    assert "os-password" not in manifests
+    secret = next(d for d in docs if d["kind"] == "Secret")
+    assert secret["stringData"]["os-applicationCredentialID"] == _FAKE_APP_CRED["id"]
+    assert secret["stringData"]["os-applicationCredentialSecret"] == _FAKE_APP_CRED["secret"]
+    assert "os-userName" not in secret["stringData"]
+    assert "os-password" not in secret["stringData"]
     # NFS CSI 드라이버도 포함되어야 함
     names = {d.get("metadata", {}).get("name") for d in docs}
     assert "nfs.csi.k8s.io" in names
@@ -247,11 +250,106 @@ def test_manila_csi_manifests_missing_app_cred_raises():
     s = _base_settings(drover_manila_csi_enabled=True)
     with pytest.raises(ValueError, match="app_credential"):
         ManilaCsiPlugin().generate_manifests("test-cluster", "proj-1", s, app_credential=None)
+
+
 def test_manila_csi_no_cloud_conf_sections():
     from drover.services.plugins.manila_csi import ManilaCsiPlugin
 
     s = _base_settings(drover_manila_csi_enabled=True)
     assert ManilaCsiPlugin().cloud_conf_sections("proj-1", s) == ""
+
+
+@pytest.fixture
+def manila_documents():
+    from drover.services.plugins.manila_csi import ManilaCsiPlugin
+
+    manifests = ManilaCsiPlugin().generate_manifests(
+        "test-cluster", "proj-1", _base_settings(), app_credential=_FAKE_APP_CRED
+    )
+    return {(d["kind"], d["metadata"]["name"]): d for d in yaml.safe_load_all(manifests) if d}
+
+
+@pytest.mark.parametrize("share_type", ["default", "cephfsnfstype", "operator \"NFS\" type"])
+def test_manila_storage_class_credentials_and_share_type(share_type):
+    from drover.services.plugins.manila_csi import ManilaCsiPlugin
+
+    manifests = ManilaCsiPlugin().generate_manifests(
+        "test-cluster", "proj-1", _base_settings(drover_manila_csi_share_type=share_type),
+        app_credential=_FAKE_APP_CRED,
+    )
+    docs = [d for d in yaml.safe_load_all(manifests) if d]
+    secret = next(d for d in docs if d["kind"] == "Secret")
+    storage_class = next(d for d in docs if d["kind"] == "StorageClass")
+    driver_names = {d["metadata"]["name"] for d in docs if d["kind"] == "CSIDriver"}
+    assert storage_class["provisioner"] in driver_names
+    assert storage_class["parameters"]["type"] == share_type
+    for operation in ("provisioner", "node-stage", "node-publish"):
+        prefix = f"csi.storage.k8s.io/{operation}-secret"
+        assert storage_class["parameters"][f"{prefix}-name"] == secret["metadata"]["name"]
+        assert storage_class["parameters"][f"{prefix}-namespace"] == secret["metadata"]["namespace"]
+
+
+def test_manila_controller_secret_access_is_namespaced_and_resource_scoped(manila_documents):
+    secret = manila_documents["Secret", "manila-cloud-secret"]
+    controller = manila_documents["StatefulSet", "manila-csi-controllerplugin"]
+    secret_roles = [
+        d for (kind, _), d in manila_documents.items()
+        if kind in {"Role", "ClusterRole"} and any("secrets" in rule["resources"] for rule in d["rules"])
+    ]
+    assert len(secret_roles) == 1
+    role = secret_roles[0]
+    assert role["kind"] == "Role"
+    assert role["metadata"]["namespace"] == secret["metadata"]["namespace"]
+    assert role["rules"] == [{
+        "apiGroups": [""], "resources": ["secrets"],
+        "resourceNames": [secret["metadata"]["name"]], "verbs": ["get"],
+    }]
+    bindings = [
+        d for (kind, _), d in manila_documents.items()
+        if kind in {"RoleBinding", "ClusterRoleBinding"} and d["roleRef"]["name"] == role["metadata"]["name"]
+    ]
+    assert len(bindings) == 1
+    binding = bindings[0]
+    assert binding["kind"] == "RoleBinding"
+    assert binding["metadata"]["namespace"] == role["metadata"]["namespace"]
+    assert binding["roleRef"]["kind"] == "Role"
+    assert binding["subjects"] == [{
+        "kind": "ServiceAccount", "name": controller["spec"]["template"]["spec"]["serviceAccountName"],
+        "namespace": controller["metadata"]["namespace"],
+    }]
+
+
+def test_manila_and_nfs_controller_sockets_do_not_replace_node_sockets(manila_documents):
+    manila_path = "/var/lib/kubelet/plugins/manila.csi.openstack.org"
+    nfs_path = "/var/lib/kubelet/plugins/nfs.csi.k8s.io"
+    for controller_kind, controller_name, node_name, driver_name, path in (
+        ("StatefulSet", "manila-csi-controllerplugin", "manila-csi-nodeplugin", "manila-csi-plugin", manila_path),
+        ("Deployment", "nfs-csi-controller", "nfs-csi-node", "nfs", nfs_path),
+    ):
+        controller = manila_documents[controller_kind, controller_name]["spec"]["template"]["spec"]
+        node = manila_documents["DaemonSet", node_name]["spec"]["template"]["spec"]
+        for spec, controller_socket in ((controller, True), (node, False)):
+            driver = next(c for c in spec["containers"] if c["name"] == driver_name)
+            endpoint = next(e["value"] for e in driver["env"] if e["name"] == "CSI_ENDPOINT")
+            assert endpoint == f"unix://{path}/csi.sock"
+            socket_mount = next(m for m in driver["volumeMounts"] if m["mountPath"] == path)
+            volume = next(v for v in spec["volumes"] if v["name"] == socket_mount["name"])
+            if controller_socket:
+                assert volume["emptyDir"] == {}
+                assert "hostPath" not in volume
+            else:
+                assert volume["hostPath"]["path"] == path
+                assert next(m for m in driver["volumeMounts"] if m["mountPath"] == "/var/lib/kubelet/pods")[
+                    "mountPropagation"
+                ] == "Bidirectional"
+        registrar = next(c for c in node["containers"] if c["name"] == "node-driver-registrar")
+        assert next(e["value"] for e in registrar["env"] if e["name"] == "DRIVER_REG_SOCK_PATH") == f"{path}/csi.sock"
+
+    manila_node = manila_documents["DaemonSet", "manila-csi-nodeplugin"]["spec"]["template"]["spec"]
+    driver = next(c for c in manila_node["containers"] if c["name"] == "manila-csi-plugin")
+    assert f"--fwdendpoint=unix://{nfs_path}/csi.sock" in driver["args"]
+    forwarding_mount = next(m for m in driver["volumeMounts"] if m["mountPath"] == nfs_path)
+    assert next(v for v in manila_node["volumes"] if v["name"] == forwarding_mount["name"])["hostPath"]["path"] == nfs_path
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +470,8 @@ def test_keystone_auth_server_install_args_includes_kubelet_arg():
     args = KeystoneAuthPlugin().server_install_args(s)
     assert any("authentication-token-webhook-config-file" in a for a in args)
     assert any("pod-manifest-path=/var/lib/rancher/k3s/agent/pod-manifests" in a for a in args)
+    assert "--kube-apiserver-arg=authentication-token-webhook-version=v1beta1" in args
+    assert not any("authorization" in arg for arg in args)
 
 
 def test_keystone_auth_extra_write_files_paths():
@@ -404,6 +504,12 @@ def test_keystone_auth_webhook_endpoint_is_localhost():
     webhook_yaml = next(f["content"] for f in files if f["path"].endswith("keystone-webhook.yaml"))
     config = yaml.safe_load(webhook_yaml)
     assert config["clusters"][0]["cluster"]["server"] == "https://127.0.0.1:8443/webhook"
+    cluster = config["clusters"][0]["cluster"]
+    cert = next(f["content"] for f in files if f["path"].endswith("tls.crt"))
+    assert base64.b64decode(cluster["certificate-authority-data"]).decode() == cert
+    assert "insecure-skip-tls-verify" not in cluster
+    policy = next(f["content"] for f in files if f["path"].endswith("policy.json"))
+    assert policy == "[]"
 
 
 def test_keystone_auth_static_pod_listens_on_localhost():

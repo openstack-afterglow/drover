@@ -129,32 +129,34 @@ def _load_toml() -> dict:
         "drover_boot_volume_size_gb": drover.get("boot_volume_size_gb", 30),
         "drover_occm_enabled": drover.get("occm_enabled", True),
         "drover_occm_image": drover.get(
-            "occm_image", "ghcr.io/openstack-afterglow/openstack-cloud-controller-manager:v1.28.0"
+            "occm_image", "registry.k8s.io/provider-os/openstack-cloud-controller-manager:v1.34.1"
         ),
+        "drover_occm_internal_lb": drover.get("occm_internal_lb", False),
         "drover_cinder_csi_enabled": drover.get("cinder_csi_enabled", True),
         "drover_cinder_csi_image": drover.get(
-            "cinder_csi_image", "registry.k8s.io/provider-os/cinder-csi-plugin:v1.28.0"
+            "cinder_csi_image", "registry.k8s.io/provider-os/cinder-csi-plugin:v1.34.1"
         ),
         "drover_manila_csi_enabled": drover.get("manila_csi_enabled", False),
         "drover_manila_csi_image": drover.get(
-            "manila_csi_image", "registry.k8s.io/provider-os/manila-csi-plugin:v1.28.0"
+            "manila_csi_image", "registry.k8s.io/provider-os/manila-csi-plugin:v1.34.1"
         ),
         "drover_manila_csi_nfs_image": drover.get(
-            "manila_csi_nfs_image", "registry.k8s.io/sig-storage/nfsplugin:v4.4.0"
+            "manila_csi_nfs_image", "registry.k8s.io/sig-storage/nfsplugin:v4.9.0"
         ),
         "drover_manila_csi_share_protocol": drover.get("manila_csi_share_protocol", "NFS"),
+        "drover_manila_csi_share_type": drover.get("manila_csi_share_type", "default"),
         "drover_keystone_auth_enabled": drover.get("keystone_auth_enabled", False),
         "drover_keystone_auth_image": drover.get(
-            "keystone_auth_image", "registry.k8s.io/provider-os/k8s-keystone-auth:v1.28.0"
+            "keystone_auth_image", "registry.k8s.io/provider-os/k8s-keystone-auth:v1.34.1"
         ),
         "drover_keystone_auth_policy": drover.get("keystone_auth_policy", ""),
         "drover_octavia_ingress_enabled": drover.get("octavia_ingress_enabled", False),
         "drover_octavia_ingress_image": drover.get(
-            "octavia_ingress_image", "registry.k8s.io/provider-os/octavia-ingress-controller:v1.28.0"
+            "octavia_ingress_image", "registry.k8s.io/provider-os/octavia-ingress-controller:v1.34.1"
         ),
         "drover_barbican_kms_enabled": drover.get("barbican_kms_enabled", False),
         "drover_barbican_kms_image": drover.get(
-            "barbican_kms_image", "registry.k8s.io/provider-os/k8s-barbican-kms:v1.28.0"
+            "barbican_kms_image", "registry.k8s.io/provider-os/barbican-kms-plugin:v1.34.1"
         ),
         "drover_barbican_kms_kek_id": drover.get("barbican_kms_kek_id", ""),
         "drover_cert_rotation_node_timeout_sec": drover.get("cert_rotation_node_timeout_sec", 300),
@@ -241,20 +243,22 @@ class Settings(BaseSettings):
     drover_kubeconfig_encryption_key_file: str = ""
     drover_boot_volume_size_gb: int = 30
     drover_occm_enabled: bool = True
-    drover_occm_image: str = "ghcr.io/openstack-afterglow/openstack-cloud-controller-manager:v1.28.0"
+    drover_occm_image: str = "registry.k8s.io/provider-os/openstack-cloud-controller-manager:v1.34.1"
+    drover_occm_internal_lb: bool = False
     drover_cinder_csi_enabled: bool = True
-    drover_cinder_csi_image: str = "registry.k8s.io/provider-os/cinder-csi-plugin:v1.28.0"
+    drover_cinder_csi_image: str = "registry.k8s.io/provider-os/cinder-csi-plugin:v1.34.1"
     drover_manila_csi_enabled: bool = False
-    drover_manila_csi_image: str = "registry.k8s.io/provider-os/manila-csi-plugin:v1.28.0"
-    drover_manila_csi_nfs_image: str = "registry.k8s.io/sig-storage/nfsplugin:v4.4.0"
+    drover_manila_csi_image: str = "registry.k8s.io/provider-os/manila-csi-plugin:v1.34.1"
+    drover_manila_csi_nfs_image: str = "registry.k8s.io/sig-storage/nfsplugin:v4.9.0"
     drover_manila_csi_share_protocol: str = "NFS"
+    drover_manila_csi_share_type: str = "default"
     drover_keystone_auth_enabled: bool = False
-    drover_keystone_auth_image: str = "registry.k8s.io/provider-os/k8s-keystone-auth:v1.28.0"
+    drover_keystone_auth_image: str = "registry.k8s.io/provider-os/k8s-keystone-auth:v1.34.1"
     drover_keystone_auth_policy: str = ""
     drover_octavia_ingress_enabled: bool = False
-    drover_octavia_ingress_image: str = "registry.k8s.io/provider-os/octavia-ingress-controller:v1.28.0"
+    drover_octavia_ingress_image: str = "registry.k8s.io/provider-os/octavia-ingress-controller:v1.34.1"
     drover_barbican_kms_enabled: bool = False
-    drover_barbican_kms_image: str = "registry.k8s.io/provider-os/k8s-barbican-kms:v1.28.0"
+    drover_barbican_kms_image: str = "registry.k8s.io/provider-os/barbican-kms-plugin:v1.34.1"
     drover_barbican_kms_kek_id: str = ""
     drover_cert_rotation_node_timeout_sec: int = 300
     drover_cert_rotation_job_image: str = "rancher/k3s:v1.28.4-k3s2"

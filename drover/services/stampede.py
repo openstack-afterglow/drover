@@ -282,7 +282,15 @@ def _assign_pending_pods(
             reason = _scheduling_block(pod)
         elif _requests(pod).get("extended_resources"):
             reason = "unsupported_resource_request"
-        elif not re.search(r"insufficient (cpu|memory|nvidia\.com/gpu|pods)|no nodes available", pod.get("message", ""), re.IGNORECASE):
+        elif not (
+            re.search(r"insufficient (cpu|memory|nvidia\.com/gpu|pods)|no nodes available", pod.get("message", ""), re.IGNORECASE)
+            # At zero workers the scheduler can reject every node on labels before
+            # checking resources. The candidate template below must still fit.
+            or (
+                (pod.get("node_selector") or ((pod.get("affinity") or {}).get("nodeAffinity") or {}).get("requiredDuringSchedulingIgnoredDuringExecution"))
+                and "didn't match pod's node affinity/selector" in pod.get("message", "").lower()
+            )
+        ):
             reason = "not_resource_shortage"
         if reason:
             blocked.append({"pod": pod, "reason": reason})

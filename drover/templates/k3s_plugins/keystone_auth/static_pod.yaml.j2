@@ -21,6 +21,9 @@ spec:
         - --tls-cert-file=/etc/pki/tls.crt
         - --tls-private-key-file=/etc/pki/tls.key
         - --keystone-url={{ os_auth_url }}
+{% if ca_file %}
+        - --keystone-ca-file={{ ca_file }}
+{% endif %}
         - --keystone-policy-file=/etc/policy/policy.json
         - --listen=127.0.0.1:8443
       imagePullPolicy: IfNotPresent

@@ -2,7 +2,7 @@
 # Drover kolla role defaults
 
 drover_image_namespace: "ghcr.io/openstack-afterglow"
-drover_image_tag: "v0.4.7"
+drover_image_tag: "v0.4.8"
 drover_api_image: "{{ drover_image_namespace }}/drover-api"
 drover_worker_image: "{{ drover_image_namespace }}/drover-worker"
 
@@ -71,6 +71,7 @@ drover_boot_volume_size_gb: 30
 
 drover_occm_enabled: false
 drover_occm_image: "registry.k8s.io/provider-os/openstack-cloud-controller-manager:v1.34.1"
+drover_occm_internal_lb: false
 
 drover_cinder_csi_enabled: false
 drover_cinder_csi_image: "registry.k8s.io/provider-os/cinder-csi-plugin:v1.34.1"
@@ -79,6 +80,7 @@ drover_manila_csi_enabled: false
 drover_manila_csi_image: "registry.k8s.io/provider-os/manila-csi-plugin:v1.34.1"
 drover_manila_csi_nfs_image: "registry.k8s.io/sig-storage/nfsplugin:v4.9.0"
 drover_manila_csi_share_protocol: "NFS"
+drover_manila_csi_share_type: "default"
 
 drover_keystone_auth_enabled: false
 drover_keystone_auth_image: "registry.k8s.io/provider-os/k8s-keystone-auth:v1.34.1"

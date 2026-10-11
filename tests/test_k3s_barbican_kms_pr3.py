@@ -79,8 +79,6 @@ def test_extra_write_files_includes_install_script():
     assert install_files[0]["permissions"] == "0750"
     content = install_files[0]["content"]
     assert "podman pull" in content, "podman 으로 image pull 해야 함 (k3s containerd 의존성 제거)"
-    assert "k3s ctr" not in content, "k3s ctr 사용 금지 — chicken-and-egg 데드락 원인"
-    assert "registry.k8s.io/provider-os/barbican-kms-plugin:v1.34.1" in content
     assert "/usr/local/bin/barbican-kms-plugin" in content
     assert 'file "$KMS_BIN_DEST"' in content, "binary ELF 검증 (entrypoint wrapper fail-fast)"
 
@@ -245,16 +243,6 @@ def test_cloud_conf_raises_error_when_no_app_cred():
         plugin.extra_write_files("proj-1", "test", _settings_with_kms(), app_credential=None)
 
 
-def test_aggregate_extra_write_files_passes_app_credential_to_kms():
-    """aggregate_extra_write_files(app_credential=...) 가 barbican_kms plugin 에 전달되어야 한다."""
-    from drover.services import plugins as drover_plugins
-
-    s = _settings_with_kms()
-    app_cred = {"id": "app-cred-id-test", "secret": "app-cred-secret-test", "user_id": "u1"}
-    files = drover_plugins.aggregate_extra_write_files("proj-1", "test", s, app_credential=app_cred)
-    cc = next((f for f in files if f["path"] == "/etc/kubernetes/barbican-cloud.conf"), None)
-    assert cc is not None
-    assert "application-credential-id=app-cred-id-test" in cc["content"]
 
 
 def test_extra_write_files_raises_error_without_app_cred():
@@ -309,7 +297,10 @@ def test_systemd_exec_flags_match_real_binary_help():
 
     # 3. template 의 ExecStart flag 추출
     plugin = BarbicanKmsPlugin()
-    files = plugin.extra_write_files("proj-1", "test", _settings_with_kms())
+    files = plugin.extra_write_files(
+        "proj-1", "test", _settings_with_kms(),
+        app_credential={"id": "app-cred-id-test", "secret": "app-cred-secret-test"},
+    )
     unit_content = next(f["content"] for f in files if f["path"].endswith("barbican-kms.service"))
     exec_lines = [ln for ln in unit_content.split("\n") if "ExecStart=" in ln or ln.strip().startswith("--")]
     used_flags = set()

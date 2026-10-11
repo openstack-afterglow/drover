@@ -10,6 +10,7 @@ ca-file={{ ca_file }}
 
 [LoadBalancer]
 use-octavia=true
+internal-lb={{ internal_lb | string | lower }}
 {% if floating_network_id %}
 floating-network-id={{ floating_network_id }}
 {% endif %}
