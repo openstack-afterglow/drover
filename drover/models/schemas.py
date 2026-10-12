@@ -724,7 +724,7 @@ class DroverOperationEventInfo(BaseModel):
     operation_id: str
     sequence: int
     phase: str
-    message: str
+    message: str | None
     payload_json: dict | None = None
     created_at: str | None = None
 

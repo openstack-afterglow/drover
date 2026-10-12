@@ -175,3 +175,30 @@ async def test_ordered_events_and_since_sequence(mock_operations_store):
         assert res_since.status_code == 200
         data_since = res_since.json()
         assert [e["sequence"] for e in data_since] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_payload_only_event_remains_replayable_with_null_message(mock_operations_store):
+    now = datetime.now(UTC)
+    mock_operations_store["add_op"](DroverOperation(
+        id="op-gpu", project_id="proj-1", cluster_id="cluster-1",
+        kind="nodegroup_reconcile", status="SUCCEEDED", created_at=now,
+    ))
+    mock_operations_store["add_event"](DroverOperationEvent(
+        id=401, operation_id="op-gpu", sequence=1, phase="job_enqueued",
+        message="Worker queued", created_at=now,
+    ))
+    mock_operations_store["add_event"](DroverOperationEvent(
+        id=402, operation_id="op-gpu", sequence=2, phase="stampede_workers_observed",
+        message=None, payload_json={"ready_nodes": ["gpu-worker"], "reason": None}, created_at=now,
+    ))
+    async with AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test") as client:
+        response = await client.get(
+            "/v1/operations/op-gpu/events?since_sequence=1", headers={"X-Auth-Token": "token-proj-1"},
+        )
+    assert response.status_code == 200
+    assert response.json() == [{
+        "id": "402", "operation_id": "op-gpu", "sequence": 2, "phase": "stampede_workers_observed",
+        "message": None, "payload_json": {"ready_nodes": ["gpu-worker"], "reason": None},
+        "created_at": now.isoformat(),
+    }]

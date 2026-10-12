@@ -408,6 +408,7 @@ Drover API는 K3s 클러스터 내부 Control Plane과 통신하여 테넌트용
 - **설명**: 오퍼레이션의 시퀀스별 상세 이벤트 로그 조회.
 - **쿼리 파라미터**: `since_sequence` (int, 기본값: `0`)
 - **응답 (200 OK)**: `list[DroverOperationEventInfo]`
+- `message`는 필수 응답 key이지만 값은 문자열 또는 `null`입니다. 사람이 읽는 메시지가 없는 payload-only 이벤트도 정상 이력이며 phase·sequence·payload를 보존합니다. `stampede_workers_observed` 같은 nullable DB 이벤트를 빈 문자열로 덮어쓰거나 DB를 수정하지 않습니다. `since_sequence` replay와 프로젝트 격리는 동일합니다([schema](../drover/models/schemas.py), [producer](../drover/services/operations.py), [regression](../tests/test_operations_api.py)).
 
 ---
 
