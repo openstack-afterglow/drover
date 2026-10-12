@@ -191,7 +191,7 @@ FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 �
 - `drover-sdk`: `sdk/`의 독립 Python package이며 API/Worker process에 import되어야 하는 내부 module이 아니다.
 - `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
 - 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
-- Kolla registry default `drover_image_tag`은 source `v0.4.11`이다 (`deploy/kolla/ansible/roles/drover/defaults/main.yml`); 0.4.11 immutable source-build pin·발행·배포는 별도 alignment/검증 대상이다. [0.4.10 native receipt](docs/release-0.4.0.md#tagged-0410-deployment-and-configured-endpoint-proof)는 operator wheel/role/lock·controller3대 순차 배포·six-container app/revision/source parity·direct/VIP/public readiness 및 all non-Drover container ID/image 보존을 확인했다. Registry API/Worker indexes는 linux/amd64와 attestations만 포함하며 별도 local builds는 amd64/arm64에서 실행했다. 실제 CSI/LB/TLS/auth/KMS·CPU/GPU behavior는 source 기본값이나 Ready로 대체하지 않는다.
+- Kolla registry default `drover_image_tag`은 source `v0.4.11`, immutable source-build pin은 corrected code `b957f2af2d0048643943a7f7c6605096372fd573`이다 (`deploy/kolla/ansible/roles/drover/defaults/main.yml`); 0.4.11 발행·배포는 별도 검증 대상이다. [0.4.10 native receipt](docs/release-0.4.0.md#tagged-0410-deployment-and-configured-endpoint-proof)는 operator wheel/role/lock·controller3대 순차 배포·six-container app/revision/source parity·direct/VIP/public readiness 및 all non-Drover container ID/image 보존을 확인했다. Registry API/Worker indexes는 linux/amd64와 attestations만 포함하며 별도 local builds는 amd64/arm64에서 실행했다. 실제 CSI/LB/TLS/auth/KMS·CPU/GPU behavior는 source 기본값이나 Ready로 대체하지 않는다.
 - `drover_run_preconditions`의 기본값은 `true`다. `tasks/deploy.yml`은 이 flag로 DB·Keystone resource 생성만 조건부 실행하며 `bootstrap_service.yml` migration과 `start.yml`은 계속 실행한다. 기존 DB·catalog를 확인한 2026-10-06 DMSLab 재배포는 ProxySQL의 기존 `kolla_root` 생성 권한 거부 때문에 operator override를 `false`로 두었다. 신규 설치는 기본값을 유지해야 한다. API에만 Docker healthcheck가 있으므로 Worker 실행 여부와 durable job 성공은 별도로 검증한다. 실제 v0.4.3 digest·세 controller·외부 endpoint 검증은 아래 릴리스 기록을 따른다.
 
 릴리스 변경과 검증 경계는 [`docs/release-0.4.0.md`](docs/release-0.4.0.md)(0.4.1–0.4.11 patch sections)에 정리한다. 이전 tag/artifact와 역사적 실행 기록은 보존한다. source root wheel/런타임/lock은 `0.4.11`, independent SDK는 `0.2.21`; 새 schema나 migration은 없다. 기존 004가 필요한 cutover는 [0.4.4 순서](docs/release-0.4.0.md#044-patch)를 따른다. Tag workflow는 version/wheel 이름을 확인하며 image workflow는 reusable tests 이후에만 발행한다. Wheel workflow가 전체 tag suite를 기다리지 않는 기존 공백과 Trivy의 nonblocking 정책은 그대로다. Registry workflow는 hosted default linux/amd64만 발행한다. Stable version tag는 metadata-action `latest=auto`로 latest도 이동하므로 정확한 SHA/digest를 확인하며 source 기본값을 발행/배포 증거로 쓰지 않는다.
@@ -277,9 +277,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e3cdd3dc45036e8ce253bc08af6f7579676e55d572fa3883c57931dc2438cb8c",
-  "reviewed_at": "2026-10-12T17:58:46Z",
-  "summary": "0.4.11 nodegroup.py deletion-only ERROR lifecycle admission; create/update remain ACTIVE-only; regression preserves requester/project/default/active-job/in-flight guards and tracking/error; version/lock/Kolla tag/docs; topology/schema/authority/drain unchanged"
+  "source_sha256": "bf1bccbd103d92e42b0534b6308c05d1d25d86e31152666703adc5299d91dfc6",
+  "reviewed_at": "2026-10-12T18:08:30Z",
+  "summary": "0.4.11 source-build pin b957f2a aligns deletion-only ERROR recovery; real isolated MariaDB API/Worker smoke on amd64/arm64 keeps error/tracking and enforces requester/project/default/active/in-flight guards; topology/schema/authority/drain unchanged"
 }
 ```
 <!-- architecture-review:end -->
