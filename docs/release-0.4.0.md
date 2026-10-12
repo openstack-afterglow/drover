@@ -385,4 +385,7 @@ The consumer replay regression failed before correction with HTTP500 and passed 
 
 Final local0.4.12 qualification: `uv run --frozen --all-extras pytest -q tests` **1345 passed / 3 skipped**, repository Ruff passed, wheel built. Canonical Dockerfile API/Worker targets built for amd64/arm64. All four actual images executed the real SQLAlchemy/MariaDB11.4 event ledger plus native ASGI event HTTP handler with a synthetic read-only local caller: HTTP200, required `message:null`, exact phase/payload/sequence and cursor replay2/3, version0.4.12, x86_64/aarch64, RC0/zero stderr. The first fixture omitted the required cluster FK and failed IntegrityError before event proof; it was corrected rather than relaxing constraints. This is local runtime evidence, not native caller authorization/deployed event replay. No production DB row was edited.
 
+Corrected nullable-event source and independent source-build pin are `9de1218280d6dcc7b029ffe23074d82f6a644dae`; schema source SHA256 is `b4d96bb9412e67a9ec33d98d99bca13c369309186bffb23053caf887c8913bc6`. The actual GPU Pod UID `6a324295-0d1c-4bc6-bdec-7f77e22b838f` and baseline UID remained Running while preparing the response-only release; the VM/workload were not recreated.
+
+
 

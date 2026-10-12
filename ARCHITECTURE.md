@@ -192,7 +192,7 @@ FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 �
 - `drover-sdk`: `sdk/`의 독립 Python package이며 API/Worker process에 import되어야 하는 내부 module이 아니다.
 - `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
 - 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
-- Source registry default tag은 `v0.4.12`이고 independent source-build pin은 corrected commit과 별도로 align한다 (`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 최신 완료 [0.4.11 native receipt](docs/release-0.4.0.md#tagged-0411-publication-and-native-recovery-verification)는 wheel/20role files/lock·controller3대 순차 배포·six-container app/revision/source parity·direct/VIP/public readiness와 non-Drover container 보존을 확인했다. 다른 작업의 Afterglow globals는 보존한다. Published amd64+attestation과 local amd64/arm64 실행을 구분하고 CSI/LB/TLS/auth/KMS/CPU/GPU를 Ready로 대체하지 않는다.
+- Source registry default tag은 `v0.4.12`, independent source-build pin은 corrected commit `9de1218280d6dcc7b029ffe23074d82f6a644dae`다 (`deploy/kolla/ansible/roles/drover/defaults/main.yml`). 최신 완료 [0.4.11 native receipt](docs/release-0.4.0.md#tagged-0411-publication-and-native-recovery-verification)는 wheel/20role files/lock·controller3대 순차 배포·six-container app/revision/source parity·direct/VIP/public readiness와 non-Drover container 보존을 확인했다. 다른 작업의 Afterglow globals는 보존한다. Published amd64+attestation과 local amd64/arm64 실행을 구분하고 CSI/LB/TLS/auth/KMS/CPU/GPU를 Ready로 대체하지 않는다.
 - `drover_run_preconditions`의 기본값은 `true`다. `tasks/deploy.yml`은 이 flag로 DB·Keystone resource 생성만 조건부 실행하며 `bootstrap_service.yml` migration과 `start.yml`은 계속 실행한다. 기존 DB·catalog를 확인한 2026-10-06 DMSLab 재배포는 ProxySQL의 기존 `kolla_root` 생성 권한 거부 때문에 operator override를 `false`로 두었다. 신규 설치는 기본값을 유지해야 한다. API에만 Docker healthcheck가 있으므로 Worker 실행 여부와 durable job 성공은 별도로 검증한다. 실제 v0.4.3 digest·세 controller·외부 endpoint 검증은 아래 릴리스 기록을 따른다.
 
 릴리스/검증은 [`docs/release-0.4.0.md`](docs/release-0.4.0.md)의0.4.1–0.4.12 sections에 기록한다. source root wheel/런타임/lock은0.4.12, SDK는0.2.21이며 새 persistence schema/migration은 없다. nullable event response만 실제 DB 계약과 일치시킨다. 기존004 cutover는 [0.4.4 순서](docs/release-0.4.0.md#044-patch)를 따른다. Image publication은 reusable suite를 기다리며 독립 wheel gate/Trivy nonblocking 공백은 유지한다. Registry workflow는 hosted linux/amd64를 발행하므로 local multiarch와 구분한다. Stable tag의 latest 이동은 실제 SHA/digest로 확인하며 source default를 배포 증거로 쓰지 않는다.
@@ -278,9 +278,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "c9188b3e23ffc92bf5ed2c409e5caa4510f6ef2252452ad4cd5670b240c20200",
-  "reviewed_at": "2026-10-12T21:13:04Z",
-  "summary": "0.4.12 DroverOperationEventInfo.message preserves actual nullable ORM/producer contract; null payload-only event GET/replay regression fails500 before and passes after, four actual API/Worker amd64/arm64 SQL/ASGI smoke; source-linked acceptance receipts; no topology/persistence-schema/authority/worker behavior changes"
+  "source_sha256": "05d6fd13625aa0d2043fdd697adbbfc154dd78c6e1136116ca4a821a6202a998",
+  "reviewed_at": "2026-10-12T21:14:04Z",
+  "summary": "0.4.12 source-build pin 9de1218 aligns nullable event schema; required key preserves null and payload-only sequence replay; actual four-image SQL/ASGI smoke and full1345/3skip; topology/persistence-schema/authority unchanged; exact same native GPU retained pending deployed replay verification"
 }
 ```
 <!-- architecture-review:end -->
