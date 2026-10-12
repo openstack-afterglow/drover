@@ -36,7 +36,7 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - Active GPU quota 소유권의 Afterglow 단독 이관에 따른 Drover legacy `gpu_quotas` 테이블의 소스 은퇴(Source Table Retirement) 절차
    - 마이그레이션 데이터 감사(Audit), Afterglow 권한 롤아웃 검증 및 물리적 `DROP TABLE` 전제 조건 체크리스트
 
-5. **[Drover 0.4.0–0.4.10 릴리스 노트](release-0.4.0.md)**
+5. **[Drover 0.4.0–0.4.11 릴리스 노트](release-0.4.0.md)**
    - Pod 요청/Node allocatable 계산, GPU 준비성, 원자적 예약/fencing, 300–600초 안정화 및 drain 축소
    - Afterglow 상태/이벤트 API, 부분 삭제 재시도와 실제 배포 검증 범위
    - 0.4.1 patch: project에 공유된 private(GPU) flavor를 nodegroup flavor로 허용
@@ -49,6 +49,7 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - [0.4.8 source patch와 native 검증 경계](release-0.4.0.md#048-patch--native-all-plugin-and-zero-size-demand-corrections): 전 플러그인 설정·TLS/TokenReview·CSI socket/RBAC 및 zero-size 수요 수정; native Manila export 불일치와 실제 guest/CPU·GPU acceptance를 분리
    - [0.4.9 Sentinel writer routing](release-0.4.0.md#049-patch--sentinel-writer-routing): Kolla discovery 설정, Redis DB 7 보존, 단일 backend와 native callback/event smoke; 실제 guest/CPU·GPU acceptance와 구분
    - [0.4.10 Barbican catalog scope](release-0.4.0.md#0410-patch--configured-barbican-catalog-scope): configured interface·region·versioned endpoint 보존, public order ref의 동일 endpoint polling과 native KEK 발급·재사용 source smoke
+   - [0.4.11 ERROR nodegroup cleanup](release-0.4.0.md#0411-patch--error-nodegroup-cleanup-admission): 삭제 전용 lifecycle 복구 admission, requester/project·job/default/in-flight·drain 경계 보존; 실제 all-plugin acceptance와 CPU/GPU 후속 검증 구분
 
 6. **[Drover 0.3.0 및 0.3.1 준비 기록](release-0.3.0.md)**
    - 구조화 요청/job 로그, opt-in `LOG_LEVEL=DEBUG`, Redis 5 종료 API 수정과 당시 검증 기록

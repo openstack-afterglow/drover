@@ -408,6 +408,103 @@ def _service_group():
 
 
 @pytest.mark.asyncio
+async def test_error_cluster_delete_reserves_cleanup_without_clearing_error(monkeypatch):
+    from types import SimpleNamespace
+
+    from drover.services import nodegroup
+
+    cluster = SimpleNamespace(status="ERROR", project_id="project-1", status_reason="Reconciliation failed: worker ERROR")
+    group = _service_group()
+    _service_session(monkeypatch, [cluster, None, group, "cleanup-operation"])
+    monkeypatch.setattr("drover.services.jobs.enqueue_job", AsyncMock(return_value="cleanup-job"))
+
+    assert await nodegroup.enqueue_nodegroup_delete(
+        _CLUSTER_ID, group.id, project_id="project-1", delegation=SimpleNamespace(id="requester-delegation"),
+    )
+    assert cluster.status == "ERROR"
+    assert cluster.status_reason == "Reconciliation failed: worker ERROR"
+    assert group.stampede_state["in_flight_count"] == 1
+    assert group.stampede_state["last_operation_id"] == "cleanup-operation"
+    assert group.node_count == 2
+    assert [vm.vm_id for vm in group.vms] == ["vm-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["active_job", "default_group", "in_flight"])
+async def test_error_cluster_delete_preserves_mutation_guards(monkeypatch, guard):
+    from types import SimpleNamespace
+
+    from drover.services import nodegroup
+
+    cluster = SimpleNamespace(status="ERROR", project_id="project-1")
+    group = _service_group()
+    if guard == "default_group":
+        group.is_default = True
+    if guard == "in_flight":
+        group.stampede_state = {"in_flight_count": 1}
+    _service_session(monkeypatch, [cluster, "active-job" if guard == "active_job" else None, group])
+    failure = ValueError if guard == "default_group" else nodegroup.NodegroupConflict
+    with pytest.raises(failure):
+        await nodegroup.enqueue_nodegroup_delete(
+            _CLUSTER_ID, group.id, project_id="project-1", delegation=SimpleNamespace(id="requester-delegation"),
+        )
+    assert group.node_count == 2
+    assert [vm.vm_id for vm in group.vms] == ["vm-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["ERROR", "CREATING", "PROVISIONING", "SCALING", "DELETING", "DELETED"])
+@pytest.mark.parametrize("mutation", ["create", "update"])
+async def test_recovery_does_not_allow_nonactive_creation_or_update(monkeypatch, status, mutation):
+    from types import SimpleNamespace
+
+    from drover.services import nodegroup
+
+    _service_session(monkeypatch, [SimpleNamespace(status=status)])
+    with pytest.raises(nodegroup.NodegroupConflict):
+        if mutation == "create":
+            await nodegroup.create_nodegroup(_CLUSTER_ID, {"name": "workers", "role": "agent", "node_count": 0})
+        else:
+            await nodegroup.update_nodegroup(_CLUSTER_ID, "group-1", {"node_count": 0})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["CREATING", "PROVISIONING", "SCALING", "DELETING", "DELETED"])
+async def test_recovery_delete_rejects_other_nonactive_lifecycles(monkeypatch, status):
+    from types import SimpleNamespace
+
+    from drover.services import nodegroup
+
+    _service_session(monkeypatch, [SimpleNamespace(status=status)])
+    with pytest.raises(nodegroup.NodegroupConflict):
+        await nodegroup.enqueue_nodegroup_delete(_CLUSTER_ID, "group-1", project_id="project-1")
+
+
+@pytest.mark.asyncio
+async def test_error_cluster_delete_requires_admitted_requester(monkeypatch):
+    from types import SimpleNamespace
+
+    from drover.services import nodegroup
+
+    group = _service_group()
+    _service_session(monkeypatch, [SimpleNamespace(status="ERROR", project_id="project-1"), None, group])
+    with pytest.raises(PermissionError):
+        await nodegroup.enqueue_nodegroup_delete(_CLUSTER_ID, group.id, project_id="project-1")
+    assert group.stampede_state == {}
+    assert [vm.vm_id for vm in group.vms] == ["vm-1"]
+
+
+@pytest.mark.asyncio
+async def test_error_cluster_delete_does_not_cross_project(monkeypatch):
+    from types import SimpleNamespace
+
+    from drover.services import nodegroup
+
+    _service_session(monkeypatch, [SimpleNamespace(status="ERROR", project_id="project-2"), None])
+    assert not await nodegroup.enqueue_nodegroup_delete(_CLUSTER_ID, "group-1", project_id="project-1")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("updates", [{"min_size": 3}, {"max_size": 1}, {"node_count": 6}])
 async def test_service_rejects_invalid_merged_sizes(monkeypatch, updates):
     from types import SimpleNamespace

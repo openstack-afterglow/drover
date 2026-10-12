@@ -19,7 +19,7 @@ class NodegroupConflict(ValueError):
 
 
 
-async def _lock_manual_cluster(session, cluster_id: str) -> K3sCluster | None:
+async def _lock_manual_cluster(session, cluster_id: str, *, allow_error: bool = False) -> K3sCluster | None:
     cluster = (await session.execute(
         select(K3sCluster).where(
             K3sCluster.id == cluster_id, K3sCluster.deleted_at.is_(None)
@@ -27,7 +27,7 @@ async def _lock_manual_cluster(session, cluster_id: str) -> K3sCluster | None:
     )).scalar_one_or_none()
     if cluster is None:
         return None
-    if cluster.status != "ACTIVE":
+    if cluster.status != "ACTIVE" and not (allow_error and cluster.status == "ERROR"):
         raise NodegroupConflict("ACTIVE 상태의 클러스터만 노드그룹을 변경할 수 있습니다.")
     active = (await session.execute(
         select(DroverJob.id).where(
@@ -387,7 +387,7 @@ async def enqueue_nodegroup_delete(
     if not is_db_available():
         raise RuntimeError("MariaDB unavailable")
     async with get_session_factory()() as session, session.begin():
-        cluster = await _lock_manual_cluster(session, cluster_id)
+        cluster = await _lock_manual_cluster(session, cluster_id, allow_error=True)
         if cluster is None or cluster.project_id != project_id:
             return False
         ng = (await session.execute(select(K3sNodegroup).where(

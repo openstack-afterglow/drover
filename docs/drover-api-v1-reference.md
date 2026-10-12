@@ -314,6 +314,8 @@ LOG_LEVEL=DEBUG drover-worker
 * **`PATCH /v1/clusters/{cluster_id}/nodegroups/{nodegroup_id}`**: 노드그룹 설정/노드 수 수정 (`UpdateK3sNodegroupRequest`)
 * **`DELETE /v1/clusters/{cluster_id}/nodegroups/{nodegroup_id}`**: 노드그룹 삭제 (`204 No Content`)
 
+생성·수정은 `ACTIVE` cluster에서만 허용합니다. 삭제는 실패 자원 복구를 위해 `ACTIVE` 또는 `ERROR`에서 기존 `drover:clusters:delete` 권한과 admitted requester delegation으로 durable worker에 큐잉합니다. `204`는 삭제 완료가 아닙니다. default group은 `422`, 다른 lifecycle·active mutation job·Stampede in-flight 충돌은 `409`이며 project ownership, row lock과 정상 VM/boot-volume/Node 확인·drain을 유지합니다. API는 오류 상태나 tracking을 먼저 지우지 않습니다([source](../drover/services/nodegroup.py), [recovery regressions](../tests/test_k3s_nodegroups.py)).
+
 ### 4.2 클러스터 템플릿 API (`/v1/cluster-templates`)
 * **`GET /v1/cluster-templates`**: 공개 및 본인 소유 클러스터 템플릿 목록 조회 (`list[K3sClusterTemplateInfo]`)
 * **`GET /v1/cluster-templates/{template_id}`**: 템플릿 상세 조회 (`K3sClusterTemplateInfo`)
