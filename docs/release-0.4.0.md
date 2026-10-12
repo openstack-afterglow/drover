@@ -268,3 +268,27 @@ Native disposable source smoke executed the corrected backend and readiness/acti
 
 Local full service suite: **1320 passed / 3 skipped**. Repository Ruff passed after restoring the repository's first-party import grouping; the language-server import organizer had classified `drover` as third-party. A throwaway production-role renderer parsed the resulting TOML into Settings, verified three Sentinel endpoints, native monitor name, DB 7 and explicit standalone opt-out. These local checks do not claim native rollout or forced failover.
 
+### Tagged 0.4.9 deployment and writer proof
+
+Published source revision `075d1c21fdb1cf0b50a8d4463bd1ad26258f364d` was tested by the successful dev and tag image workflows (`38162137867`, `38163427170`); release workflow `38163427036` published the0.4.9 wheel. Published API and Worker indexes contain linux/amd64 plus attestations, not linux/arm64. Separate local API/Worker images for both architectures executed successfully; both published immutable images also executed on linux/amd64 with version, revision, Sentinel DB7 and active-plugin configuration checks.
+
+- API: `ghcr.io/openstack-afterglow/drover-api@sha256:bb5b7ec5d0ab8f2a393a35602496d21bb3c0409108ac803d9ba2e27478b88c2c`.
+- Worker: `ghcr.io/openstack-afterglow/drover-worker@sha256:e6a822ca3bde4d6dcd710cdbb90b97a52cfaea9f1f9c93e9f5b3f31d244ba9c8`.
+
+Native Kolla prechecks/genconfig/pull succeeded, then each controller was reconfigured sequentially with an intervening readiness canary. All three APIs returned ready200 with DB/Redis/migration/Keystone checks; all six API/Worker containers ran the qualified0.4.9 refs. Their actual runtime settings and Redis clients independently resolved a master in DB7 and passed cache SETEX/read/TTL, callback and HA-token atomic consume/replay rejection, and lock exclusion/release. Owned keys were removed; shared Valkey roles/failover were not changed. Receipt is retained at `/etc/kolla/.drover-rollout-backups/0.4.9/rollout-receipt.json`.
+
+This closes the deployed Redis-writer prerequisite, not guest HTTP callback, full-plugin Kubernetes mounts, CPU scale-out/in or GPU Pod acceptance. Native Manila managers were separately refreshed sequentially; a new NFS share's corrected export was created/read/deleted while12 pre-existing Ceph exports remained. Kubernetes data continuity and all cluster/Pod acceptance remain separate live gates.
+
+## 0.4.10 patch — configured Barbican catalog scope
+
+The new all-plugin fixture `9f2f731b-2442-45db-a5a9-e39c958a27f3` failed before VM creation while looking up the project KEK. Its SDK request silently selected the public Barbican endpoint despite the connection's configured internal interface. Exact SDK KEK searches observed public `ConnectTimeout` and internal `200`; no proxy environment was configured. Public TCP and a separate verified HTTP client succeeded, so this does not claim a Barbican service outage or an identified external TLS cause.
+
+- Reuse the SDK `key_manager` proxy's versioned endpoint for KEK lookup/order, secret payload, ACL, consumer and quota raw REST. Preserve configured interface, region and catalog prefix; append the API version only once.
+- Poll returned `order_ref` by ID through that same endpoint rather than following a public absolute reference.
+- Root package/runtime/lock and registry default tag are `0.4.10` / `v0.4.10`; SDK and schema/migrations are unchanged. No service restart, quota, membership, authorization ceiling, TLS bypass or timeout increase fixes this path.
+
+Executed-source native smoke issued an AES-256 project KEK through the configured internal endpoint, observed `ACTIVE`, and reused the same ID on the next lookup. The real SDK/loopback HTTP regression passed: configured internal/selected region wins over a failing public/other-region endpoint, public order refs stay within the configured endpoint, and secret payload reads return the expected synthetic marker. This is not tagged deployment, guest KMS Secret storage or end-to-end cluster/CPU/GPU acceptance evidence.
+
+Final local 0.4.10 qualification: `uv run --frozen --all-extras python -m pytest -q tests` **1321 passed / 3 skipped**, repository Ruff and source-linked architecture guard passed. Canonical Buildx API/Worker targets built for linux/amd64 and linux/arm64. All four `docker run --rm -i --platform ... --network none ... python -` combinations executed the real SDK/loopback endpoint, order-origin and expected-payload smoke with version0.4.10 and x86_64/aarch64; API/Worker imports succeeded. The first smoke omitted `-i` and received no Python input, so its exit0 is not execution evidence. `uv build --wheel` produced `dist/drover-0.4.10-py3-none-any.whl`. Immutable publication and canonical native deployment remain pending; local multiarchitecture execution does not widen the amd64-only registry workflow contract.
+
+

@@ -34,10 +34,10 @@ async def ensure_project_kek(conn) -> str:
 
 def _ensure_project_kek_sync(conn) -> str:
     project_id = conn.current_project_id
-    ep = conn.session.get_endpoint(service_type="key-manager")
+    ep = _bep(conn)
 
     # 1. 기존 KEK 검색
-    r = conn.session.get(f"{ep}/v1/secrets", params={"name": KEK_NAME})
+    r = conn.session.get(f"{ep}/secrets", params={"name": KEK_NAME})
     # A denied or failed lookup must not mint a second project KEK.
     r.raise_for_status()
     for s in r.json().get("secrets", []) or []:
@@ -49,7 +49,7 @@ def _ensure_project_kek_sync(conn) -> str:
     # 2. 신규 order 발급
     _logger.info("신규 KEK order 발급: project=%s", project_id)
     order_resp = conn.session.post(
-        f"{ep}/v1/orders",
+        f"{ep}/orders",
         json={
             "type": "key",
             "meta": {
@@ -65,12 +65,13 @@ def _ensure_project_kek_sync(conn) -> str:
     order_ref = order_resp.json().get("order_ref")
     if not order_ref:
         raise RuntimeError(f"Barbican order 응답에 order_ref 없음: {order_resp.text[:200]}")
+    order_id = order_ref.rsplit("/", 1)[-1]
 
     # 3. order PENDING → ACTIVE 폴링 (최대 30초)
     import time
 
     for _ in range(30):
-        o = conn.session.get(order_ref)
+        o = conn.session.get(f"{ep}/orders/{order_id}")
         o_body = o.json()
         status = o_body.get("status")
         if status == "ACTIVE":
@@ -95,8 +96,8 @@ def _is_system_managed(name: str | None) -> bool:
 
 
 def _bep(conn) -> str:
-    """Barbican endpoint."""
-    return conn.session.get_endpoint(service_type="key-manager")
+    """Versioned Barbican endpoint using the connection's interface and region."""
+    return conn.key_manager.get_endpoint().rstrip("/")
 
 
 def _secret_uuid(s) -> str:
@@ -153,7 +154,7 @@ def get_secret_payload(conn, secret_id: str) -> bytes:
     """payload 복호화 — raw REST (캐시/로그 금지)."""
     ep = _bep(conn)
     resp = conn.session.get(
-        f"{ep}/v1/secrets/{secret_id}/payload",
+        f"{ep}/secrets/{secret_id}/payload",
         headers={"Accept": "application/octet-stream"},
     )
     resp.raise_for_status()
@@ -266,7 +267,7 @@ def delete_order(conn, order_id: str) -> None:
 
 def get_acl(conn, resource_type: str, resource_id: str) -> dict:
     ep = _bep(conn)
-    r = conn.session.get(f"{ep}/v1/{resource_type}/{resource_id}/acl")
+    r = conn.session.get(f"{ep}/{resource_type}/{resource_id}/acl")
     r.raise_for_status()
     return r.json()
 
@@ -274,7 +275,7 @@ def get_acl(conn, resource_type: str, resource_id: str) -> dict:
 def set_acl(conn, resource_type: str, resource_id: str, users: list[str], project_access: bool) -> dict:
     ep = _bep(conn)
     r = conn.session.put(
-        f"{ep}/v1/{resource_type}/{resource_id}/acl",
+        f"{ep}/{resource_type}/{resource_id}/acl",
         json={"read": {"users": users, "project-access": project_access}},
     )
     r.raise_for_status()
@@ -283,7 +284,7 @@ def set_acl(conn, resource_type: str, resource_id: str, users: list[str], projec
 
 def delete_acl(conn, resource_type: str, resource_id: str) -> None:
     ep = _bep(conn)
-    r = conn.session.delete(f"{ep}/v1/{resource_type}/{resource_id}/acl")
+    r = conn.session.delete(f"{ep}/{resource_type}/{resource_id}/acl")
     r.raise_for_status()
 
 
@@ -292,14 +293,14 @@ def delete_acl(conn, resource_type: str, resource_id: str) -> None:
 
 def list_secret_consumers(conn, secret_id: str) -> list[dict]:
     ep = _bep(conn)
-    r = conn.session.get(f"{ep}/v1/secrets/{secret_id}/consumers")
+    r = conn.session.get(f"{ep}/secrets/{secret_id}/consumers")
     r.raise_for_status()
     return r.json().get("consumers", [])
 
 
 def list_container_consumers(conn, container_id: str) -> list[dict]:
     ep = _bep(conn)
-    r = conn.session.get(f"{ep}/v1/containers/{container_id}/consumers")
+    r = conn.session.get(f"{ep}/containers/{container_id}/consumers")
     r.raise_for_status()
     return r.json().get("consumers", [])
 
@@ -309,21 +310,21 @@ def list_container_consumers(conn, container_id: str) -> list[dict]:
 
 def get_effective_quota(conn) -> dict:
     ep = _bep(conn)
-    r = conn.session.get(f"{ep}/v1/quotas")
+    r = conn.session.get(f"{ep}/quotas")
     r.raise_for_status()
     return r.json().get("quotas", {})
 
 
 def list_project_quotas(conn) -> list[dict]:
     ep = _bep(conn)
-    r = conn.session.get(f"{ep}/v1/project-quotas")
+    r = conn.session.get(f"{ep}/project-quotas")
     r.raise_for_status()
     return r.json().get("project_quotas", [])
 
 
 def get_project_quota(conn, project_id: str) -> dict:
     ep = _bep(conn)
-    r = conn.session.get(f"{ep}/v1/project-quotas/{project_id}")
+    r = conn.session.get(f"{ep}/project-quotas/{project_id}")
     r.raise_for_status()
     return r.json()
 
@@ -331,7 +332,7 @@ def get_project_quota(conn, project_id: str) -> dict:
 def set_project_quota(conn, project_id: str, quotas: dict) -> dict:
     ep = _bep(conn)
     r = conn.session.put(
-        f"{ep}/v1/project-quotas/{project_id}",
+        f"{ep}/project-quotas/{project_id}",
         json={"project_quotas": quotas},
     )
     r.raise_for_status()
@@ -340,5 +341,5 @@ def set_project_quota(conn, project_id: str, quotas: dict) -> dict:
 
 def delete_project_quota(conn, project_id: str) -> None:
     ep = _bep(conn)
-    r = conn.session.delete(f"{ep}/v1/project-quotas/{project_id}")
+    r = conn.session.delete(f"{ep}/project-quotas/{project_id}")
     r.raise_for_status()
