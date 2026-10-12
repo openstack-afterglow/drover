@@ -276,9 +276,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "4cd5e60efb388660178832a4a986c9f68f7ff8efcadaef96a1b4c1407b99f693",
-  "reviewed_at": "2026-10-12T15:52:28Z",
-  "summary": "0.4.10: Barbican raw REST and KEK order polling reuse configured SDK interface/region/versioned endpoint; real SDK loopback and native AES-256 issuance/reuse proof; root version and source-linked detailed docs; no schema or authorization-ceiling change"
+  "source_sha256": "88282799eef30a53fb0cc7d56f2c97c2cd62f63919e64851faa863cf284318c3",
+  "reviewed_at": "2026-10-12T16:33:29Z",
+  "summary": "0.4.10 source-build pin a60c2b8 aligns configured Barbican proxy endpoint and all raw REST consumers; native SDK scope/order/payload runtime proof on local amd64/arm64 API and Worker; no schema/authority changes"
 }
 ```
 <!-- architecture-review:end -->
