@@ -243,6 +243,10 @@ spec:
     spec:
       serviceAccountName: cinder-csi-node-sa
       hostNetwork: true
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: cinder-csi-plugin
           image: {{ cinder_csi_image }}

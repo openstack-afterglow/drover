@@ -269,6 +269,25 @@ def manila_documents():
     return {(d["kind"], d["metadata"]["name"]): d for d in yaml.safe_load_all(manifests) if d}
 
 
+@pytest.mark.parametrize("node_plugin", ["cinder-csi-nodeplugin", "manila-csi-nodeplugin", "nfs-csi-node"])
+@pytest.mark.parametrize("key,effect,expected", [
+    ("nvidia.com/gpu", "NoSchedule", True),
+    ("unrelated.example/dedicated", "NoSchedule", False),
+    ("nvidia.com/gpu", "NoExecute", False),
+])
+def test_csi_nodes_tolerate_only_gpu_noschedule(manila_documents, node_plugin, key, effect, expected):
+    from drover.services.plugins.cinder_csi import CinderCsiPlugin
+    from drover.services.stampede import _node_matches_nodegroup
+
+    documents = dict(manila_documents)
+    cinder = CinderCsiPlugin().generate_manifests("test-cluster", "proj-1", _base_settings())
+    documents.update({(d["kind"], d["metadata"]["name"]): d for d in yaml.safe_load_all(cinder) if d})
+    spec = documents["DaemonSet", node_plugin]["spec"]["template"]["spec"]
+    pod = {"node_selector": spec.get("nodeSelector", {}), "tolerations": spec.get("tolerations", [])}
+    candidate = {"labels": {}, "taints": [{"key": key, "value": "true", "effect": effect}]}
+    assert _node_matches_nodegroup(pod, candidate) is expected
+
+
 @pytest.mark.parametrize("share_type", ["default", "cephfsnfstype", "operator \"NFS\" type"])
 def test_manila_storage_class_credentials_and_share_type(share_type):
     from drover.services.plugins.manila_csi import ManilaCsiPlugin

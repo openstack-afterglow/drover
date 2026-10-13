@@ -40,13 +40,10 @@ def list_flavors(conn: openstack.connection.Connection) -> list[FlavorInfo]:
     # is_public=None → 공개 + 접근 권한이 부여된 비공개 플레이버 모두 반환
     for f in conn.compute.flavors(is_public=None):
         extra = dict(f.extra_specs) if f.extra_specs else {}
-        # List API는 extra_specs를 포함하지 않을 수 있으므로 개별 조회 fallback
+        # Resolve omitted metadata explicitly; lookup failures must not turn GPUs into CPU flavors.
         if not extra:
-            try:
-                detail = conn.compute.get_flavor(f.id)
-                extra = dict(detail.extra_specs) if detail.extra_specs else {}
-            except Exception:
-                pass
+            detail = conn.compute.fetch_flavor_extra_specs(f.id)
+            extra = dict(detail.extra_specs or {})
         flavors.append(
             FlavorInfo(
                 id=f.id,

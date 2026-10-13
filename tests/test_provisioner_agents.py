@@ -13,6 +13,7 @@ from openstack import exceptions as os_exceptions
 
 from drover.config import Settings
 from drover.services import autoscale, cloudinit, provisioner
+from drover.services.nova import list_flavors as nova_list_flavors
 
 pytestmark = pytest.mark.asyncio
 
@@ -93,6 +94,10 @@ async def test_provision_agents_persists_created_vm_ids(os_type, extra_specs) ->
     volume = SimpleNamespace(id="volume-1")
     server = SimpleNamespace(id="server-1")
     connection = MagicMock()
+    connection.compute.flavors.return_value = [
+        SimpleNamespace(id="flavor-1", name="selected", vcpus=8, ram=16384, disk=0, extra_specs={}),
+    ]
+    connection.compute.fetch_flavor_extra_specs.return_value = SimpleNamespace(extra_specs=extra_specs)
 
     with (
         patch("drover.services.provisioner.k3s_cluster.get_cluster", new=AsyncMock(return_value=cluster)),
@@ -103,9 +108,6 @@ async def test_provision_agents_persists_created_vm_ids(os_type, extra_specs) ->
         ),
         patch("drover.services.plugins.aggregate_agent_args", return_value=["--node-label=team=research"]),
         patch("drover.services.cinder.create_volume_from_image", return_value=volume),
-        patch("drover.services.nova.list_flavors", return_value=[
-            SimpleNamespace(id="flavor-1", extra_specs=extra_specs),
-        ]) as list_flavors,
         patch("drover.services.gpu.ensure_device_plugin", new=AsyncMock()) as plugin,
         patch("drover.services.afterglow.require_gpu_admission", new=AsyncMock()),
         patch("drover.services.nova.create_server", return_value=server) as create_server,
@@ -121,7 +123,6 @@ async def test_provision_agents_persists_created_vm_ids(os_type, extra_specs) ->
     add_agent_vms.assert_awaited_once_with("cluster-1", expected_entries)
     add_nodegroup_vms.assert_awaited_once_with("nodegroup-1", "cluster-1", expected_entries)
     assert update_status.await_args.kwargs["agent_vm_ids"] == ["server-1"]
-    list_flavors.assert_called_once_with(connection)
     script, args, labels = _worker_bootstrap(create_server, os_type)
     assert labels["afterglow.io/nodegroup"] == ["nodegroup-1"]
     assert labels["team"] == ["research"]
@@ -165,6 +166,34 @@ async def test_provision_agents_reuses_persisted_ssh_key() -> None:
     assert "key_name" not in create_server.call_args.kwargs
 
 
+@pytest.mark.parametrize("status", [403, 404, 503])
+async def test_initial_agent_metadata_error_prevents_cloud_mutation(status):
+    cluster = _cluster()
+    connection = MagicMock()
+    flavor = SimpleNamespace(id="flavor-1", name="gpu", vcpus=8, ram=16384, disk=0, extra_specs={})
+    connection.compute.flavors.return_value = [flavor]
+    error = os_exceptions.HttpException("flavor metadata unavailable", http_status=status)
+    connection.compute.get_flavor.side_effect = error
+    connection.compute.fetch_flavor_extra_specs.side_effect = error
+    with (
+        patch("drover.services.provisioner.k3s_cluster.get_cluster", new=AsyncMock(return_value=cluster)),
+        patch("drover.config.get_settings", return_value=SimpleNamespace(drover_boot_volume_size_gb=30)),
+        patch("drover.services.execution.open_connection", new=AsyncMock(return_value=connection)),
+        patch("drover.services.cinder.create_volume_from_image") as create_volume,
+        patch("drover.services.nova.create_server") as create_server,
+        patch("drover.services.gpu.ensure_device_plugin", new=AsyncMock()) as plugin,
+        patch("drover.services.provisioner.k3s_cluster.update_cluster_status", new=AsyncMock()) as update_status,
+        patch("drover.services.keystone.close_connection", new=AsyncMock()) as close,
+    ):
+        with pytest.raises(os_exceptions.HttpException):
+            await provisioner.provision_agents("project-1", "cluster-1", "192.0.2.10", "node-token")
+    create_volume.assert_not_called()
+    create_server.assert_not_called()
+    plugin.assert_not_awaited()
+    update_status.assert_not_awaited()
+    close.assert_awaited_once_with(connection)
+
+
 async def test_named_key_without_snapshot_fails_before_execution_connection() -> None:
     payload = {"key_name": "caller-key"}
     execution_connection = AsyncMock()
@@ -174,6 +203,35 @@ async def test_named_key_without_snapshot_fails_before_execution_connection() ->
             await provisioner.create_cluster_job("project-1", "cluster-1", payload)
 
     execution_connection.assert_not_awaited()
+
+
+@pytest.mark.parametrize("status", [403, 404, 503])
+async def test_create_preflight_metadata_error_prevents_control_plane_resources(status):
+    connection = MagicMock()
+    connection.compute.flavors.return_value = [
+        SimpleNamespace(id="flavor-1", name="gpu", vcpus=8, ram=16384, disk=0, extra_specs={}),
+    ]
+    connection.compute.fetch_flavor_extra_specs.side_effect = os_exceptions.HttpException(
+        "flavor metadata unavailable", http_status=status,
+    )
+    with (
+        patch("drover.services.execution.open_connection", new=AsyncMock(return_value=connection)),
+        patch("drover.services.provisioner._guest_plugin_settings", new=AsyncMock()),
+        patch("drover.services.neutron.create_security_group") as create_security_group,
+        patch("drover.services.cinder.create_volume_from_image") as create_volume,
+        patch("drover.services.nova.create_server") as create_server,
+        patch("drover.services.provisioner.k3s_cluster.update_cluster_status", new=AsyncMock()) as status_update,
+        patch("drover.services.keystone.close_connection", new=AsyncMock()) as close,
+    ):
+        with pytest.raises(os_exceptions.HttpException):
+            await provisioner.create_cluster_job("project-1", "cluster-1", {
+                "name": "gpu-preflight", "agent_count": 1, "agent_flavor_id": "flavor-1", "network_id": "network-1",
+            })
+    create_security_group.assert_not_called()
+    create_volume.assert_not_called()
+    create_server.assert_not_called()
+    assert status_update.await_args.args[2] == "ERROR"
+    close.assert_awaited_once_with(connection)
 
 
 async def test_primary_server_uses_snapshot_without_key_name() -> None:
@@ -952,6 +1010,28 @@ async def test_manual_gpu_plugin_failure_prevents_vm_creation(worker_bootstrap, 
             provisioning_key_prefix=key_prefix, inspect_flavor_gpu=key_prefix is not None,
         )
     mocks.plugin.assert_awaited_once_with("cluster-1")
+    mocks.create_volume.assert_not_called()
+    mocks.create_server.assert_not_called()
+    mocks.add.assert_not_awaited()
+
+
+@pytest.mark.parametrize("key_prefix", [None, "manual-operation-key"])
+async def test_nodegroup_metadata_error_prevents_cloud_mutation(native_nodegroup, monkeypatch, key_prefix):
+    from drover.services import nova
+
+    mocks = native_nodegroup
+    monkeypatch.setattr(nova, "list_flavors", nova_list_flavors)
+    mocks.connection.compute.flavors.return_value = [
+        SimpleNamespace(id="flavor-1", name="gpu", vcpus=8, ram=16384, disk=0, extra_specs={}),
+    ]
+    error = os_exceptions.HttpException("flavor metadata unavailable", http_status=503)
+    mocks.connection.compute.get_flavor.side_effect = error
+    mocks.connection.compute.fetch_flavor_extra_specs.side_effect = error
+    with pytest.raises(os_exceptions.HttpException):
+        await autoscale.provision_nodegroup_vms(
+            "project-1", "cluster-1", "nodegroup-1", 1, flavor_id="flavor-1",
+            provisioning_key_prefix=key_prefix, inspect_flavor_gpu=key_prefix is not None,
+        )
     mocks.create_volume.assert_not_called()
     mocks.create_server.assert_not_called()
     mocks.add.assert_not_awaited()

@@ -207,6 +207,10 @@ spec:
         app: manila-csi-nodeplugin
     spec:
       serviceAccountName: manila-csi-node-sa
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: manila-csi-plugin
           image: {{ manila_csi_image }}

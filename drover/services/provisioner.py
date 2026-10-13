@@ -606,6 +606,11 @@ async def create_cluster_job(
         plugin_settings = await _guest_plugin_settings(conn, s, policy_snapshot)
         if not network_id:
             raise RuntimeError("Creation-time network snapshot is missing")
+        if int(payload.get("agent_count") or 0) > 0:
+            # Fail known agent metadata outages before creating the control plane.
+            flavors = await asyncio.to_thread(nova.list_flavors, conn)
+            if not any(flavor.id == payload.get("agent_flavor_id") for flavor in flavors):
+                raise RuntimeError("Selected agent flavor is unavailable")
         # Step 1: Security Group
         if operation_id:
             await operations.append_operation_event(
