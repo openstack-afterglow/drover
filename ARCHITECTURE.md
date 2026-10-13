@@ -279,9 +279,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1dfb704e54c2b9f74fb620c32dcab09e3a5da09f1a2265674e746e37b8d9c157",
-  "reviewed_at": "2026-10-13T11:17:59Z",
-  "summary": "0.4.13: Stampede default-on for new clusters (request/store/Settings/TOML/Kolla gate) with explicit false opt-out; default-server/default-agent rows written stampede_enabled=false so requested initial workers are never autoscaled away; new nodegroups default on only with explicit flavor. GPU identity normalized like Afterglow quota (RTX-3060-LHR->RTX3060LHR) and registered as reserved afterglow.io/gpu-type plus Kubernetes accelerator label (explicit nodegroup accelerator kept) by planner, nodegroup/Stampede workers and initial agents (initial GPU agents now get device plugin/admission/NVIDIA bootstrap). Durable flavor snapshot/fence unchanged. No schema/migration/authority/safety-window change. Local service 1413/3skip, SDK 114, Ruff, uv lock check, canonical API/Worker amd64+arm64 build and in-image execution passed."
+  "source_sha256": "ac4249c1a00cf0dc70a89f8289233b47509f83bfceb79a598ab4b72182db19ad",
+  "reviewed_at": "2026-10-13T11:18:23Z",
+  "summary": "0.4.13 source pin: Kolla drover_source_version -> c6ecd6d (identical service source to the reviewed default-on Stampede/accelerator-label commit); release notes record local multi-arch image execution. No runtime/topology change."
 }
 ```
 <!-- architecture-review:end -->
