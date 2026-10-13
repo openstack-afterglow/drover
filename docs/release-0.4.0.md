@@ -387,5 +387,55 @@ Final local0.4.12 qualification: `uv run --frozen --all-extras pytest -q tests` 
 
 Corrected nullable-event source and independent source-build pin are `9de1218280d6dcc7b029ffe23074d82f6a644dae`; schema source SHA256 is `b4d96bb9412e67a9ec33d98d99bca13c369309186bffb23053caf887c8913bc6`. The actual GPU Pod UID `6a324295-0d1c-4bc6-bdec-7f77e22b838f` and baseline UID remained Running while preparing the response-only release; the VM/workload were not recreated.
 
+### Tagged 0.4.12 publication and actual native event replay
 
+Immutable revision/tag is `6389b00145351c52fae15572be21d36850a0388b` / `v0.4.12`. Exact dev [38309456043](https://github.com/openstack-afterglow/drover/actions/runs/38309456043) and tag [38309460589](https://github.com/openstack-afterglow/drover/actions/runs/38309460589) image workflows passed every six-job suite/publication stage. Independent Release [38309460165](https://github.com/openstack-afterglow/drover/actions/runs/38309460165) published wheel SHA256 `d3a879bfb246b9643a3e3bca725279e9578bc0853d212f99084ad3a636280eb5`; it still does not itself wait for the tag suite.
 
+| Artifact | Immutable index digest |
+| --- | --- |
+| API | `sha256:06d4800b86bce901037bdef80bb006fe799d6068aad9855d3a7d2d4c3d606619` |
+| Worker | `sha256:1e6764928d78f900bbd321e3ccf99d638e913aac80f634b4253523768375608a` |
+
+Both official immutable amd64 images executed0.4.12/x86_64 with source schema fingerprint `b4d96bb9412e67a9ec33d98d99bca13c369309186bffb23053caf887c8913bc6`, preserved null and imported API/Worker. OCI version/revision matched v0.4.12/6389b00. Published indexes contain amd64 plus attestations; separate local amd64/arm64 build/execution is not a claim of published arm64.
+
+Canonical operator source tag/lock/sync installed0.4.12 and20role files with corrected source pin9de1218; lock SHA256 `b05fa2df8fddb061f1b756c1601bd308b02a2a15da6f39f4d8b9ac84a686aa80`. Only Drover and the root project's Drover dependency metadata changed. Globals changed only the four Drover image-tag/ref/source-version keys; every current Afterglow/other byte was preserved. Protected before snapshots remain under `/etc/kolla/.drover-rollout-backups/0.4.12`.
+
+Native Kolla prechecks/genconfig/pull and controller1→2→3 sequential reconfigure returned0. Receipt `/etc/kolla/.drover-rollout-backups/0.4.12/rollout-receipt.json`, timestamp `2026-10-12T21:25:46Z`, proves six exact0.4.12/revision/schema-hash containers, plugin/admission/Sentinel settings and direct/VIP/public readiness200. Other container IDs/images remained unchanged242/234/151. This response-only cutover did not reprovision the GPU VM, GPU Pod or baseline workload.
+
+The exact existing GPU Operation events changed500→200: sequences1/2/3, same `stampede_workers_observed` payload and `message:null`, plus `since_sequence=1` HTTP200 replay2/3. Operation remained SUCCEEDED. No DB event rewrite, fabricated message, event suppression or new GPU reservation was used.
+
+### Native real GPU zero-to-one consumer proof
+
+Actual group `04319d21-d602-4578-a1be-90e10a894060` began with no VM and configured native private flavor `fe5a5a4c-a568-481d-982b-469967f64808` / driver image `30d2812f-834c-42da-8292-c04c183ee140`; current configured Afterglow admission returned `gpu_required=true`/no block. Real deployment201, UID `244ab9f5-88c5-4eb3-8dcb-1e88e63741df`, requested exactly one `nvidia.com/gpu` with nodegroup/GPU selectors, ordinary GPU taint toleration and native NVIDIA RuntimeClass. No host/count override or fake device was used.
+
+| Native evidence | Exact observed value |
+| --- | --- |
+| VM | `6c522a85-8fe6-4322-b981-2fd62dc44e03`, ACTIVE; node `drover-native0410-0e15f805de34-stampede-543c35ef437d` |
+| Boot volume | `e33fd259-3563-4efe-9978-9763fc9ffdfb`, recorded owning cluster metadata |
+| Node | UID `92e821ed-7424-47da-b43c-06ad3544eb09`, Ready, actual `nvidia.com/gpu` allocatable1 |
+| CUDA Pod | `drover-0411-gpu-demand-587c45f9f7-hbpnc`, UID `6a324295-0d1c-4bc6-bdec-7f77e22b838f`, Running on that node, runtimeClass nvidia, request1 |
+| Hardware query/log | `NVIDIA GeForce RTX 3060`, `GPU-8585ef4a-cb94-2f3b-3140-ef165643afb4`, driver535.309.01; actual log HTTP200 and `GPU_EXECUTION_OK` |
+| Durable operation | `d2e90e55-69ab-4c22-a800-001018444220`, SUCCEEDED; real enqueue/workers-observed/completed events now replay HTTP200 |
+| Preserved workload | Baseline UID `870c770a-d942-427e-a22c-ec6ca02bcf12`, same original worker and Running |
+
+Final combined proof timestamp `2026-10-12T21:26:06Z`. The initial full observer failed on the event-response HTTP500 and was retained as failure; the same actual VM/Pod/hardware were re-observed after the permanent API fix, not provisioned again. The real authenticated Afterglow Stampede tab showed the GPU group/capacity and actual history; native hardware/operation receipts are not replaced by its free-slot card (free GPU0 means the proof Pod is using the allocated device).
+
+Parent then removed only the exact deployment UID through foreground DELETE200 at `2026-10-12T21:26:58Z`; natural idle/drain/scale-in and final ownership cleanup are separate observed receipts below. No desired-count/min-size/pending/window bypass was made.
+
+### Native GPU natural scale-in and final cleanup boundary
+
+Stampede recorded the GPU node idle from `2026-10-12T21:27:39Z`. Without window, count, min-size, pending or drain changes, it queued scale-down Operation `c6e04c21-5b07-461a-9baa-b6a98443f0dc` after the 600-second window (`desired=0`, `scale_down_queued` observed `21:37:54Z`). Nova server `6c522a85-8fe6-4322-b981-2fd62dc44e03` and Node `drover-native0410-0e15f805de34-stampede-543c35ef437d` then returned 404. Drover's own Node-delete step was not reached; [INFERENCE] the OCCM node lifecycle removed the Node after its instance disappeared.
+
+Native workers boot with Nova delete-on-termination (`autoscale.py:provision_nodegroup_vms`), so Nova requested deletion of boot volume `e33fd259-3563-4efe-9978-9763fc9ffdfb`. It stayed detached in Cinder `error_deleting`, unencrypted, with the fixture project/cluster metadata on backend `dms-controller2@ceph#ceph`. `cinder.delete_detached_boot_volume` accepts absence or deletes only an owned, detached `available` volume, so every attempt failed closed. Operation status is FAILED with `boot_volume_delete_unverified:e33fd259-3563-4efe-9978-9763fc9ffdfb` and events `job_enqueued`, `job_attempt_failed`×2, `job_failed` (last scale-down `21:44:14Z`). Group `04319d21-d602-4578-a1be-90e10a894060` keeps `node_count=1` and its VM tracking row, and the cluster is ERROR. `stampede.py:run_all` scans only ACTIVE clusters, so no repeated scale-down followed. The finite observer's TIMEOUT is retained; GPU scale-in is not counted as passed.
+
+The backend host's cinder-volume log for UTC `21:38:20–21:41:44Z` records ERROR tracebacks through `delete_volume`/`_delete_volume` with `rbd.Timeout` (`RBD operation timeout`). This is time-window correlation, not request-ID linkage; same-window `rbd.ImageExists` create/clone errors are not attributed. Cinder API logs on the three controllers show no failure marker for this volume ID. Deployed Cinder `API.delete` allows ordinary deletion only from `available`, `error`, `error_restoring`, `error_extending` or `error_managing`, so recovery requires administrator reset-state or force-delete. By explicit owner decision neither was performed. No direct SQL, tracking removal, or count/window/guard bypass was used either. The volume, GPU group tracking and ERROR fixture `f63db749-a27f-4785-9315-da34a0c7d487` are preserved for operator triage.
+
+| Exact cleanup on 2026-10-13 | Native result |
+| --- | --- |
+| Namespace `gpu-0411`, UID `bbe15240-4588-4968-bf5d-f871dc32dd71` | No workload object; UID-precondition DELETE200, then GET404 (`06:08:52Z`) |
+| Empty CPU group `6164f671-1b3e-49da-ab4c-dc8615872524` | Caller-admitted DELETE204; Operation `d5d61ae2-ac72-4622-af18-62d8754eb622` SUCCEEDED with `job_enqueued`, `nodegroup_reconciled`, `job_completed`; GET404 |
+| Flavor `fe5a5a4c-a568-481d-982b-469967f64808` access for tenant `99f2f82cb2d14788a0723af31c16dab0` | Recovered grant receipt: not preexisting, added and verified by the approved test, quota unchanged. After GPU server404, only that tenant row was removed; the other three tenant rows and six compute quota limits were unchanged (`06:17:24Z`) |
+
+The first CPU-group observer failed on a nonexistent operation-list route before any mutation. The next observer's post-DELETE discovery TypeError is retained; DELETE was not repeated before read-only verification.
+
+Final read-only checks at `08:15–08:16Z` found fixture baseline Pod UID `870c770a-d942-427e-a22c-ec6ca02bcf12` Running on its original node with both baseline nodes Ready, and `gpu-0411` still404. Approved supplementary ports `707fecf0-5790-4576-a326-d90b3151d14e`/`67ce7855-4d5e-4cf1-97ef-77793d9b3214` remained ACTIVE on the baseline VMs, and shared KEK `416228dd-7747-4205-a071-4b7b368f283f` stayed ACTIVE without a payload read. Restored cluster `78ba1d31-ea1e-48a1-b8c9-6573626d7045` belongs to another project and remains ERROR. Operator read-only CA/hostname-verified guest health returned200 with the same two Ready nodes, all seven baseline Pod UIDs with unchanged phase/node, and no new Pods. Legacy `cac87f5d-dbcc-4e78-b2c1-8dfac6a3471c` remains DELETED. The test caller's404 for those clusters reflects project isolation, not deletion.

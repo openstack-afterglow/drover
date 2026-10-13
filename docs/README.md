@@ -51,6 +51,7 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - [0.4.10 Barbican catalog scope](release-0.4.0.md#0410-patch--configured-barbican-catalog-scope): configured interface·region·versioned endpoint 보존, public order ref의 동일 endpoint polling과 native KEK 발급·재사용 source smoke
    - [0.4.11 ERROR nodegroup cleanup](release-0.4.0.md#0411-patch--error-nodegroup-cleanup-admission): 삭제 전용 lifecycle 복구 admission, requester/project·job/default/in-flight·drain 경계 보존; 실제 all-plugin acceptance와 CPU/GPU 후속 검증 구분
    - [0.4.12 nullable operation event](release-0.4.0.md#0412-patch--nullable-durable-event-messages): 실제 payload-only GPU readiness 이벤트의 null message를 phase/sequence/payload와 보존하며 조회500을 수정; DB rewrite·fake message·이벤트 누락 없이 정상 replay
+   - [0.4.12 GPU 자연축소·최종 정리 경계](release-0.4.0.md#native-gpu-natural-scale-in-and-final-cleanup-boundary): VM/Node404 뒤 Cinder `error_deleting` boot volume으로 실패한 축소, force/reset 없는 보존과 정확한 ID 정리·보존 확인
 
 6. **[Drover 0.3.0 및 0.3.1 준비 기록](release-0.3.0.md)**
    - 구조화 요청/job 로그, opt-in `LOG_LEVEL=DEBUG`, Redis 5 종료 API 수정과 당시 검증 기록

@@ -2,7 +2,7 @@
 
 본 문서는 레거시 오퍼레이션 및 이전 직접 오픈스택 API 연동 방식 대비 **Drover 서비스의 기능 커버리지, 교체 매핑, 오픈스택 서비스 통합 구조, 보안 아키텍처 및 의도적 제약사항**을 상세히 기술합니다.
 
-**검증 경계:** 최신 완료 배포는 `v0.4.11`이며 source는 nullable operation-event response를 수정한 `0.4.12`입니다. 0.4.11 전체 service suite1344/3skip, API/Worker 실제 local amd64/arm64 실행과 canonical controller3대 배포를 확인했습니다. 같은 native fixture에서 Cinder 재부착·Manila RWX·Service LB·HTTP/TLS Ingress·bearer-only RBAC·KMS Encrypt/Decrypt/암호화 저장과 CPU0→2→0을 실제 검증했습니다. GPU VM·Pod·nvidia-smi는 실행됐으나 event replay500을 발견해 API 계약을 수정 중이며 최종 native 이력/정리는 [release receipt](release-0.4.0.md)와 구분합니다. 전체 재인가/guest credential rotation matrix를 다시 실행했다고 주장하지 않습니다.
+**검증 경계:** 최신 완료 발행·canonical controller3대 배포는 `v0.4.12`; full service1345/3skip, 실제 local API/Worker amd64/arm64 실행을 확인했습니다. 같은 native fixture에서 Cinder 재부착·Manila RWX·Service LB·HTTP/TLS Ingress·bearer-only RBAC·KMS Encrypt/Decrypt/암호화 저장, CPU0→2→0·baseline UID 보존, 실제 RTX3060 GPU0→1/Ready/allocatable1/Running nvidia-smi/SUCCEEDED와 원래 durable events500→200/null 보존/cursor replay를 검증했습니다. GPU 자연축소는 VM404까지 진행했지만 boot volume이 Cinder `error_deleting`으로 남아 Operation FAILED이며, owner 결정에 따라 force/reset 없이 volume·group tracking·ERROR fixture를 보존했습니다([exact receipt](release-0.4.0.md#native-gpu-natural-scale-in-and-final-cleanup-boundary)). 전체 guest credential rotation/재인가 matrix를 재실행했다는 주장은 하지 않습니다.
 
 ---
 
@@ -108,7 +108,7 @@ drover wheel
         └── drover-migrate.json.j2# Pre-start Migration 컨테이너 템플릿
 ```
 
-소스 role은 `deploy/kolla/ansible/roles/drover`에 있으며 root wheel shared data로 설치됩니다. 서비스에는 `drover[service]` extra가 필요합니다. source registry default는 `v0.4.12`, 최신 완료 발행·canonical 배포는 [0.4.11 receipt](release-0.4.0.md#tagged-0411-publication-and-native-recovery-verification)이며0.4.12는 별도 qualify/publish/deploy합니다. Published indexes의 amd64+attestation과 local amd64/arm64 실행을 구분합니다. SDK0.2.21 및 schema/migrations는 독립적·불변입니다. source 기본값이나 Ready는 native consumer 검증을 대체하지 않습니다.
+소스 role은 root wheel의 `deploy/kolla/ansible/roles/drover` shared data로 설치하며 서비스에는 `drover[service]`가 필요합니다. Registry default/최신 완료 발행·배포는 `v0.4.12`([receipt](release-0.4.0.md#tagged-0412-publication-and-actual-native-event-replay)); wheel/lock/20role files와 immutable image/runtime parity를 확인했습니다. Published amd64+attestation과 local amd64/arm64를 구분합니다. SDK0.2.21 및 persistence schema/migrations는 불변이며 nullable event response를 실제 DB 계약에 맞췄습니다. source default나 Ready는 native consumer 검증을 대체하지 않습니다.
 
 ### Schema Readiness 및 Pre-start Migration
 - API/Worker보다 `drover-migrate`를 먼저 실행하여 manifest checksum ledger의 001–004를 적용합니다. `004_execution_authority.sql`은 delegations, control/guest credential generations, job delegation FK와 `reauthorize` operation kind를 추가합니다. 기존 manager rows/password는 authority로 전환하지 않습니다. [004 upgrade runbook](../drover/migrations/README.md#execution-authority-upgrade-004)을 따릅니다.
@@ -139,6 +139,7 @@ drover wheel
 - **안정화 윈도우 및 안전한 Drain/축소**: 노드그룹의 사용률이 임계값(`drover_stampede_scale_down_threshold`, 기본 0.5) 미만으로 300–600초(`drover_stampede_scale_down_window`) 동안 지속되고 `min_size`를 초과할 때만 축소 후보를 선정합니다. 후보 노드의 모든 Pod가 남은 활성 스케줄 가능 노드로 안전하게 재배치(relocate) 가능한지(컨트롤러 유무, PVC, 로컬 스토리지, PDB 준수) 검증한 후 1개씩 축소합니다. 삭제 직전 live pending Pod, Ready, min-size headroom을 Nova ID 조회로 재검증하며 실제 404만 absent로 봅니다(403/400 등 관측 오류는 정리를 허가하지 않음). cordon은 Node annotation `drover.io/removing-vm-id`를 함께 기록합니다. drain 실패나 DELETE 직전 최종 Nova 조회·소유권 재검증 실패 시에는 이번 시도가 새로 건 cordon만 해제하고 리소스를 보존합니다. 이전 시도에서 남은 같은 VM annotation cordon은 DELETE 이후일 수 있어 해제하지 않습니다. 최종 재검증 뒤에는 DELETE 거부나 정리 실패가 있어도 cordon을 유지하고, 재시도는 같은 VM annotation의 자기 cordon만 재개합니다. Nova VM 소멸이 확인된 후에만 boot volume, Kubernetes Node, tracking row를 순차 정리합니다.
 - **미등록 worker 수동 삭제**: 전체 Node 조회가 성공한 경우에만 없는 이름을 cordoned Node로 POST 예약하고 정상 drain·최종 Nova 재검증을 거칩니다. POST 201 외 응답과 통신 실패는 삭제를 중단하며 예약은 rollback으로 uncordon하지 않습니다. 자동 축소의 Ready/min-size guard는 그대로입니다(`autoscale.py:delete_nodegroup_vms`, `kube.py:cordon_node`).
 - **실제 CPU 축소:** current native fixture의 CPU0→2→0, 두 Running demand Pods, durable scale-out 및 두 scale-in SUCCEEDED, VM/boot/Node404와 baseline Pod UID/노드/Running 유지가 [receipt](release-0.4.0.md#native-cpu-zero-to-two-to-zero-and-baseline-preservation)에 기록돼 있습니다. 600초 연속 idle·300초 cooldown·global pending/drain/min-size guard 및 desired count는 수동으로 바꾸지 않았습니다.
+- **실제 GPU 축소 경계:** GPU 0→1 실행 뒤 deployment만 제거하자 600초 idle 후 scale-down이 큐잉되고 Nova VM/Node가 404가 됐습니다. Nova delete-on-termination이 요청한 boot volume 삭제는 backend host의 같은 시간대 `rbd.Timeout`과 함께 `error_deleting`으로 남았습니다. Drover는 `available`이 아닌 volume을 삭제하지 않고 `boot_volume_delete_unverified`로 실패하며 tracking row를 보존했습니다. 배포된 Cinder 일반 DELETE도 이 상태를 거부하므로 관리자 reset-state/force-delete가 필요하지만, owner 결정에 따라 수행하지 않았습니다. 빈 CPU 그룹·GPU namespace·임시 flavor access는 정확한 ID로 정리했습니다([receipt](release-0.4.0.md#native-gpu-natural-scale-in-and-final-cleanup-boundary)).
 
 ---
 
