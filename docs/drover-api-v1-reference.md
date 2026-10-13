@@ -354,6 +354,8 @@ spec:
 
 맞는 Ready GPU 노드가 없으면 Pod는 Pending이 되고, planner는 같은 flavor-derived label로 zero-size 그룹까지 후보를 고릅니다. `nodeSelector`와 지원되는 required nodeAffinity를 모두 적용하며 타입·GPU 수·CPU/RAM·taint 조건을 모두 만족해야 증설합니다. planner는 선택한 flavor ID와 extra specs를 durable job에 함께 전달하고, 예약 row lock 안에서 flavor ID가 바뀌었으면 오래된 GPU 타입 snapshot을 사용하지 않습니다. Worker는 같은 snapshot으로 kubelet label을 등록하고, 수동 nodegroup·초기 worker 생성은 현재 project-scoped Nova flavor를 조회합니다. Node Ready 및 실제 `nvidia.com/gpu` allocatable 대기, admission, cooldown/min/max와 drain guard는 그대로입니다([planner](../drover/services/stampede.py), [durable reservation/dispatch](../drover/services/jobs.py), [planner regressions](../tests/test_k3s_stampede.py), [rendered bootstrap regressions](../tests/test_provisioner_agents.py), [stale-flavor fence](../tests/test_jobs.py)).
 
+GPU worker를 GPU workload 전용으로 쓰고 유휴 시 자동 축소되게 하려면 GPU nodegroup에 `taints`(예: `nvidia.com/gpu=true:NoSchedule`)를 지정하고 GPU Pod에 같은 key의 toleration을 함께 넣습니다. Drover는 GPU taint를 자동으로 붙이지 않으므로 taint 없는 GPU worker에는 일반 Pod도 배치될 수 있습니다. 0.4.13 실제 검증에서는 클러스터의 유일한 worker였던 GPU node에 K3s 기본 `traefik`(emptyDir 사용)이 배치되었고, GPU workload를 삭제한 뒤에도 기존 local-storage 보호 규칙이 `protected_pod`로 축소를 막았습니다([live acceptance](release-0.4.0.md#live-default-on-and-accelerator-acceptance)).
+
 
 ### 4.2 클러스터 템플릿 API (`/v1/cluster-templates`)
 * **`GET /v1/cluster-templates`**: 공개 및 본인 소유 클러스터 템플릿 목록 조회 (`list[K3sClusterTemplateInfo]`)

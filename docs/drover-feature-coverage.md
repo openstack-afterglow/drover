@@ -2,7 +2,7 @@
 
 본 문서는 레거시 오퍼레이션 및 이전 직접 오픈스택 API 연동 방식 대비 **Drover 서비스의 기능 커버리지, 교체 매핑, 오픈스택 서비스 통합 구조, 보안 아키텍처 및 의도적 제약사항**을 상세히 기술합니다.
 
-**검증 경계:** 최신 완료 발행·canonical controller3대 배포는 `v0.4.12`; full service1345/3skip, 실제 local API/Worker amd64/arm64 실행을 확인했습니다. 같은 native fixture에서 Cinder 재부착·Manila RWX·Service LB·HTTP/TLS Ingress·bearer-only RBAC·KMS Encrypt/Decrypt/암호화 저장, CPU0→2→0·baseline UID 보존, 실제 RTX3060 GPU0→1/Ready/allocatable1/Running nvidia-smi/SUCCEEDED와 원래 durable events500→200/null 보존/cursor replay를 검증했습니다. GPU 자연축소는 VM404까지 진행했지만 boot volume이 Cinder `error_deleting`으로 남아 Operation FAILED이며, owner 결정에 따라 force/reset 없이 volume·group tracking·ERROR fixture를 보존했습니다([exact receipt](release-0.4.0.md#native-gpu-natural-scale-in-and-final-cleanup-boundary)). 전체 guest credential rotation/재인가 matrix를 재실행했다는 주장은 하지 않습니다.
+**검증 경계:** 최신 완료 발행·canonical controller3대 배포는 `v0.4.13`; full service1413/3skip, 실제 local API/Worker amd64/arm64 실행을 확인했습니다. 새 disposable cluster에서 `stampede_enabled` 생략 시 cluster `true`·default 그룹 `false`, GPU flavor nodegroup 생략 시 `true`를 확인했고 `accelerator: RTX3060LHR` nodeSelector와 `nvidia.com/gpu: 1` Pod로 GPU0→1 증설·자동 `accelerator`/`afterglow.io/gpu-type` label·allocatable1·Running nvidia-smi·Operation SUCCEEDED를 확인한 뒤 cluster/VM/volume 정리와 임시 flavor access 제거를 확인했습니다([live acceptance](release-0.4.0.md#live-default-on-and-accelerator-acceptance)). taint 없는 GPU worker에 K3s traefik(emptyDir)이 배치되어 그 실행의 자연 축소는 `protected_pod`로 차단됐습니다. 0.4.12까지의 native fixture에서는 Cinder 재부착·Manila RWX·Service LB·HTTP/TLS Ingress·bearer-only RBAC·KMS Encrypt/Decrypt/암호화 저장, CPU0→2→0·baseline UID 보존, 실제 RTX3060 GPU0→1/Ready/allocatable1/Running nvidia-smi/SUCCEEDED와 원래 durable events500→200/null 보존/cursor replay를 검증했습니다. GPU 자연축소는 VM404까지 진행했지만 boot volume이 Cinder `error_deleting`으로 남아 Operation FAILED이며, owner 결정에 따라 force/reset 없이 volume·group tracking·ERROR fixture를 보존했습니다([exact receipt](release-0.4.0.md#native-gpu-natural-scale-in-and-final-cleanup-boundary)). 전체 guest credential rotation/재인가 matrix를 재실행했다는 주장은 하지 않습니다.
 
 ---
 
@@ -108,7 +108,7 @@ drover wheel
         └── drover-migrate.json.j2# Pre-start Migration 컨테이너 템플릿
 ```
 
-소스 role은 root wheel의 `deploy/kolla/ansible/roles/drover` shared data로 설치하며 서비스에는 `drover[service]`가 필요합니다. Registry default/최신 완료 발행·배포는 `v0.4.12`([receipt](release-0.4.0.md#tagged-0412-publication-and-actual-native-event-replay)); wheel/lock/20role files와 immutable image/runtime parity를 확인했습니다. Published amd64+attestation과 local amd64/arm64를 구분합니다. SDK0.2.21 및 persistence schema/migrations는 불변이며 nullable event response를 실제 DB 계약에 맞췄습니다. source default나 Ready는 native consumer 검증을 대체하지 않습니다.
+소스 role은 root wheel의 `deploy/kolla/ansible/roles/drover` shared data로 설치하며 서비스에는 `drover[service]`가 필요합니다. Registry default/최신 완료 발행·배포는 `v0.4.13`([receipt](release-0.4.0.md#tagged-0413-publication-and-canonical-rollout)); wheel/lock/20role files와 immutable image/runtime parity를 확인했습니다. Published amd64+attestation과 local amd64/arm64를 구분합니다. SDK0.2.21 및 persistence schema/migrations는 불변이며 0.4.13은 Stampede 생성 기본값과 GPU worker label만 바꿨습니다. source default나 Ready는 native consumer 검증을 대체하지 않습니다.
 
 ### Schema Readiness 및 Pre-start Migration
 - API/Worker보다 `drover-migrate`를 먼저 실행하여 manifest checksum ledger의 001–004를 적용합니다. `004_execution_authority.sql`은 delegations, control/guest credential generations, job delegation FK와 `reauthorize` operation kind를 추가합니다. 기존 manager rows/password는 authority로 전환하지 않습니다. [004 upgrade runbook](../drover/migrations/README.md#execution-authority-upgrade-004)을 따릅니다.
