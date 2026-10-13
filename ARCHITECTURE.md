@@ -282,9 +282,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e4b649b2415dcd0f694717f94b947539b56c27dad810fbff919ae9f7107866f1",
-  "reviewed_at": "2026-10-13T15:58:36Z",
-  "summary": "0.4.14 GPU API correction: nova.list_flavors explicitly fetches omitted extra specs and propagates failure; create_cluster_job preflights initial-agent metadata before SG/volume/VM creation; Cinder/Manila/NFS node DaemonSets tolerate only nvidia.com/gpu NoSchedule. Regression proof 8 failures before, full final service1430/3skip and SDK114 passed; final API/Worker amd64/arm64 actual-image SDK HTTP/CSI render smoke with provisioner parity passed. Existing API/auth/quota/schema/idle600/cooldown300/drain guards and protected resources unchanged; Afterglow dashboard implementation is separate OpenSpec/handoff."
+  "source_sha256": "d9d9748e5fdf1c6c9d28f6f6f8fedeccb1e67fd638ba3b184bed321fd59832de",
+  "reviewed_at": "2026-10-13T15:59:02Z",
+  "summary": "0.4.14 source pin alignment: Kolla source mode now pins reviewed GPU metadata/preflight and narrow CSI toleration feature commit 7f9f439; runtime identical to the tested/built source. No new behavior, authority or schema change."
 }
 ```
 <!-- architecture-review:end -->
