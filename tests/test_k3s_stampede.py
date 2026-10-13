@@ -7,7 +7,7 @@ import pytest
 from openstack import exceptions as os_exceptions
 
 from drover.config import Settings
-from drover.services import activity, autoscale, inventory, jobs, keystone, kube, nodegroup, stampede
+from drover.services import activity, autoscale, gpu, inventory, jobs, keystone, kube, nodegroup, stampede
 
 
 def _pod(name="work", *, cpu=500, memory=512, gpu=0, **extra):
@@ -86,6 +86,84 @@ def test_gpu_selector_matches_bootstrap_label_without_user_label_duplication():
         [pod], [_group(), _group("gpu")], {"cpu": _flavor(), "gpu": _flavor("gpu", gpu=1)}, [], [],
     )
     assert assignments == {"cpu": [], "gpu": [pod]}
+    assert blocked == []
+
+
+
+@pytest.mark.parametrize("selection", ["selector", "affinity"])
+@pytest.mark.parametrize("label_key", ["accelerator", "afterglow.io/gpu-type"])
+@pytest.mark.parametrize("extra_specs,gpu_type", [
+    ({"pci_passthrough:alias": "RTX-3060-LHR:1,GA106-audio:1"}, "RTX3060LHR"),
+    ({"pci_passthrough:alias": "RTX-3060-LHR:1,rtx3060lhr:1"}, "RTX3060LHR"),
+    ({"gpu_count": "1", "pci_passthrough:alias": "A100_80GB:1"}, "A10080GB"),
+])
+def test_gpu_type_demand_selects_matching_zero_group(selection, label_key, extra_specs, gpu_type):
+    requirement = {"node_selector": {label_key: gpu_type}}
+    if selection == "affinity":
+        requirement = {"affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
+            "nodeSelectorTerms": [{"matchExpressions": [{"key": label_key, "operator": "In", "values": [gpu_type]}]}],
+        }}}}
+    pod = _pod(gpu=1, message="0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector.", **requirement)
+    # A user copy of the reserved type label must not let an H100 group claim this demand.
+    groups = [_group(), _group("wrong", labels={"afterglow.io/gpu-type": gpu_type}), _group("matching")]
+    flavors = {
+        "cpu": _flavor(),
+        "wrong": {**_flavor("wrong", gpu=1), "extra_specs": {"pci_passthrough:alias": "H100:1"}},
+        "matching": {**_flavor("matching", gpu=gpu.flavor_gpu_count(extra_specs)), "extra_specs": extra_specs},
+    }
+    assignments, blocked, _ = stampede._assign_pending_pods([pod], groups, flavors, [], [])
+    assert assignments == {"cpu": [], "wrong": [], "matching": [pod]}
+    assert blocked == []
+
+
+@pytest.mark.parametrize("extra_specs,gpu_count", [
+    ({"gpu_count": "1"}, 1),
+    ({"pci_passthrough:alias": "RTX-3060-LHR:1,A100:1"}, 2),
+    ({"gpu_count": "1", "pci_passthrough:alias": "???:1"}, 1),
+    ({"gpu_count": "1", "pci_passthrough:alias": "x" * 64 + ":1"}, 1),
+    ({"pci_passthrough:alias": "sriov:1,GA106-audio:1"}, 0),
+])
+def test_unknown_or_ambiguous_gpu_type_cannot_be_claimed_by_group_labels(extra_specs, gpu_count):
+    pod = _pod(node_selector={"afterglow.io/gpu-type": "RTX3060LHR"})
+    group = _group(labels={"afterglow.io/gpu": "true", "afterglow.io/gpu-type": "RTX3060LHR"})
+    flavor = {**_flavor(gpu=gpu_count), "extra_specs": extra_specs}
+    assignments, blocked, _ = stampede._assign_pending_pods([pod], [group], {"cpu": flavor}, [], [])
+    assert assignments == {"cpu": []}
+    assert blocked[0]["reason"] == "no_matching_nodegroup"
+
+
+def test_cpu_flavor_cannot_impersonate_gpu_type_without_gpu_resource_request():
+    pod = _pod(node_selector={"afterglow.io/gpu-type": "A100"})
+    group = _group(labels={"afterglow.io/gpu": "true", "afterglow.io/gpu-type": "A100"})
+    assignments, blocked, _ = stampede._assign_pending_pods(
+        [pod], [group], {"cpu": {**_flavor(), "extra_specs": {"pci_passthrough:alias": "A100:1", "gpu_count": "0"}}}, [], [],
+    )
+    assert assignments == {"cpu": []}
+    assert blocked[0]["reason"] == "no_matching_nodegroup"
+
+
+def test_gpu_type_selector_consumes_only_matching_existing_capacity():
+    pod = _pod(gpu=1, node_selector={"afterglow.io/gpu-type": "RTX3060LHR"})
+    group = _group("gpu")
+    flavor = {**_flavor("gpu", gpu=1), "extra_specs": {"pci_passthrough:alias": "RTX-3060-LHR:1"}}
+    wrong = _node("wrong", gpu=1, labels={"afterglow.io/gpu-type": "A100"})
+    assignments, blocked, _ = stampede._assign_pending_pods([pod], [group], {"gpu": flavor}, [], [wrong])
+    assert assignments == {"gpu": [pod]}
+    assert blocked == []
+    matching = _node("matching", gpu=1, labels={"afterglow.io/gpu-type": "RTX3060LHR"})
+    assignments, blocked, _ = stampede._assign_pending_pods([pod], [group], {"gpu": flavor}, [], [wrong, matching])
+    assert assignments == {"gpu": []}
+    assert blocked == []
+
+def test_explicit_accelerator_label_wins_without_changing_reserved_gpu_type():
+    labels = gpu.node_labels({"accelerator": "custom-a100"}, {"pci_passthrough:alias": "RTX-3060-LHR:1"}, gpu_required=True)
+    assert labels == {"accelerator": "custom-a100", "afterglow.io/gpu": "true", "afterglow.io/gpu-type": "RTX3060LHR"}
+    pod = _pod(gpu=1, node_selector={"accelerator": "custom-a100"},
+               message="0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector.")
+    group = _group("gpu", labels={"accelerator": "custom-a100"})
+    flavor = {**_flavor("gpu", gpu=1), "extra_specs": {"pci_passthrough:alias": "RTX-3060-LHR:1"}}
+    assignments, blocked, _ = stampede._assign_pending_pods([pod], [group], {"gpu": flavor}, [], [])
+    assert assignments == {"gpu": [pod]}
     assert blocked == []
 
 
@@ -902,7 +980,7 @@ async def test_gpu_job_finishes_only_after_all_requested_devices_register(monkey
     ({"pci_passthrough:alias": "sriov:2,rdma:1"}, 0),
 ])
 def test_gpu_aliases_exclude_non_gpu_pci_functions(extra_specs, count):
-    assert stampede._flavor_gpu_count(extra_specs) == count
+    assert gpu.flavor_gpu_count(extra_specs) == count
 
 
 @pytest.mark.parametrize("os_type", ["ubuntu", "fcos"])

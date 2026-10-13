@@ -2,7 +2,7 @@
 # Drover kolla role defaults
 
 drover_image_namespace: "ghcr.io/openstack-afterglow"
-drover_image_tag: "v0.4.12"
+drover_image_tag: "v0.4.13"
 drover_api_image: "{{ drover_image_namespace }}/drover-api"
 drover_worker_image: "{{ drover_image_namespace }}/drover-worker"
 
@@ -108,7 +108,7 @@ drover_delegated_required_roles: ["member"]
 drover_delegated_optional_roles: ["load-balancer_member"]
 drover_guest_rollout_timeout_seconds: 600
 
-drover_stampede_enabled: false
+drover_stampede_enabled: true
 drover_stampede_interval: 60
 drover_stampede_scale_down_threshold: 0.5
 drover_stampede_scale_down_window: 600

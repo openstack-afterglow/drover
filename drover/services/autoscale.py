@@ -90,6 +90,7 @@ async def provision_nodegroup_vms(
     provisioning_key_prefix: str | None = None,
     gpu_required: bool = False,
     inspect_flavor_gpu: bool = False,
+    flavor_extra_specs: dict | None = None,
 ) -> list[dict]:
     """노드그룹에 agent VM을 add_count개 생성해 k3s 클러스터에 join시킨다.
 
@@ -138,25 +139,28 @@ async def provision_nodegroup_vms(
 
     conn = await execution.open_connection(project_id)
     try:
-        if (provisioning_key_prefix is None or inspect_flavor_gpu) and add_count > 0 and not gpu_required:
-            # Manual nodegroups use the same explicitly selected Nova flavor.
-            from drover.services import gpu
-            from drover.services.stampede import _flavor_gpu_count
+        from drover.services import gpu
 
+        if add_count > 0 and flavor_extra_specs is None and (
+            provisioning_key_prefix is None or inspect_flavor_gpu or gpu_required
+        ):
+            # Manual provisioning reads Nova; Stampede uses the planner's flavor snapshot.
             flavors = await asyncio.to_thread(nova.list_flavors, conn)
             selected = next((flavor for flavor in flavors if flavor.id == flavor_id), None)
             if selected is None:
                 raise RuntimeError("Selected nodegroup flavor is unavailable")
-            gpu_required = _flavor_gpu_count(selected.extra_specs or {}) > 0
+            flavor_extra_specs = selected.extra_specs or {}
+            gpu_required = gpu_required or gpu.flavor_gpu_count(flavor_extra_specs) > 0
             if gpu_required:
                 await gpu.ensure_device_plugin(cluster_id)
+        effective_labels = gpu.node_labels(labels, flavor_extra_specs or {}, gpu_required=gpu_required)
         # extra_agent_args 구성 (플러그인 + labels/taints + nodegroup 식별 라벨)
         _agent_args = k3s_plugins.aggregate_agent_args(s)
         if not _agent_args and cluster.get("occm_enabled"):
             _agent_args = ["--kubelet-arg=cloud-provider=external"]
 
         # 노드그룹 labels → --node-label
-        for k, v in (labels or {}).items():
+        for k, v in effective_labels.items():
             _agent_args.append(f"--node-label={k}={v}")
 
         # nodegroup 식별 라벨 (Stampede 내부 추적용)

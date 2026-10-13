@@ -375,7 +375,8 @@ async def test_gpu_admission_precedes_every_native_create(monkeypatch, denied):
     monkeypatch.setattr("drover.services.cinder.create_volume_from_image", volume)
     monkeypatch.setattr("drover.services.nova.create_server", server)
     call = autoscale.provision_nodegroup_vms("project", "cluster", "group", 2, flavor_id="gpu",
-                                           gpu_required=True, provisioning_key_prefix="key")
+                                           gpu_required=True, provisioning_key_prefix="key",
+                                           flavor_extra_specs={"pci_passthrough:alias": "RTX-3060-LHR:1,GA106-audio:1"})
     if denied:
         with pytest.raises(afterglow.GpuAdmissionDenied):
             await call

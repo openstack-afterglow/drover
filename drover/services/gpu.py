@@ -1,6 +1,7 @@
 """NVIDIA worker runtime bootstrap and the cluster device-plugin boundary."""
 
 import json
+import re
 
 import httpx
 
@@ -9,11 +10,67 @@ from drover.services import kube, store
 _TOOLKIT_VERSION = "1.20.1-1"
 _DEVICE_PLUGIN_IMAGE = "nvcr.io/nvidia/k8s-device-plugin:v0.17.3"
 _DEVICE_PLUGIN_NAME = "afterglow-nvidia-device-plugin"
+_NON_GPU_PCI_ALIAS_TOKENS = frozenset(
+    {"audio", "crypto", "fpga", "infiniband", "network", "nic", "nvme", "qat", "rdma", "sriov"}
+)
+
+
+def _gpu_alias_counts(extra_specs: dict) -> dict[str, int]:
+    aliases: dict[str, int] = {}
+    for entry in str(extra_specs.get("pci_passthrough:alias", "")).split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            name, _, count_text = entry.rpartition(":")
+            try:
+                count = max(1, int(count_text.strip()))
+            except ValueError:
+                count = 1
+        else:
+            name, count = entry, 1
+        name = name.strip()
+        tokens = {token for token in re.split(r"[^a-z0-9]+", name.lower()) if token}
+        if "audio" in name.lower() or tokens & _NON_GPU_PCI_ALIAS_TOKENS:
+            continue
+        aliases[name] = aliases.get(name, 0) + count
+    return aliases
+
+
+def flavor_gpu_count(extra_specs: dict) -> int:
+    raw = extra_specs.get("gpu_count")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    return sum(_gpu_alias_counts(extra_specs).values())
+
+
+def node_labels(labels: dict | None, extra_specs: dict, *, gpu_required: bool) -> dict:
+    """Use the same flavor-derived GPU identity for planning and kubelet registration."""
+    effective = {key: value for key, value in (labels or {}).items()
+                 if key not in {"afterglow.io/gpu", "afterglow.io/gpu-type"}}
+    if not gpu_required:
+        return effective
+    effective["afterglow.io/gpu"] = "true"
+    # Match Afterglow GPU quota/inventory tokens before checking uniqueness.
+    aliases = {re.sub(r"[^A-Z0-9]", "", alias.upper()) for alias in _gpu_alias_counts(extra_specs)}
+    if len(aliases) == 1:
+        gpu_type = next(iter(aliases))
+        if gpu_type and len(gpu_type) <= 63:
+            effective["afterglow.io/gpu-type"] = gpu_type
+            # Kubernetes' conventional user label: derive it, but keep an explicit nodegroup value.
+            effective.setdefault("accelerator", gpu_type)
+    return effective
 
 
 def agent_args(args: list[str]) -> list[str]:
     """Return GPU agent arguments without mutating the caller's list."""
-    return [*args, "--default-runtime=nvidia", "--node-label=afterglow.io/gpu=true"]
+    result = [*args, "--default-runtime=nvidia"]
+    if "--node-label=afterglow.io/gpu=true" not in result:
+        result.append("--node-label=afterglow.io/gpu=true")
+    return result
 
 
 def bootstrap_script(os_type: str) -> str:

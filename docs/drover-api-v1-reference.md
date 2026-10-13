@@ -144,9 +144,10 @@ LOG_LEVEL=DEBUG drover-worker
     "allowed_cidrs": ["10.0.0.0/8"],
     "template_id": "template-uuid",
     "master_count": 1,
-    "stampede_enabled": false
+    "stampede_enabled": true
   }
   ```
+- **Stampede 기본값(0.4.13)**: `stampede_enabled`를 생략하면 새 클러스터는 Stampede가 켜진 상태로 생성됩니다. 끄려면 명시적으로 `false`를 보냅니다. 기존 클러스터의 저장된 값은 바꾸지 않습니다. `default-server`와 사용자가 요청한 초기 worker의 `default-agent` 그룹은 자동 축소 대상이 아니며(`stampede_enabled=false`) 자동 증감은 명시적 flavor를 가진 nodegroup에서 수행됩니다. 서버 전역 `stampede_enabled`의 Kolla·TOML 기본값도 `true`이며 운영자는 `false`로 전체를 끌 수 있습니다([요청 schema](../drover/models/schemas.py), [저장](../drover/services/store.py), [default group](../drover/services/nodegroup.py)).
 - **클러스터 네트워크**: `network_id`는 Neutron 외부 네트워크의 ID만 받습니다. 생략하면 관리자 `k3s.default_network` 정책의 외부 네트워크 ID를 조회·재검증합니다. 공유 네트워크라도 외부가 아니면 명시 요청과 기본 정책 모두 사용할 수 없습니다. 명시한 네트워크가 없거나 내부이면 기록 전에 `400`, 기본 정책이 누락·만료되면 `503`, 네트워크 조회 서비스가 불가하면 `503`으로 거부하며 Nova 자동 네트워크 선택으로 우회하지 않습니다. 선택한 ID와 이름은 cluster/job의 `resource_policy_snapshot["k3s.default_network"]`에, ID는 `network_id`에도 저장되고 primary·HA·agent·nodegroup 프로비저닝과 후속 scale에 사용됩니다. [요청 처리](../drover/api/clusters.py), [정책 제약과 조회](../drover/services/resource_policies.py), [정책 스냅샷](../drover/services/resource_policy_store.py), [직접 VM 생성](../drover/services/provisioner.py), [노드그룹 VM 생성](../drover/services/autoscale.py).
 - **응답 (200 OK)**: `text/event-stream` (SSE 스트림)
   - 이벤트 라인 형식 (`K3sProgressMessage`):
@@ -203,7 +204,7 @@ LOG_LEVEL=DEBUG drover-worker
 - **응답 (204 No Content)**
 
 ### `POST /v1/clusters/{cluster_id}/stampede/enable`
-- **설명**: 클러스터의 Stampede 오토스케일링 모드를 활성화합니다.
+- **설명**: 클러스터의 Stampede 오토스케일링 모드를 활성화합니다. 0.4.13 이후 새 클러스터는 기본적으로 활성화되므로, 이 endpoint는 생성 시 `false`로 끈 클러스터나 이전 클러스터를 다시 켤 때 사용합니다.
 - **선행 조건**: 클러스터 상태가 `ACTIVE`여야 하며, `stampede_enabled=true`인 agent 노드그룹(유효한 flavor_id 및 min_size <= node_count <= max_size)이 최소 1개 이상 존재해야 합니다. 노드그룹 `flavor_id`는 요청 프로젝트 scope의 Nova 조회로 검증하므로 프로젝트에 공유된 private flavor(예: GPU passthrough)도 허용되고, 보이지 않는 flavor는 `422`입니다. `image_id`는 `k3s.server_image` 정책(public/community image)을 따릅니다. 노드그룹 생성·수정(`POST`/`PATCH /v1/clusters/{id}/nodegroups`)도 같은 규칙을 적용합니다.
 - **Resource authority**: active control credential이 없으면 409로 거부합니다(legacy cluster는 먼저 재인가). planner와 job은 credential owner의 현재 scale capability를 재검증하며 `reauthorization_required`/`authority_revoked` 차단은 다른 identity로 우회하지 않습니다.
 - **zero-size 수요 선택**: Pod의 `nodeSelector: {afterglow.io/nodegroup: <nodegroup_id>}` 또는 지원되는 required nodeAffinity가 후보 그룹을 선택하면 native affinity/selector mismatch도 scale-up 수요로 처리합니다. 그룹 label/taint·CPU/RAM/GPU fit 및 min/max를 계속 검사하며 selector 없는 실패, PVC 지연, pinned node와 unsupported constraints를 우회하지 않습니다. ready_count만으로 GPU 성공을 판정하지 말고 Operation `SUCCEEDED`, 실제 `nvidia.com/gpu` allocatable과 GPU Pod 실행을 확인합니다.
@@ -315,6 +316,44 @@ LOG_LEVEL=DEBUG drover-worker
 * **`DELETE /v1/clusters/{cluster_id}/nodegroups/{nodegroup_id}`**: 노드그룹 삭제 (`204 No Content`)
 
 생성·수정은 `ACTIVE` cluster에서만 허용합니다. 삭제는 실패 자원 복구를 위해 `ACTIVE` 또는 `ERROR`에서 기존 `drover:clusters:delete` 권한과 admitted requester delegation으로 durable worker에 큐잉합니다. `204`는 삭제 완료가 아닙니다. default group은 `422`, 다른 lifecycle·active mutation job·Stampede in-flight 충돌은 `409`이며 project ownership, row lock과 정상 VM/boot-volume/Node 확인·drain을 유지합니다. API는 오류 상태나 tracking을 먼저 지우지 않습니다([source](../drover/services/nodegroup.py), [recovery regressions](../tests/test_k3s_nodegroups.py)).
+
+#### GPU 타입 기반 스케줄링
+
+GPU flavor로 만드는 worker는 kubelet 등록 시 다음 label을 자동으로 가집니다. Kubernetes 문서의 `kubectl label nodes <node> accelerator=<type>` 관례를 Drover가 노드 생성 시점에 대신 수행합니다. nodegroup worker와 클러스터 생성 시의 초기 `default-agent` worker 모두 적용됩니다.
+
+| Label | 값 | 비고 |
+|---|---|---|
+| `accelerator` | `<GPU 타입>` (예: `RTX3060LHR`) | 사용자 관례 label. nodegroup `labels`에 `accelerator`를 직접 지정하면 그 값을 유지합니다. |
+| `afterglow.io/gpu-type` | `<GPU 타입>` | Drover 예약 label. 항상 flavor에서 계산하며 사용자 label로 덮어쓸 수 없습니다. |
+| `afterglow.io/gpu` | `true` | GPU flavor worker에만 등록합니다. |
+
+GPU 타입은 Nova flavor `pci_passthrough:alias`의 GPU alias를 Afterglow GPU quota·admission과 같은 규칙으로 정규화한 값입니다. 영문 대문자와 숫자만 남기므로 `RTX-3060-LHR:1,GA106-audio:1`은 `RTX3060LHR`입니다. audio·NIC 등 비-GPU function은 제외하고, 정규화 결과가 같은 alias의 반복은 한 타입으로 봅니다. 서로 다른 GPU 타입이 섞였거나 63자를 넘거나 정규화 결과가 비면 타입 label을 만들지 않으며, 해당 타입을 요구한 Pod도 다른 GPU 타입으로 fallback하지 않습니다. CPU flavor에는 GPU label을 붙이지 않습니다. 기존 Node는 patch하지 않으므로 이 label은 0.4.13 적용 후 생성되는 worker부터 등록됩니다([label authority](../drover/services/gpu.py), [nodegroup worker](../drover/services/autoscale.py), [초기 worker](../drover/services/provisioner.py)).
+
+새 GPU worker가 자동으로 생기려면 클러스터 Stampede와 GPU agent nodegroup의 Stampede가 켜져 있어야 합니다. 0.4.13부터 둘 다 기본값이며, `stampede_enabled`를 생략하고 명시적 GPU `flavor_id`로 만든 nodegroup은 자동으로 Stampede 대상이 됩니다(flavor가 없는 nodegroup은 대상이 아닙니다). Pod의 `metadata.labels`는 식별용일 뿐 스케줄링이나 GPU 자원 요청이 아닙니다. **배치 조건은 `spec.nodeSelector`, GPU 장치 요청은 `resources`의 `nvidia.com/gpu`**로 지정합니다.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-type-check
+spec:
+  runtimeClassName: nvidia
+  restartPolicy: Never
+  nodeSelector:
+    accelerator: RTX3060LHR
+  containers:
+    - name: cuda
+      image: nvidia/cuda:12.4.1-base-ubuntu22.04
+      command: ["nvidia-smi"]
+      resources:
+        requests:
+          nvidia.com/gpu: "1"
+        limits:
+          nvidia.com/gpu: "1"
+```
+
+맞는 Ready GPU 노드가 없으면 Pod는 Pending이 되고, planner는 같은 flavor-derived label로 zero-size 그룹까지 후보를 고릅니다. `nodeSelector`와 지원되는 required nodeAffinity를 모두 적용하며 타입·GPU 수·CPU/RAM·taint 조건을 모두 만족해야 증설합니다. planner는 선택한 flavor ID와 extra specs를 durable job에 함께 전달하고, 예약 row lock 안에서 flavor ID가 바뀌었으면 오래된 GPU 타입 snapshot을 사용하지 않습니다. Worker는 같은 snapshot으로 kubelet label을 등록하고, 수동 nodegroup·초기 worker 생성은 현재 project-scoped Nova flavor를 조회합니다. Node Ready 및 실제 `nvidia.com/gpu` allocatable 대기, admission, cooldown/min/max와 drain guard는 그대로입니다([planner](../drover/services/stampede.py), [durable reservation/dispatch](../drover/services/jobs.py), [planner regressions](../tests/test_k3s_stampede.py), [rendered bootstrap regressions](../tests/test_provisioner_agents.py), [stale-flavor fence](../tests/test_jobs.py)).
+
 
 ### 4.2 클러스터 템플릿 API (`/v1/cluster-templates`)
 * **`GET /v1/cluster-templates`**: 공개 및 본인 소유 클러스터 템플릿 목록 조회 (`list[K3sClusterTemplateInfo]`)

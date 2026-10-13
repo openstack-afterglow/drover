@@ -192,7 +192,7 @@ def _cluster_security_group_rules(
 async def provision_agents(project_id: str, cluster_id: str, server_ip: str, node_token: str) -> None:
     """에이전트 VM을 모두 생성하고 클러스터 상태를 ACTIVE로 전환한다."""
     from drover.config import get_settings
-    from drover.services import cinder, execution, inventory, keystone, nova
+    from drover.services import cinder, execution, gpu, inventory, keystone, nodegroup, nova
     from drover.services import cloudinit as k3s_cloudinit
 
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
@@ -235,6 +235,18 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
         _logger.error("k3s agent provision: cannot get OpenStack connection: %s", e)
         raise
     try:
+        flavors = await asyncio.to_thread(nova.list_flavors, conn)
+        selected = next((flavor for flavor in flavors if flavor.id == agent_flavor_id), None)
+        if selected is None:
+            raise RuntimeError("Selected agent flavor is unavailable")
+        extra_specs = selected.extra_specs or {}
+        gpu_required = gpu.flavor_gpu_count(extra_specs) > 0
+        if gpu_required:
+            await gpu.ensure_device_plugin(cluster_id)
+        default_agent_id = await nodegroup.get_default_agent_nodegroup_id(cluster_id)
+        agent_labels = gpu.node_labels({}, extra_specs, gpu_required=gpu_required)
+        if default_agent_id:
+            agent_labels.update({"afterglow.io/nodegroup": default_agent_id, "afterglow.io/stampede": "true"})
         agent_vm_ids: list[str] = []
         failed_count = 0
         new_agent_entries: list[dict] = []
@@ -242,6 +254,10 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
         for _i in range(agent_count):
             agent_name = f"{cluster_name}-{_rand_suffix()}"
             try:
+                if gpu_required:
+                    from drover.services import afterglow
+
+                    await afterglow.require_gpu_admission(project_id, agent_flavor_id, settings=s)
                 vol_metadata = inventory.build_drover_metadata(cluster_id, None, "volume")
                 vol = await asyncio.to_thread(
                     cinder.create_volume_from_image,
@@ -264,6 +280,7 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
 
                 if not _agent_args and cluster.get("occm_enabled"):
                     _agent_args = ["--kubelet-arg=cloud-provider=external"]
+                _agent_args.extend(f"--node-label={key}={value}" for key, value in agent_labels.items())
                 agent_userdata = k3s_cloudinit.generate_agent_userdata(
                     cluster_name=cluster_name,
                     k3s_version=k3s_version,
@@ -273,6 +290,7 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
                     primary_network_id=network_id,
                     extra_agent_args=_agent_args,
                     os_type=os_type,
+                    gpu_required=gpu_required,
                 )
                 agent_vm_metadata = inventory.build_drover_metadata(cluster_id, None, "server")
                 agent_vm_metadata.update(
@@ -307,11 +325,8 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
 
         if new_agent_entries:
             await k3s_cluster.add_agent_vms(cluster_id, new_agent_entries)
-            from drover.services import nodegroup as k3s_nodegroup
-
-            default_agent_id = await k3s_nodegroup.get_default_agent_nodegroup_id(cluster_id)
             if default_agent_id:
-                await k3s_nodegroup.add_nodegroup_vms(default_agent_id, cluster_id, new_agent_entries)
+                await nodegroup.add_nodegroup_vms(default_agent_id, cluster_id, new_agent_entries)
         reason = f"에이전트 {failed_count}개 생성 실패" if failed_count else ""
         await k3s_cluster.update_cluster_status(project_id, cluster_id, "ACTIVE", reason, agent_vm_ids=agent_vm_ids)
         _logger.info(

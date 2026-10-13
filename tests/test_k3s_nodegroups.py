@@ -305,6 +305,62 @@ async def test_create_default_nodegroups_adds_server_and_agent_rows():
     assert added[1].flavor_id == "agent-flavor"
     assert added[0].image_id == "server-image"
     assert added[1].image_id == "agent-image"
+    assert [row.stampede_enabled for row in added] == [False, False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested,expected", [(None, True), (False, False)])
+async def test_new_cluster_defaults_on_without_autoscaling_requested_initial_workers(monkeypatch, requested, expected):
+    from drover.services import store
+
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = []
+    session = AsyncMock()
+    session.__aenter__.return_value = session
+    session.execute.return_value = result
+    session.add = MagicMock()
+    monkeypatch.setattr(store, "is_db_available", lambda: True)
+    monkeypatch.setattr(store, "get_session_factory", lambda: lambda: session)
+    data = {"name": "new-cluster", "agent_flavor_id": "agent-flavor", "agent_count": 1}
+    if requested is not None:
+        data["stampede_enabled"] = requested
+
+    await store.create_cluster_record("test-project-123", _CLUSTER_ID, data)
+
+    cluster, server, agent = [call.args[0] for call in session.add.call_args_list]
+    assert cluster.stampede_enabled is expected
+    assert (server.stampede_enabled, agent.stampede_enabled) == (False, False)
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["api", "service"])
+@pytest.mark.parametrize("requested,flavor_id,expected", [
+    (None, "flavor-cpu", True), (None, None, False), (False, "flavor-cpu", False), (True, "flavor-cpu", True),
+])
+async def test_new_nodegroup_autoscaling_defaults_on_only_for_explicit_flavor(
+    client, monkeypatch, source, requested, flavor_id, expected,
+):
+    from types import SimpleNamespace
+
+    from drover.services import nodegroup
+
+    session = _service_session(monkeypatch, [SimpleNamespace(status="ACTIVE", project_id="test-project-123"), None, None])
+    data = {"name": "workers", "node_count": 0, "flavor_id": flavor_id}
+    if requested is not None:
+        data["stampede_enabled"] = requested
+    if source == "api":
+        with _cluster_access_ok():
+            response = await client.post(f"/v1/clusters/{_CLUSTER_ID}/nodegroups", json=data)
+        assert response.status_code == 201
+        result = response.json()
+    else:
+        result = await nodegroup.create_nodegroup(_CLUSTER_ID, data, project_id="test-project-123")
+
+    stored = session.add.call_args.args[0]
+    assert stored.stampede_enabled is expected
+    assert result["stampede_enabled"] is expected
+    session.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -50,6 +50,12 @@ def isolated_toml_settings(tmp_path, monkeypatch):
             config.load_raw_toml.cache_clear()
 
 
+@pytest.mark.parametrize("toml,expected", [("[drover]\n", True), ("[drover]\nstampede_enabled = false\n", False)])
+def test_stampede_gate_defaults_on_and_keeps_operator_opt_out(isolated_toml_settings, toml, expected):
+    isolated_toml_settings.write_text(toml, encoding="utf-8")
+
+    assert config.get_settings().drover_stampede_enabled is expected
+
 
 
 def test_get_settings_keeps_explicit_empty_auth_endpoint(isolated_toml_settings):

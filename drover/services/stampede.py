@@ -13,6 +13,7 @@ import time
 import uuid
 
 from drover.config import get_settings
+from drover.services import gpu
 
 _logger = logging.getLogger("drover.stampede")
 
@@ -122,40 +123,6 @@ def _is_pvc_issue(pod: dict) -> bool:
 
 
 
-_NON_GPU_PCI_ALIAS_TOKENS = frozenset(
-    {"audio", "crypto", "fpga", "infiniband", "network", "nic", "nvme", "qat", "rdma", "sriov"}
-)
-
-
-def _flavor_gpu_count(extra_specs: dict) -> int:
-    raw = extra_specs.get("gpu_count")
-    if raw is not None:
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            pass
-    alias = extra_specs.get("pci_passthrough:alias", "")
-    total = 0
-    for entry in str(alias).split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        if ":" in entry:
-            gpu_alias, _, count_text = entry.rpartition(":")
-            try:
-                count = int(count_text.strip())
-                if count <= 0:
-                    count = 1
-            except ValueError:
-                count = 1
-        else:
-            gpu_alias = entry
-            count = 1
-        alias_tokens = {token for token in re.split(r"[^a-z0-9]+", gpu_alias.lower()) if token}
-        if alias_tokens & _NON_GPU_PCI_ALIAS_TOKENS:
-            continue
-        total += count
-    return total
 
 
 def _fits_capacity(req: dict, cap: dict) -> bool:
@@ -300,10 +267,16 @@ def _assign_pending_pods(
         candidates = []
         for ng in nodegroups:
             flavor = flavors_by_id.get(ng.get("flavor_id"))
-            template = {"labels": {"afterglow.io/nodegroup": ng["id"], "afterglow.io/stampede": "true", **(ng.get("labels") or {})}, "taints": ng.get("taints") or []}
-            if flavor and flavor.get("gpu", 0) > 0:
-                template["labels"]["afterglow.io/gpu"] = "true"
-            if flavor and _node_matches_nodegroup(pod, template) and _fits_capacity(_requests(pod), _flavor_capacity(flavor, headroom_factor)):
+            if not flavor:
+                continue
+            template = {
+                "labels": gpu.node_labels(
+                    {**(ng.get("labels") or {}), "afterglow.io/nodegroup": ng["id"], "afterglow.io/stampede": "true"},
+                    flavor.get("extra_specs") or {}, gpu_required=flavor.get("gpu", 0) > 0,
+                ),
+                "taints": ng.get("taints") or [],
+            }
+            if _node_matches_nodegroup(pod, template) and _fits_capacity(_requests(pod), _flavor_capacity(flavor, headroom_factor)):
                 candidates.append((ng, flavor))
         candidates.sort(key=lambda item: (item[0].get("node_count", 0) >= item[0].get("max_size", 5), item[1].get("gpu", 0), item[1].get("vcpus_m", 0), item[1].get("ram_bytes", 0)))
         if candidates:
@@ -319,7 +292,7 @@ async def _get_available_flavors(project_id: str) -> list[dict]:
     async with execution.connection(project_id) as conn:
         raw = await asyncio.to_thread(nova.list_flavors, conn)
     return [{"id": flavor.id, "name": flavor.name, "vcpus_m": int(flavor.vcpus or 0) * 1000,
-             "ram_bytes": int(flavor.ram or 0) * 1024 * 1024, "gpu": _flavor_gpu_count(flavor.extra_specs or {}),
+             "ram_bytes": int(flavor.ram or 0) * 1024 * 1024, "gpu": gpu.flavor_gpu_count(flavor.extra_specs or {}),
              "extra_specs": flavor.extra_specs or {}} for flavor in raw]
 
 
@@ -389,8 +362,10 @@ async def _scale_up_nodegroup(
         cluster_id, project_id, ng_id, direction="up", requested_count=min(needed, room),
         expected_node_count=nodegroup.get("node_count", 0),
         payload={
+            "flavor_id": flavor["id"],
             "gpu_required": gpu_required,
             "gpu_count": max(1, flavor.get("gpu", 0)) if gpu_required else 0,
+            "flavor_extra_specs": flavor.get("extra_specs") or {},
             "provisioning_key_prefix": f"stampede-{cluster_id}-{ng_id}-{uuid.uuid4().hex}",
             "triggering_metric": "pending_pods" if pending_pods else "min_size",
         },
@@ -410,6 +385,7 @@ async def _provision_and_track(
     gpu_required: bool = False, provisioning_key_prefix: str | None = None,
     operation_id: str | None = None, triggering_metric: str | dict | None = None,
     gpu_count: int = 0,
+    flavor_extra_specs: dict | None = None,
 ) -> None:
     """A durable job succeeds only once its workers and GPU devices are schedulable."""
     from drover.services import autoscale, kube, nodegroup, operations
@@ -419,6 +395,7 @@ async def _provision_and_track(
         flavor_id=flavor_id, image_id=image_id, labels=labels, taints=taints,
         provisioning_key_prefix=provisioning_key_prefix,
         gpu_required=gpu_required,
+        flavor_extra_specs=flavor_extra_specs,
     )
     if gpu_required:
         from drover.services.gpu import ensure_device_plugin

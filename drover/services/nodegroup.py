@@ -175,6 +175,7 @@ async def create_default_nodegroups(
                 flavor_id=server_flavor_id,
                 image_id=server_image_id,
                 is_default=True,
+                stampede_enabled=False,
                 min_size=1,
                 max_size=1,
             )
@@ -190,6 +191,8 @@ async def create_default_nodegroups(
                 flavor_id=agent_flavor_id,
                 image_id=agent_image_id,
                 is_default=True,
+                # Cluster-level default-on never autoscales the requested initial workers.
+                stampede_enabled=False,
                 min_size=0,
                 max_size=max(5, int(agent_count or 0)),
             )
@@ -227,7 +230,8 @@ async def create_nodegroup(
             raise ValueError("커스텀 server 노드그룹은 아직 지원되지 않습니다.")
         node_count = int(data.get("node_count", 0))
         flavor_id = data.get("flavor_id") or None
-        stampede_enabled = bool(data.get("stampede_enabled", False))
+        requested_stampede = data.get("stampede_enabled")
+        stampede_enabled = bool(flavor_id) if requested_stampede is None else bool(requested_stampede)
         min_size = int(data.get("min_size", 0))
         max_size = int(data.get("max_size", 5))
         _validate_scalable_invariants(role, node_count, flavor_id, stampede_enabled, min_size, max_size)

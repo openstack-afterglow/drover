@@ -85,7 +85,7 @@ class CreateK3sClusterRequest(BaseModel):
     allowed_cidrs: list[str] | None = Field(default=None, max_length=20)
     template_id: str | None = None
     master_count: int = Field(default=1)
-    stampede_enabled: bool = False
+    stampede_enabled: bool = True
 
     @field_validator("master_count")
     @classmethod
@@ -455,7 +455,8 @@ class CreateK3sNodegroupRequest(BaseModel):
     image_id: str | None = None
     labels: dict[str, str] | None = None
     taints: list[dict] | None = None
-    stampede_enabled: bool = False
+    # Omitted: enabled for an explicit-flavor agent group, never for a flavor-less placeholder.
+    stampede_enabled: bool | None = None
     min_size: int = Field(default=0, ge=0)
     max_size: int = Field(default=5, ge=0)
 

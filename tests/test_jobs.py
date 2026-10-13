@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy.dialects import mysql
 
-from drover.models.orm import DroverJob, DroverOperation, DroverOperationEvent, K3sCluster
+from drover.models.orm import DroverJob, DroverOperation, DroverOperationEvent, K3sCluster, K3sNodegroup
 from drover.services import jobs
 
 pytestmark = pytest.mark.asyncio
@@ -93,6 +93,27 @@ async def test_enqueue_rejects_unknown_job_kind(monkeypatch):
     monkeypatch.setattr(jobs, "get_session_factory", lambda: None)
     with pytest.raises(ValueError, match="unsupported Drover job kind"):
         await jobs.enqueue_job("cluster-1", "project-1", "unknown", {})
+
+
+async def test_stampede_flavor_change_rejects_stale_gpu_identity_before_reservation(monkeypatch):
+    cluster = SimpleNamespace(project_id="project-1", deleted_at=None, status="ACTIVE", stampede_enabled=True)
+    group = SimpleNamespace(cluster_id="cluster-1", deleted_at=None, role="agent", stampede_enabled=True,
+                            flavor_id="new-gpu-flavor", node_count=0, min_size=0, max_size=3, image_id=None,
+                            labels={}, taints=[], stampede_state={})
+    session = _Session(objects={(K3sCluster, "cluster-1"): cluster, (K3sNodegroup, "group-1"): group})
+    session.scalar = AsyncMock(return_value=None)
+    monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+    monkeypatch.setattr("drover.services.operations.create_or_get_operation", AsyncMock(return_value=SimpleNamespace(id="op")))
+    monkeypatch.setattr(jobs, "enqueue_job", AsyncMock(return_value="job"))
+    reservation = await jobs.enqueue_stampede_job(
+        "cluster-1", "project-1", "group-1", direction="up", requested_count=1, expected_node_count=0,
+        payload={"flavor_id": "old-gpu-flavor", "gpu_required": True,
+                 "flavor_extra_specs": {"gpu_count": "1", "gpu_type": "RTX-3060-LHR"}},
+    )
+    assert reservation is None
+    assert group.node_count == 0
+    assert group.stampede_state == {}
+    assert session.added == []
 
 
 async def test_old_worker_cannot_complete_reclaimed_attempt(monkeypatch):

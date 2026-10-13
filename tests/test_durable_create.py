@@ -225,17 +225,22 @@ async def _parse_sse(response):
 
 
 @pytest.mark.asyncio
-async def test_queue_only_behavior(async_client, store):
+@pytest.mark.parametrize("stampede_enabled,expected", [(None, True), (False, False), (True, True)])
+@pytest.mark.parametrize("agent_count", [0, 1])
+async def test_queue_only_behavior(async_client, store, stampede_enabled, expected, agent_count):
     """create_k3s_cluster_async queues the job without executing OpenStack calls inside the request."""
     mock_nova = patch("drover.services.nova.create_server", MagicMock())
     mock_neutron = patch("drover.services.neutron.create_security_group", MagicMock())
     mock_cinder = patch("drover.services.cinder.create_volume_from_image", MagicMock())
+    body = {"name": "queue-only-cluster", "agent_count": agent_count}
+    if stampede_enabled is not None:
+        body["stampede_enabled"] = stampede_enabled
 
     with mock_nova as nova_mock, mock_neutron as neutron_mock, mock_cinder as cinder_mock:
         async with async_client.stream(
             "POST",
             "/v1/clusters/async",
-            json={"name": "queue-only-cluster", "agent_count": 1},
+            json=body,
         ) as response:
             assert response.status_code == 200
             events = await _parse_sse(response)
@@ -244,6 +249,12 @@ async def test_queue_only_behavior(async_client, store):
     nova_mock.assert_not_called()
     neutron_mock.assert_not_called()
     cinder_mock.assert_not_called()
+    cluster = next(iter(store.clusters.values()))
+    job = next(iter(store.jobs.values())).payload_json
+    for data in (cluster, job):
+        assert data["stampede_enabled"] is expected
+        assert data["agent_flavor_id"] == "flv-agt-1"
+        assert data["agent_count"] == agent_count
 
     assert len(events) >= 1
     assert "operation_id" in events[0]

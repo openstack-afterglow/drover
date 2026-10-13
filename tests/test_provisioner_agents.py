@@ -1,15 +1,67 @@
 """Provisioner guest rendering, persistence, and scaling-token contracts."""
 
+import base64
+import gzip
+import json
+import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 from openstack import exceptions as os_exceptions
 
 from drover.config import Settings
-from drover.services import autoscale, provisioner
+from drover.services import autoscale, cloudinit, provisioner
 
 pytestmark = pytest.mark.asyncio
+
+_GPU_EXTRA_SPECS = {"pci_passthrough:alias": "RTX-3060-LHR:1,GA106-audio:1"}
+_WORKER_ROUTES = ["manual", "inspect-flavor", "manual-job", "stampede-job"]
+
+
+def _worker_bootstrap(create_server: MagicMock, os_type: str) -> tuple[str, list[str], dict[str, list[str]]]:
+    """Inspect the join script Nova actually receives, not renderer inputs."""
+    create_server.assert_called_once()
+    kwargs = create_server.call_args.kwargs
+    assert kwargs["config_drive"] is (os_type == "fcos")
+    decoded = base64.b64decode(kwargs["userdata"])
+    if os_type == "fcos":
+        ignition = json.loads(decoded)
+        join_file, = [entry for entry in ignition["storage"]["files"] if entry["path"] == "/opt/k3s/agent-join.sh"]
+        contents = join_file["contents"]
+        prefix, encoded = contents["source"].split(",", 1)
+        assert prefix == "data:;base64"
+        script_bytes = base64.b64decode(encoded)
+        if contents.get("compression") == "gzip":
+            script_bytes = gzip.decompress(script_bytes)
+        script = script_bytes.decode()
+    else:
+        config = yaml.safe_load(gzip.decompress(decoded))
+        join_file, = [entry for entry in config["write_files"] if entry["path"] == "/opt/k3s/agent-join.sh"]
+        script = join_file["content"]
+
+    assignment, = [line.strip() for line in script.splitlines() if line.strip().startswith("_EXEC_ARGS=")]
+    value = assignment.removeprefix("_EXEC_ARGS=")
+    assert value.startswith('"') and value.endswith('"')
+    args = shlex.split(value[1:-1])
+    assert args[0] == "agent"
+    assert 'INSTALL_K3S_EXEC="${_EXEC_ARGS}"' in script
+    labels: dict[str, list[str]] = {}
+    for arg in args[1:]:
+        if arg.startswith("--node-label="):
+            key, value = arg.removeprefix("--node-label=").split("=", 1)
+            labels.setdefault(key, []).append(value)
+    return script, args, labels
+
+
+def _assert_gpu_bootstrap(script: str, args: list[str], labels: dict[str, list[str]]) -> None:
+    assert labels["afterglow.io/gpu"] == ["true"]
+    assert labels["afterglow.io/gpu-type"] == ["RTX3060LHR"]
+    assert labels["accelerator"] == ["RTX3060LHR"]
+    assert args.count("--default-runtime=nvidia") == 1
+    assert "timeout 30 nvidia-smi -L" in script
+    assert "timeout 30 nvidia-container-cli info" in script
 
 
 def _cluster() -> dict:
@@ -33,11 +85,13 @@ def _cluster() -> dict:
     }
 
 
-async def test_provision_agents_persists_created_vm_ids() -> None:
+@pytest.mark.parametrize("os_type", ["ubuntu", "fcos"])
+@pytest.mark.parametrize("extra_specs", [{}, _GPU_EXTRA_SPECS], ids=["cpu", "gpu"])
+async def test_provision_agents_persists_created_vm_ids(os_type, extra_specs) -> None:
     cluster = _cluster()
+    cluster["os_type"] = os_type
     volume = SimpleNamespace(id="volume-1")
     server = SimpleNamespace(id="server-1")
-    userdata = SimpleNamespace(data="cloud-init", config_drive=False)
     connection = MagicMock()
 
     with (
@@ -47,10 +101,14 @@ async def test_provision_agents_persists_created_vm_ids() -> None:
         patch(
             "drover.services.plugins.with_resource_policy_snapshot", side_effect=lambda settings, _snapshot: settings
         ),
-        patch("drover.services.plugins.aggregate_agent_args", return_value=[]),
+        patch("drover.services.plugins.aggregate_agent_args", return_value=["--node-label=team=research"]),
         patch("drover.services.cinder.create_volume_from_image", return_value=volume),
-        patch("drover.services.cloudinit.generate_agent_userdata", return_value=userdata),
-        patch("drover.services.nova.create_server", return_value=server),
+        patch("drover.services.nova.list_flavors", return_value=[
+            SimpleNamespace(id="flavor-1", extra_specs=extra_specs),
+        ]) as list_flavors,
+        patch("drover.services.gpu.ensure_device_plugin", new=AsyncMock()) as plugin,
+        patch("drover.services.afterglow.require_gpu_admission", new=AsyncMock()),
+        patch("drover.services.nova.create_server", return_value=server) as create_server,
         patch("drover.services.inventory.record_resource", new=AsyncMock()),
         patch("drover.services.provisioner.k3s_cluster.add_agent_vms", new=AsyncMock()) as add_agent_vms,
         patch("drover.services.nodegroup.get_default_agent_nodegroup_id", new=AsyncMock(return_value="nodegroup-1")),
@@ -63,6 +121,19 @@ async def test_provision_agents_persists_created_vm_ids() -> None:
     add_agent_vms.assert_awaited_once_with("cluster-1", expected_entries)
     add_nodegroup_vms.assert_awaited_once_with("nodegroup-1", "cluster-1", expected_entries)
     assert update_status.await_args.kwargs["agent_vm_ids"] == ["server-1"]
+    list_flavors.assert_called_once_with(connection)
+    script, args, labels = _worker_bootstrap(create_server, os_type)
+    assert labels["afterglow.io/nodegroup"] == ["nodegroup-1"]
+    assert labels["team"] == ["research"]
+    if extra_specs:
+        plugin.assert_awaited_once_with("cluster-1")
+        _assert_gpu_bootstrap(script, args, labels)
+    else:
+        plugin.assert_not_awaited()
+        assert "afterglow.io/gpu" not in labels
+        assert "afterglow.io/gpu-type" not in labels
+        assert "accelerator" not in labels
+
 
 
 async def test_provision_agents_reuses_persisted_ssh_key() -> None:
@@ -79,6 +150,8 @@ async def test_provision_agents_reuses_persisted_ssh_key() -> None:
         patch("drover.services.plugins.with_resource_policy_snapshot", side_effect=lambda settings, _snapshot: settings),
         patch("drover.services.plugins.aggregate_agent_args", return_value=[]),
         patch("drover.services.cinder.create_volume_from_image", return_value=SimpleNamespace(id="volume-1")),
+        patch("drover.services.nova.list_flavors", return_value=[SimpleNamespace(id="flavor-1", extra_specs={})]),
+        patch("drover.services.gpu.ensure_device_plugin", new=AsyncMock()),
         patch("drover.services.cloudinit.generate_agent_userdata", return_value=userdata) as generate_userdata,
         patch("drover.services.nova.create_server", return_value=SimpleNamespace(id="server-1")) as create_server,
         patch("drover.services.inventory.record_resource", new=AsyncMock()),
@@ -348,10 +421,17 @@ def native_nodegroup(monkeypatch):
     server = SimpleNamespace(id="server-1", status="ACTIVE")
     create_volume = MagicMock(return_value=volume)
     create_server = MagicMock(return_value=server)
+    cluster = _cluster()
+    real_generate_agent_userdata = cloudinit.generate_agent_userdata
+    list_flavors = MagicMock(return_value=[SimpleNamespace(id="flavor-1", extra_specs={})])
+    plugin = AsyncMock()
+    monkeypatch.setattr("drover.services.nova.list_flavors", list_flavors)
+    monkeypatch.setattr("drover.services.gpu.ensure_device_plugin", plugin)
+    monkeypatch.setattr("drover.config.get_settings", lambda: SimpleNamespace(drover_boot_volume_size_gb=30))
     monkeypatch.setattr(autoscale, "get_settings", lambda: SimpleNamespace(
         drover_boot_volume_size_gb=30,
     ))
-    monkeypatch.setattr("drover.services.store.get_cluster_admin", AsyncMock(return_value=_cluster()))
+    monkeypatch.setattr("drover.services.store.get_cluster_admin", AsyncMock(return_value=cluster))
     monkeypatch.setattr("drover.services.store.get_cluster_node_token", AsyncMock(return_value="node-token"))
     monkeypatch.setattr("drover.services.execution.open_connection", AsyncMock(return_value=connection))
     monkeypatch.setattr("drover.services.keystone.close_connection", AsyncMock())
@@ -369,6 +449,8 @@ def native_nodegroup(monkeypatch):
     return SimpleNamespace(
         connection=connection, tracked=tracked, add=add, volume=volume, server=server,
         create_volume=create_volume, create_server=create_server,
+        cluster=cluster, real_generate_agent_userdata=real_generate_agent_userdata,
+        list_flavors=list_flavors, plugin=plugin,
     )
 
 
@@ -712,33 +794,166 @@ async def test_nova_create_can_return_resource_for_immediate_tracking(wait):
 
 
 
-async def test_native_gpu_worker_forwards_required_bootstrap(native_nodegroup):
-    with patch("drover.services.cloudinit.generate_agent_userdata", return_value=SimpleNamespace(
-        data="gpu-cloud-init", config_drive=False,
-    )) as userdata:
-        await autoscale.provision_nodegroup_vms(
-            "project-1", "cluster-1", "nodegroup-1", 1, flavor_id="gpu-flavor",
-            provisioning_key_prefix="stampede-gpu-key", gpu_required=True,
-        )
-    assert userdata.call_args.kwargs["gpu_required"] is True
+@pytest.fixture
+def worker_bootstrap(native_nodegroup, monkeypatch):
+    mocks = native_nodegroup
+    monkeypatch.setattr(cloudinit, "generate_agent_userdata", mocks.real_generate_agent_userdata)
+    # These are synthetic readiness observations, not evidence of live devices.
+    mocks.ready = AsyncMock(return_value=True)
+    mocks.gpu_ready = AsyncMock(return_value=True)
+    mocks.vm_status = AsyncMock()
+    mocks.stampede_state = AsyncMock()
+    mocks.stampede_event = AsyncMock()
+    monkeypatch.setattr("drover.services.kube.wait_node_ready", mocks.ready)
+    monkeypatch.setattr("drover.services.kube.wait_node_gpu_allocatable", mocks.gpu_ready)
+    monkeypatch.setattr("drover.services.nodegroup.set_nodegroup_vm_status", mocks.vm_status)
+    monkeypatch.setattr("drover.services.stampede._update_stampede_state", mocks.stampede_state)
+    monkeypatch.setattr("drover.services.stampede._record_stampede_event", mocks.stampede_event)
+    monkeypatch.setattr("drover.services.operations.append_operation_event", AsyncMock())
+    return mocks
 
 
-@pytest.mark.parametrize("key_prefix", [None, "nodegroup-cluster-1-nodegroup-1-operation-1"])
-async def test_manual_gpu_worker_detects_flavor_and_ensures_device_plugin(native_nodegroup, key_prefix):
-    with (
-        patch("drover.services.nova.list_flavors", return_value=[
-            SimpleNamespace(id="gpu-flavor", extra_specs={"gpu_count": "1"}),
-        ]),
-        patch("drover.services.gpu.ensure_device_plugin", new=AsyncMock()) as plugin,
-        patch("drover.services.cloudinit.generate_agent_userdata", return_value=SimpleNamespace(
-            data="gpu-cloud-init", config_drive=False,
-        )) as userdata,
-    ):
-        await autoscale.provision_nodegroup_vms(
-            "project-1", "cluster-1", "nodegroup-1", 1, flavor_id="gpu-flavor",
-            provisioning_key_prefix=key_prefix, inspect_flavor_gpu=True,
+async def _run_worker_route(mocks, monkeypatch, route, extra_specs, gpu_count, accelerator=None):
+    from drover.services import jobs
+
+    labels = {
+        "team": "research",
+        "afterglow.io/gpu": "false",
+        "afterglow.io/gpu-type": "StaleGPU",
+    }
+    if accelerator:
+        labels["accelerator"] = accelerator
+    original_labels = dict(labels)
+    mocks.list_flavors.return_value = [
+        SimpleNamespace(id="other-flavor", extra_specs={"pci_passthrough:alias": "Tesla-T4:1"}),
+        SimpleNamespace(id="flavor-1", extra_specs=dict(extra_specs)),
+    ]
+    if route in {"manual", "inspect-flavor"}:
+        created = await autoscale.provision_nodegroup_vms(
+            "project-1", "cluster-1", "nodegroup-1", 1, flavor_id="flavor-1", labels=labels,
+            provisioning_key_prefix="manual-operation-key" if route == "inspect-flavor" else None,
+            inspect_flavor_gpu=route == "inspect-flavor",
         )
-    plugin.assert_awaited_once_with("cluster-1")
-    assert userdata.call_args.kwargs["gpu_required"] is True
+        assert created == mocks.tracked
+        assert len(created) == 1
+    elif route == "manual-job":
+        group = {
+            "id": "nodegroup-1", "flavor_id": "flavor-1", "labels": labels,
+            "vms": mocks.tracked, "node_count": 0,
+        }
+        monkeypatch.setattr("drover.services.nodegroup.get_nodegroup", AsyncMock(return_value=group))
+        monkeypatch.setattr("drover.services.nodegroup.set_nodegroup_count", AsyncMock())
+        monkeypatch.setattr("drover.services.nova.observe_server", MagicMock(return_value=mocks.server))
+        await jobs._execute_job_direct(
+            "nodegroup_reconcile",
+            {"action": "provision", "nodegroup": group, "add_count": 1, "_delegation_id": "delegation-1"},
+            "cluster-1", "project-1", operation_id="operation-1",
+        )
+    else:
+        assert route == "stampede-job"
+        # The admitted flavor snapshot, not a later catalog result, controls bootstrap.
+        mocks.list_flavors.return_value = [SimpleNamespace(id="flavor-1", extra_specs={})]
+        await jobs._execute_job_direct(
+            "stampede_provision",
+            {
+                "nodegroup_id": "nodegroup-1", "add_count": 1, "flavor_id": "flavor-1",
+                "labels": labels, "gpu_required": gpu_count > 0, "gpu_count": gpu_count,
+                "flavor_extra_specs": dict(extra_specs), "provisioning_key_prefix": "stampede-worker-key",
+            },
+            "cluster-1", "project-1", operation_id="operation-1",
+        )
+        mocks.list_flavors.assert_not_called()
+        node_name = mocks.tracked[0]["name"]
+        mocks.ready.assert_awaited_once()
+        assert mocks.ready.await_args.args == ("cluster-1", node_name)
+        if gpu_count:
+            mocks.gpu_ready.assert_awaited_once_with("cluster-1", node_name, min_gpu=gpu_count, timeout=600.0)
+        else:
+            mocks.gpu_ready.assert_not_awaited()
+        mocks.vm_status.assert_awaited_once_with("nodegroup-1", "server-1", "ACTIVE")
+        assert mocks.stampede_state.await_args.args[2] == {
+            "last_blocked_reason": "", "ready_nodes": [node_name], "failed_nodes": [],
+        }
+
+    if route != "stampede-job":
+        mocks.list_flavors.assert_called_once_with(mocks.connection)
+    if gpu_count:
+        mocks.plugin.assert_awaited_once_with("cluster-1")
+    else:
+        mocks.plugin.assert_not_awaited()
+    mocks.add.assert_awaited_once()
+    assert [vm["vm_id"] for vm in mocks.tracked] == ["server-1"]
+    assert labels == original_labels
+
+
+@pytest.mark.parametrize("os_type", ["ubuntu", "fcos"])
+@pytest.mark.parametrize("route", _WORKER_ROUTES)
+async def test_gpu_worker_registers_canonical_labels_in_real_bootstrap(worker_bootstrap, monkeypatch, os_type, route):
+    mocks = worker_bootstrap
+    mocks.cluster["os_type"] = os_type
+    await _run_worker_route(mocks, monkeypatch, route, _GPU_EXTRA_SPECS, gpu_count=1)
+
+    script, args, labels = _worker_bootstrap(mocks.create_server, os_type)
+    _assert_gpu_bootstrap(script, args, labels)
+    assert labels["team"] == ["research"]
+    assert labels["afterglow.io/nodegroup"] == ["nodegroup-1"]
+    assert labels["afterglow.io/stampede"] == ["true"]
+
+
+@pytest.mark.parametrize("os_type", ["ubuntu", "fcos"])
+@pytest.mark.parametrize("route", ["manual", "stampede-job"])
+async def test_explicit_accelerator_label_is_kept_in_real_bootstrap(worker_bootstrap, monkeypatch, os_type, route):
+    mocks = worker_bootstrap
+    mocks.cluster["os_type"] = os_type
+    await _run_worker_route(mocks, monkeypatch, route, _GPU_EXTRA_SPECS, gpu_count=1, accelerator="custom-a100")
+
+    _, _, labels = _worker_bootstrap(mocks.create_server, os_type)
+    assert labels["accelerator"] == ["custom-a100"]
+    assert labels["afterglow.io/gpu-type"] == ["RTX3060LHR"]
+    assert labels["afterglow.io/gpu"] == ["true"]
+
+
+@pytest.mark.parametrize("os_type", ["ubuntu", "fcos"])
+@pytest.mark.parametrize("route", _WORKER_ROUTES)
+@pytest.mark.parametrize("extra_specs,gpu_count", [
+    ({}, 0),
+    ({"pci_passthrough:alias": "RTX-3060-LHR:1,Tesla-T4:1,GA106-audio:1"}, 2),
+], ids=["cpu", "ambiguous-gpu"])
+async def test_worker_does_not_register_stale_gpu_type(
+    worker_bootstrap, monkeypatch, os_type, route, extra_specs, gpu_count,
+):
+    mocks = worker_bootstrap
+    mocks.cluster["os_type"] = os_type
+    await _run_worker_route(mocks, monkeypatch, route, extra_specs, gpu_count)
+
+    script, args, labels = _worker_bootstrap(mocks.create_server, os_type)
+    assert labels["team"] == ["research"]
+    assert labels["afterglow.io/nodegroup"] == ["nodegroup-1"]
+    assert "afterglow.io/gpu-type" not in labels
+    assert "accelerator" not in labels
+    if gpu_count:
+        assert labels["afterglow.io/gpu"] == ["true"]
+        assert args.count("--default-runtime=nvidia") == 1
+        assert "timeout 30 nvidia-smi -L" in script
+    else:
+        assert "afterglow.io/gpu" not in labels
+        assert "--default-runtime=nvidia" not in args
+        assert "nvidia-smi" not in script
+
+
+@pytest.mark.parametrize("key_prefix", [None, "manual-operation-key"])
+async def test_manual_gpu_plugin_failure_prevents_vm_creation(worker_bootstrap, key_prefix):
+    mocks = worker_bootstrap
+    mocks.list_flavors.return_value = [SimpleNamespace(id="flavor-1", extra_specs=_GPU_EXTRA_SPECS)]
+    mocks.plugin.side_effect = RuntimeError("device-plugin unavailable")
+    with pytest.raises(RuntimeError, match="device-plugin unavailable"):
+        await autoscale.provision_nodegroup_vms(
+            "project-1", "cluster-1", "nodegroup-1", 1, flavor_id="flavor-1",
+            provisioning_key_prefix=key_prefix, inspect_flavor_gpu=key_prefix is not None,
+        )
+    mocks.plugin.assert_awaited_once_with("cluster-1")
+    mocks.create_volume.assert_not_called()
+    mocks.create_server.assert_not_called()
+    mocks.add.assert_not_awaited()
 
 

@@ -116,7 +116,7 @@ async def create_cluster_record(project_id: str, cluster_id: str, data: dict) ->
             template_snapshot=data.get("template_snapshot") or None,
             resource_policy_snapshot=data.get("resource_policy_snapshot") or None,
             master_count=int(data.get("master_count") or 1),
-            stampede_enabled=bool(data.get("stampede_enabled", False)),
+            stampede_enabled=bool(data.get("stampede_enabled", True)),
         )
         session.add(cluster)
         from drover.services import nodegroup as _nodegroups

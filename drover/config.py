@@ -167,7 +167,7 @@ def _load_toml() -> dict:
         "drover_delegated_optional_roles": drover.get("delegated_optional_roles", ["load-balancer_member"]),
         "drover_guest_rollout_timeout_seconds": drover.get("guest_rollout_timeout_seconds", 600),
         "k3s_health_interval": drover.get("k3s_health_interval", drover.get("health_interval", 180)),
-        "drover_stampede_enabled": drover.get("stampede_enabled", False),
+        "drover_stampede_enabled": drover.get("stampede_enabled", True),
         "drover_stampede_interval": drover.get("stampede_interval", 60),
         "drover_stampede_scale_down_threshold": drover.get("stampede_scale_down_threshold", 0.5),
         "drover_stampede_scale_down_window": drover.get("stampede_scale_down_window", 600),
@@ -269,7 +269,7 @@ class Settings(BaseSettings):
     drover_delegated_optional_roles: list[str] = ["load-balancer_member"]
     drover_guest_rollout_timeout_seconds: int = Field(default=600, ge=60, le=3600)
     k3s_health_interval: int = 180
-    drover_stampede_enabled: bool = False
+    drover_stampede_enabled: bool = True
     drover_stampede_interval: int = Field(default=60, ge=10)
     drover_stampede_scale_down_threshold: float = Field(default=0.5, gt=0, le=1)
     drover_stampede_scale_down_window: int = Field(default=600, ge=300, le=600)

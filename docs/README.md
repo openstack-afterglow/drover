@@ -36,7 +36,7 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - Active GPU quota 소유권의 Afterglow 단독 이관에 따른 Drover legacy `gpu_quotas` 테이블의 소스 은퇴(Source Table Retirement) 절차
    - 마이그레이션 데이터 감사(Audit), Afterglow 권한 롤아웃 검증 및 물리적 `DROP TABLE` 전제 조건 체크리스트
 
-5. **[Drover 0.4.0–0.4.12 릴리스 노트](release-0.4.0.md)**
+5. **[Drover 0.4.0–0.4.13 릴리스 노트](release-0.4.0.md)**
    - Pod 요청/Node allocatable 계산, GPU 준비성, 원자적 예약/fencing, 300–600초 안정화 및 drain 축소
    - Afterglow 상태/이벤트 API, 부분 삭제 재시도와 실제 배포 검증 범위
    - 0.4.1 patch: project에 공유된 private(GPU) flavor를 nodegroup flavor로 허용
@@ -52,6 +52,7 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - [0.4.11 ERROR nodegroup cleanup](release-0.4.0.md#0411-patch--error-nodegroup-cleanup-admission): 삭제 전용 lifecycle 복구 admission, requester/project·job/default/in-flight·drain 경계 보존; 실제 all-plugin acceptance와 CPU/GPU 후속 검증 구분
    - [0.4.12 nullable operation event](release-0.4.0.md#0412-patch--nullable-durable-event-messages): 실제 payload-only GPU readiness 이벤트의 null message를 phase/sequence/payload와 보존하며 조회500을 수정; DB rewrite·fake message·이벤트 누락 없이 정상 replay
    - [0.4.12 GPU 자연축소·최종 정리 경계](release-0.4.0.md#native-gpu-natural-scale-in-and-final-cleanup-boundary): VM/Node404 뒤 Cinder `error_deleting` boot volume으로 실패한 축소, force/reset 없는 보존과 정확한 ID 정리·보존 확인
+   - [0.4.13 Stampede 기본 활성화·가속기 label](release-0.4.0.md#0413-patch--default-on-stampede-and-accelerator-labels): 새 클러스터·flavor nodegroup 기본 활성화와 명시적 opt-out, 초기 worker 보존, Afterglow 정규화 GPU 타입의 `accelerator`/`afterglow.io/gpu-type` 자동 label과 Pod selector·resources 예제([사용 예제](drover-api-v1-reference.md#gpu-타입-기반-스케줄링))
 
 6. **[Drover 0.3.0 및 0.3.1 준비 기록](release-0.3.0.md)**
    - 구조화 요청/job 로그, opt-in `LOG_LEVEL=DEBUG`, Redis 5 종료 API 수정과 당시 검증 기록

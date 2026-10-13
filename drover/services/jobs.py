@@ -180,6 +180,7 @@ async def enqueue_stampede_job(
             or not ng.stampede_enabled
             or not ng.flavor_id
             or ng.node_count != expected_node_count
+            or (direction == "up" and payload.get("flavor_id", ng.flavor_id) != ng.flavor_id)
         ):
             return None
         busy = await session.scalar(
@@ -377,6 +378,7 @@ async def _dispatch_job(
             taints=payload.get("taints"),
             gpu_required=bool(payload.get("gpu_required")),
             gpu_count=int(payload.get("gpu_count", 0)),
+            flavor_extra_specs=payload.get("flavor_extra_specs"),
             provisioning_key_prefix=payload.get("provisioning_key_prefix"),
             **kwargs,
         )
