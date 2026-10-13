@@ -55,6 +55,7 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - [0.4.13 Stampede 기본 활성화·가속기 label](release-0.4.0.md#0413-patch--default-on-stampede-and-accelerator-labels): 새 클러스터·flavor nodegroup 기본 활성화와 명시적 opt-out, 초기 worker 보존, Afterglow 정규화 GPU 타입의 `accelerator`/`afterglow.io/gpu-type` 자동 label과 Pod selector·resources 예제([사용 예제](drover-api-v1-reference.md#gpu-타입-기반-스케줄링))
    - [0.4.13 발행·배포·live 검증](release-0.4.0.md#live-default-on-and-accelerator-acceptance): 생략 필드 기본값, GPU0→1 `accelerator` nodeSelector Pod 실행·자동 label, 정리·보존 확인과 taint 없는 GPU worker의 축소 차단 경계([발행·rollout receipt](release-0.4.0.md#tagged-0413-publication-and-canonical-rollout))
    - [0.4.14 GPU API·CSI 호환](release-0.4.0.md#0414-patch--fail-closed-flavor-metadata-and-gpu-csi-tolerations): flavor metadata fail-closed, GPU NoSchedule CSI toleration, API 전용 image/taint·Pod resources/mount/scale-in과 Afterglow 별도 인계
+   - [0.4.14 실제 GPU·CSI·자연축소 receipt](release-0.4.0.md#live-0414-gpu-csi-and-natural-scale-in-acceptance): GPU NoSchedule 격리, RTX3060 실행, native Cinder RWO/Manila NFS RWX I/O, 기존 600초 idle/300초 cooldown의1→0 SUCCEEDED와 실제 VM/Node/volume404·시험 자원 정리·보존
 
 6. **[Drover 0.3.0 및 0.3.1 준비 기록](release-0.3.0.md)**
    - 구조화 요청/job 로그, opt-in `LOG_LEVEL=DEBUG`, Redis 5 종료 API 수정과 당시 검증 기록

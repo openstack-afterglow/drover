@@ -6,7 +6,7 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: 발행·DMS Lab 배포한 `drover==0.4.13` (`2201253`, source pin `c6ecd6d`)은 새 클러스터와 명시적 flavor nodegroup의 Stampede를 기본으로 켜고(명시적 `false`만 opt-out, 초기 default 그룹은 비대상) GPU worker에 Afterglow 정규화 타입의 `accelerator`/`afterglow.io/gpu-type` label을 자동 등록한다. source/full service1413/3skip·SDK114, 실제 local API/Worker amd64/arm64 실행, immutable publication/controller3대 배포와 새 disposable cluster의 생략 필드 기본값·실제 RTX3060 GPU0→1·`accelerator=RTX3060LHR` nodeSelector Pod Running/nvidia-smi/SUCCEEDED를 확인했다. `drover-sdk==0.2.21`, topology·persistence schema·권한 ceiling은 그대로다. [live acceptance](docs/release-0.4.0.md#live-default-on-and-accelerator-acceptance)는 taint 없는 GPU worker의 자연 축소 차단과 정리·보존 경계를 구분한다.
+- 패키지: 발행·DMS Lab 배포한 `drover==0.4.14` (`f7daeec`, source pin `7f9f439`)은 기존 0.4.13의 Stampede 기본 활성화·명시적 false opt-out·GPU 타입 label을 유지하며, flavor metadata 실패를 전파하고 초기 agent를 control-plane 자원 생성 전에 preflight하며 GPU NoSchedule용 CSI node toleration을 좁게 추가한다. Service1430/3skip·SDK114, 실제 local API/Worker amd64/arm64와 발행 amd64 실행, controller3대 source/digest/readiness, 새 fixture의 GPU0→1·RTX3060 실행·Cinder ext4 RWO/Manila NFSv4 RWX I/O·자연1→0 SUCCEEDED 및 VM/Node/volume404·정리/보존을 확인했다. 기존 guest/Node 자동 retrofit, 권한·schema·SDK 버전 변경은 없다. [0.4.14 live receipts](docs/release-0.4.0.md#live-0414-gpu-csi-and-natural-scale-in-acceptance)는 native provider NIC 전제조건과 동시 OpenSearch 작업으로 중단된 c2 LB census, c3 `--skip-tags haproxy` 재개 경계를 구분한다.
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker가 lease를 얻어 OpenStack 작업을 실행한다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 callback token·짧은 상태/헬스 캐시·분산 잠금·stampede 이벤트 같은 보조 저장소다.
@@ -283,8 +283,8 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 {
   "schema_version": 1,
   "source_sha256": "d9d9748e5fdf1c6c9d28f6f6f8fedeccb1e67fd638ba3b184bed321fd59832de",
-  "reviewed_at": "2026-10-13T15:59:02Z",
-  "summary": "0.4.14 source pin alignment: Kolla source mode now pins reviewed GPU metadata/preflight and narrow CSI toleration feature commit 7f9f439; runtime identical to the tested/built source. No new behavior, authority or schema change."
+  "reviewed_at": "2026-10-13T20:13:26Z",
+  "summary": "Documentation-only v0.4.14 post-release receipts: reviewed nova fail-closed resolver, create_cluster_job early metadata preflight and narrow Cinder/Manila/NFS node tolerations at immutable f7daeec/source pin7f9f439. Native 3-controller parity/readiness, GPU0-to1 execution and CSI3 Ready, actual Cinder ext4 RWO/Manila NFSv4 RWX I/O, unchanged600s idle/300s cooldown/min0max1 natural1-to0 SUCCEEDED with VM/Node/volume/share404, owned fixture deletion/temporary ACL restoration and protected baseline/metadata-only KEK preservation verified. Original overlapping OpenSearch/LB census interruption and c3 skip-haproxy resume retained; no blanket non-Drover-isolation claim, retrofit, auth/quota/schema change or new nodegroup-interface API."
 }
 ```
 <!-- architecture-review:end -->
