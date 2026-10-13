@@ -319,7 +319,7 @@ LOG_LEVEL=DEBUG drover-worker
 
 #### GPU 타입 기반 스케줄링
 
-GPU flavor로 만드는 worker는 kubelet 등록 시 다음 label을 자동으로 가집니다. Kubernetes 문서의 `kubectl label nodes <node> accelerator=<type>` 관례를 Drover가 노드 생성 시점에 대신 수행합니다. nodegroup worker와 클러스터 생성 시의 초기 `default-agent` worker 모두 적용됩니다.
+GPU flavor specs를 정상적으로 조회한 worker는 kubelet 등록 시 다음 label을 자동으로 가집니다. Kubernetes 문서의 `kubectl label nodes <node> accelerator=<type>` 관례를 Drover가 노드 생성 시점에 대신 수행합니다. nodegroup worker와 클러스터 생성 시의 초기 `default-agent` worker 모두 적용됩니다.
 
 | Label | 값 | 비고 |
 |---|---|---|
@@ -329,7 +329,11 @@ GPU flavor로 만드는 worker는 kubelet 등록 시 다음 label을 자동으�
 
 GPU 타입은 Nova flavor `pci_passthrough:alias`의 GPU alias를 Afterglow GPU quota·admission과 같은 규칙으로 정규화한 값입니다. 영문 대문자와 숫자만 남기므로 `RTX-3060-LHR:1,GA106-audio:1`은 `RTX3060LHR`입니다. audio·NIC 등 비-GPU function은 제외하고, 정규화 결과가 같은 alias의 반복은 한 타입으로 봅니다. 서로 다른 GPU 타입이 섞였거나 63자를 넘거나 정규화 결과가 비면 타입 label을 만들지 않으며, 해당 타입을 요구한 Pod도 다른 GPU 타입으로 fallback하지 않습니다. CPU flavor에는 GPU label을 붙이지 않습니다. 기존 Node는 patch하지 않으므로 이 label은 0.4.13 적용 후 생성되는 worker부터 등록됩니다([label authority](../drover/services/gpu.py), [nodegroup worker](../drover/services/autoscale.py), [초기 worker](../drover/services/provisioner.py)).
 
+**초기 agent의 조회 실패 경계:** [`provision_agents`](../drover/services/provisioner.py)는 [`nova.list_flavors`](../drover/services/nova.py)가 반환한 `extra_specs`로 GPU 여부를 판정합니다. flavor 목록에 specs가 없고 개별 flavor 상세 조회까지 실패하면 `list_flavors`는 그 예외를 삼키고 빈 specs를 반환합니다. 이 경우 초기 agent는 GPU label·NVIDIA runtime·device plugin·GPU admission 없이 일반 agent 경로로 진행할 수 있습니다. 초기 GPU agent에 대한 보장은 specs를 정상 조회한 경우에 한하며, 이번 live 수락 검증은 초기 GPU agent가 아니라 명시적 GPU nodegroup의 Stampede 증설 경로입니다.
+
 새 GPU worker가 자동으로 생기려면 클러스터 Stampede와 GPU agent nodegroup의 Stampede가 켜져 있어야 합니다. 0.4.13부터 둘 다 기본값이며, `stampede_enabled`를 생략하고 명시적 GPU `flavor_id`로 만든 nodegroup은 자동으로 Stampede 대상이 됩니다(flavor가 없는 nodegroup은 대상이 아닙니다). Pod의 `metadata.labels`는 식별용일 뿐 스케줄링이나 GPU 자원 요청이 아닙니다. **배치 조건은 `spec.nodeSelector`, GPU 장치 요청은 `resources`의 `nvidia.com/gpu`**로 지정합니다.
+
+아래 예제는 live 수락 Deployment에서 사용한 CUDA registry·명령과 동일한 GPU selector/runtime/resources를 사용합니다. 검증된 workload의 kind는 Deployment이며, 이 standalone Pod manifest 자체를 별도로 생성해 검증한 것은 아닙니다.
 
 ```yaml
 apiVersion: v1
@@ -343,8 +347,11 @@ spec:
     accelerator: RTX3060LHR
   containers:
     - name: cuda
-      image: nvidia/cuda:12.4.1-base-ubuntu22.04
-      command: ["nvidia-smi"]
+      image: nvcr.io/nvidia/cuda:12.4.1-base-ubuntu22.04
+      command:
+        - sh
+        - -c
+        - 'set -eu; nvidia-smi --query-gpu=name,uuid,driver_version --format=csv,noheader; echo GPU_EXECUTION_OK; sleep 3600'
       resources:
         requests:
           nvidia.com/gpu: "1"
@@ -354,7 +361,7 @@ spec:
 
 맞는 Ready GPU 노드가 없으면 Pod는 Pending이 되고, planner는 같은 flavor-derived label로 zero-size 그룹까지 후보를 고릅니다. `nodeSelector`와 지원되는 required nodeAffinity를 모두 적용하며 타입·GPU 수·CPU/RAM·taint 조건을 모두 만족해야 증설합니다. planner는 선택한 flavor ID와 extra specs를 durable job에 함께 전달하고, 예약 row lock 안에서 flavor ID가 바뀌었으면 오래된 GPU 타입 snapshot을 사용하지 않습니다. Worker는 같은 snapshot으로 kubelet label을 등록하고, 수동 nodegroup·초기 worker 생성은 현재 project-scoped Nova flavor를 조회합니다. Node Ready 및 실제 `nvidia.com/gpu` allocatable 대기, admission, cooldown/min/max와 drain guard는 그대로입니다([planner](../drover/services/stampede.py), [durable reservation/dispatch](../drover/services/jobs.py), [planner regressions](../tests/test_k3s_stampede.py), [rendered bootstrap regressions](../tests/test_provisioner_agents.py), [stale-flavor fence](../tests/test_jobs.py)).
 
-GPU worker를 GPU workload 전용으로 쓰고 유휴 시 자동 축소되게 하려면 GPU nodegroup에 `taints`(예: `nvidia.com/gpu=true:NoSchedule`)를 지정하고 GPU Pod에 같은 key의 toleration을 함께 넣습니다. Drover는 GPU taint를 자동으로 붙이지 않으므로 taint 없는 GPU worker에는 일반 Pod도 배치될 수 있습니다. 0.4.13 실제 검증에서는 클러스터의 유일한 worker였던 GPU node에 K3s 기본 `traefik`(emptyDir 사용)이 배치되었고, GPU workload를 삭제한 뒤에도 기존 local-storage 보호 규칙이 `protected_pod`로 축소를 막았습니다([live acceptance](release-0.4.0.md#live-default-on-and-accelerator-acceptance)).
+**GPU 격리와 CSI 주의:** Drover는 GPU taint를 자동으로 붙이지 않습니다. taint 없는 GPU worker에는 일반 Pod도 배치될 수 있으며, 0.4.13 live 검증에서는 유일한 worker인 GPU node에 K3s `traefik`(emptyDir 사용)이 배치되어 GPU workload 삭제 후에도 `protected_pod`로 축소가 차단됐습니다([live acceptance](release-0.4.0.md#live-default-on-and-accelerator-acceptance)). CPU/control-plane 노드의 여유 용량을 확보하고 시스템 workload가 그 노드에 배치되도록 구성해야 합니다. **현재 제공되는 [Cinder](../drover/templates/k3s_plugins/cinder_csi/manifests.yaml.j2), [Manila](../drover/templates/k3s_plugins/manila_csi/manifests.yaml.j2), [NFS](../drover/templates/k3s_plugins/manila_csi/nfs_csi.yaml.j2) CSI node DaemonSet에는 사용자 GPU `NoSchedule` taint toleration이 없습니다.** 따라서 GPU Pod에만 toleration을 추가하고 GPU nodegroup에 `nvidia.com/gpu=true:NoSchedule`을 적용하는 것을 일반 해결책으로 권고하지 않습니다. CSI plugin의 matching toleration과 실제 볼륨 mount를 확인하기 전에는 그런 taint를 적용하지 마십시오. 이번 작업은 CSI toleration·자동 taint·drain 보호 규칙을 변경하지 않았고, tainted GPU 노드의 CSI mount나 자연 축소는 live-verified가 아닙니다.
 
 
 ### 4.2 클러스터 템플릿 API (`/v1/cluster-templates`)
