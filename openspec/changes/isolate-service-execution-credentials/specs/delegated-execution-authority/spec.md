@@ -97,5 +97,5 @@ Workers sharing Drover's Redis and MariaDB SHALL register independent Redis-serv
 - **THEN** the SQL job is not automatically replayed, existing operation/caller/resource authority remains required, and operators inspect durable status and provider inventory rather than blindly retrying
 
 
-**Integration boundary (0.4.15):** The dated results above qualify the preserved original WIP only, not the latest-dev integration. This integration has not run tests, lint, builds, architecture stamping, native smoke or deployment; the parent owns those gates. Latest native role-inference, Sentinel and GPU/plugin protections are retained.
+**Integration boundary (0.4.15, outcome updated 2026-10-14):** The dated results above qualify the preserved original WIP only, not the latest-dev integration. Subsequent qualification and rollout are recorded separately in [0.4.15 release notes](../../../../../docs/release-0.4.0.md#0415-patch--latest-dev-wip-integration-and-distributed-worker-cutover): source `314c7a6a` + pin `977a1cad`, exact-SHA CI and tag Release/Docker success, and completed DMS Lab whole-cohort cutover with pinned replicas/readiness. This does not establish a new guest/credential-rotation or Sentinel failover acceptance run. Latest native role-inference, Sentinel and GPU/plugin protections are retained.
 

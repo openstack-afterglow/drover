@@ -17,7 +17,7 @@ python3 scripts/check_architecture.py
 
 The root `drover` wheel owns the Python package and the Kolla-Ansible role as wheel shared data. Installing the wheel places the role at `share/kolla-ansible/ansible/roles/drover` under the installation prefix; it does not install Kolla-Ansible or service runtime dependencies.
 
-**Prepared 0.4.15 candidate (not tested, built or deployed here):** latest-dev native provisioning/credential protections plus distributed periodic worker ownership, SQL mutation non-replay/drain and fail-closed SQL inventory. Registry/package metadata is 0.4.15; immutable source-build SHA awaits the parent’s corrected-source commit. Stop/drain every old worker before the new cohort; mixed old/new SQL consumers are unsafe. See [candidate gates and prerequisites](docs/release-0.4.0.md#0415-patch--latest-dev-wip-integration-and-distributed-worker-cutover).
+**0.4.15 published and deployed to DMS Lab (2026-10-14):** latest-dev native provisioning/credential protections plus distributed periodic worker ownership, SQL mutation non-replay/drain and fail-closed SQL inventory. Source `314c7a6a` is pinned by release-metadata commit `977a1cad`; exact-SHA CI and tag `v0.4.15` Release/Docker workflows succeeded. All 3 APIs and 3 workers cut over to pinned amd64 digests with 0 restarts; readiness returned 200 on all three listeners and publicly. Stop/drain every old worker before the new cohort; mixed old/new SQL consumers remain unsafe. See [qualification, publication and production receipts](docs/release-0.4.0.md#0415-patch--latest-dev-wip-integration-and-distributed-worker-cutover), including the read-only Valkey replica observation and evidence limits.
 
 
 Use the `service` extra to run the API, worker, or migration entry points locally:
