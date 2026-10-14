@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from drover.config import get_settings
 from drover.services.execution import AuthorityRevoked, ExecutionAuthorityUnavailable, OperationAuthority
+from drover.services.worker_ownership import checkpoint, checkpoint_sync, run_sync
 
 _logger = logging.getLogger("drover.delegation")
 
@@ -518,15 +519,19 @@ def _delete_trust_with_trust_token_sync(trust_id: str, trustee_user_id: str) -> 
     from keystoneclient.v3 import client as ks_client
 
     from drover import auth
+    from drover.services.execution_safety import install_session_guard
 
     settings = get_settings()
     plugin = v3.Password(
         auth_url=settings.os_auth_url, user_id=trustee_user_id, password=settings.os_password, trust_id=trust_id
     )
     session = ks_session.Session(auth=plugin, timeout=30, verify=settings.ssl_verify)
+    install_session_guard(session)
     try:
         endpoint = auth._resolve_internal_keystone_endpoint()
-        ks_client.Client(session=session, endpoint_override=endpoint).trusts.delete(trust_id)
+        client = ks_client.Client(session=session, endpoint_override=endpoint)
+        checkpoint_sync()
+        client.trusts.delete(trust_id)
     except ks_exc.NotFound:
         return "gone"
     except (ks_exc.Unauthorized, ks_exc.Forbidden):
@@ -550,12 +555,14 @@ async def delete_released(delegation_id: str | None) -> str | None:
             return None
         trust_id, trustee = row.trust_id, row.trustee_user_id
     try:
-        outcome = await asyncio.to_thread(_delete_trust_with_trust_token_sync, trust_id, trustee)
+        await checkpoint()
+        outcome = await run_sync(_delete_trust_with_trust_token_sync, trust_id, trustee)
     except Exception:
         _logger.warning("Trust cleanup for delegation %s deferred to the next sweep", delegation_id)
         return None
     async with factory() as session, session.begin():
         row = await session.get(DroverDelegation, delegation_id, with_for_update=True)
+        await checkpoint()
         if row is not None and row.state in {"released", "revoked"}:
             now = _now()
             if outcome == "inert":
@@ -583,6 +590,7 @@ async def sweep() -> dict[str, int]:
         )).all())
     for delegation_id in active_ids:
         async with factory() as session, session.begin():
+            await checkpoint()
             await release_if_idle(session, delegation_id, reason="operation finished outside a job")
             row = await session.get(DroverDelegation, delegation_id)
             released += int(row is not None and row.state == "released")
@@ -603,7 +611,8 @@ async def sweep() -> dict[str, int]:
         )).all())
     for delegation_id, trust_id in candidates:
         try:
-            exists = await asyncio.to_thread(_trust_exists_sync, trust_id)
+            await checkpoint()
+            exists = await run_sync(_trust_exists_sync, trust_id)
         except Exception:
             _logger.warning("Delegation expiry check deferred for %s", delegation_id)
             continue
@@ -612,6 +621,7 @@ async def sweep() -> dict[str, int]:
             continue
         async with factory() as session, session.begin():
             row = await session.get(DroverDelegation, delegation_id, with_for_update=True)
+            await checkpoint()
             if row is not None and row.state in {"active", "released", "revoked"}:
                 row.state = "expired"
                 row.state_reason = "Keystone trust expired"

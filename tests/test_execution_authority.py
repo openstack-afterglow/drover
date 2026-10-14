@@ -253,7 +253,7 @@ async def test_worker_terminalizes_authority_errors(monkeypatch, error_class):
     monkeypatch.setattr(jobs, "_complete", complete)
     monkeypatch.setattr(jobs, "_heartbeat_lease", AsyncMock())
     assert await jobs.process_one_job() is True
-    retry.assert_awaited_once_with("job", attempt=1, error="authority denied", terminal=True)
+    retry.assert_awaited_once_with("job", attempt=1, error="authority denied", terminal=True, authority_failure=True)
     complete.assert_not_awaited()
 
 
@@ -450,7 +450,27 @@ async def test_activation_switches_generation_and_erases_superseded_secrets(monk
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "authentication", "rollout"])
+async def test_activation_revalidates_ownership_in_its_write_transaction(monkeypatch):
+    from drover.services import execution_safety
+
+    old = credential_row(1, cluster_authority.CONTROL, "active")
+    staged = credential_row(2, cluster_authority.CONTROL, "staged", "operator")
+    cluster = SimpleNamespace(project_id="project", deleted_at=None, app_credential_id="legacy-guest", updated_at=None)
+    session = _Session(cluster, [[old, staged]])
+    monkeypatch.setattr(db, "get_session_factory", lambda: lambda: session)
+    checkpoint = AsyncMock(side_effect=execution_safety.OwnershipLost("stale activation attempt"))
+    monkeypatch.setattr(execution_safety, "ownership_checkpoint", checkpoint)
+    with pytest.raises(execution_safety.OwnershipLost, match="stale activation"):
+        await cluster_authority._activate("project", "cluster", 2)
+    checkpoint.assert_awaited_once_with(session)
+    assert old.state == "active" and old.secret_encrypted == "ciphertext"
+    assert staged.state == "staged" and staged.secret_encrypted == "ciphertext"
+    assert cluster.app_credential_id == "legacy-guest"
+    assert session.added == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "authentication", "rollout", "ownership"])
 async def test_reauthorization_activates_only_after_complete_guest_rollout(monkeypatch, failure):
     control = cluster_authority._CredentialSnapshot("control", "cluster", "project", 2, "control", "operator",
                                                     "credential-control", ("member-id",), "ciphertext")
@@ -460,7 +480,11 @@ async def test_reauthorization_activates_only_after_complete_guest_rollout(monke
     monkeypatch.setattr(cluster_authority, "_snapshot", staged)
     monkeypatch.setattr(crypto, "decrypt_app_credential_secret", lambda _: "safe-secret-value-123")
     monkeypatch.setattr(delegation, "revalidate_principal_sync", MagicMock())
-    authenticate = MagicMock(side_effect=[None, RuntimeError("guest auth failed")] if failure == "authentication" else None)
+    authenticated = SimpleNamespace(session=MagicMock())
+    authenticate = MagicMock(
+        side_effect=[authenticated, RuntimeError("guest auth failed")] if failure == "authentication" else None,
+        return_value=authenticated,
+    )
     monkeypatch.setattr(cluster_authority, "_authenticate_sync", authenticate)
     monkeypatch.setattr("drover.services.store.get_cluster", AsyncMock(return_value={"status": "ACTIVE"}))
     monkeypatch.setattr(cluster_authority, "_guest_plugins", AsyncMock(return_value=["occm"]))
@@ -470,6 +494,10 @@ async def test_reauthorization_activates_only_after_complete_guest_rollout(monke
     monkeypatch.setattr(guest_rollout, "rollout_guest_credential", rollout)
     monkeypatch.setattr(cluster_authority, "_activate", activate)
     monkeypatch.setattr(cluster_authority, "_record_staged_error", error)
+    from drover.services import execution_safety
+
+    checkpoint = AsyncMock(side_effect=execution_safety.OwnershipLost("ownership lost") if failure == "ownership" else None)
+    monkeypatch.setattr(execution_safety, "ownership_checkpoint", checkpoint)
     if failure:
         with pytest.raises(RuntimeError):
             await cluster_authority.execute_reauthorization("project", "cluster", {"generation": 2})
@@ -484,6 +512,7 @@ async def test_reauthorization_activates_only_after_complete_guest_rollout(monke
                                         kms_required=False, kms_detect=False)
         activate.assert_awaited_once_with("project", "cluster", 2)
         error.assert_not_awaited()
+    assert authenticated.session.close.call_count == (1 if failure == "authentication" else 2)
 
 
 @pytest.mark.asyncio

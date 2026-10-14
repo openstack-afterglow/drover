@@ -4,6 +4,63 @@
 
 **검증 경계:** 최신 완료 발행·canonical controller3대 배포는 `v0.4.13`; full service1413/3skip, 실제 local API/Worker amd64/arm64 실행을 확인했습니다. 새 disposable cluster에서 `stampede_enabled` 생략 시 cluster `true`·default 그룹 `false`, GPU flavor nodegroup 생략 시 `true`를 확인했고 `accelerator: RTX3060LHR` nodeSelector와 `nvidia.com/gpu: 1` Pod로 GPU0→1 증설·자동 `accelerator`/`afterglow.io/gpu-type` label·allocatable1·Running nvidia-smi·Operation SUCCEEDED를 확인한 뒤 cluster/VM/volume 정리와 임시 flavor access 제거를 확인했습니다([live acceptance](release-0.4.0.md#live-default-on-and-accelerator-acceptance)). taint 없는 GPU worker에 K3s traefik(emptyDir)이 배치되어 그 실행의 자연 축소는 `protected_pod`로 차단됐습니다. 0.4.12까지의 native fixture에서는 Cinder 재부착·Manila RWX·Service LB·HTTP/TLS Ingress·bearer-only RBAC·KMS Encrypt/Decrypt/암호화 저장, CPU0→2→0·baseline UID 보존, 실제 RTX3060 GPU0→1/Ready/allocatable1/Running nvidia-smi/SUCCEEDED와 원래 durable events500→200/null 보존/cursor replay를 검증했습니다. GPU 자연축소는 VM404까지 진행했지만 boot volume이 Cinder `error_deleting`으로 남아 Operation FAILED이며, owner 결정에 따라 force/reset 없이 volume·group tracking·ERROR fixture를 보존했습니다([exact receipt](release-0.4.0.md#native-gpu-natural-scale-in-and-final-cleanup-boundary)). 전체 guest credential rotation/재인가 matrix를 재실행했다는 주장은 하지 않습니다.
 
+**Current integration boundary:** 0.4.15 is a prepared, unqualified candidate; latest completed native release receipts are [0.4.14](release-0.4.0.md#live-0414-gpu-csi-and-natural-scale-in-acceptance). The 0.4.13 paragraph and ownership results below are preserved historical snapshots, not new candidate execution. [0.4.15 prerequisites/gates](release-0.4.0.md#0415-patch--latest-dev-wip-integration-and-distributed-worker-cutover) include all-old-worker drain, no mixed SQL consumers and the pending immutable source-build SHA.
+
+
+## Native worker replica ownership
+
+**Evidence: test-passed locally, not live-verified (parent receipt, 2026-10-14).** The parent executed the ownership extension on a frozen public clone synced byte-for-byte from the preserved original working tree before latest-dev integration, including concurrent WIP (262 git-visible files; manifest SHA-256 `49e0e62eb2d991a7940d244d8523acd6a9668aeedde19cef76a06d32f0c8928c`). Logs, JUnit XML and execution JSON are under `/Users/pieroot/.local/share/afterglow-proofs/afterglow-process-ownership-n7xrnua4/`. These are this worker model's observed local results, not inherited historical release evidence:
+
+- Focused ownership/job lane, the 12 files listed in the regression recipe below: **374 passed**.
+- Full service suite `pytest -p no:cacheprovider tests --ignore=tests/integration`: **1323 passed, 1 skipped**.
+- Three-replica native `scripts/worker_ownership_smoke.py`: **exit 0**, initial owner counts **[11, 11, 11]**; `sticky_assignment`, `independent_control_heartbeat`, `hard_crash_takeover`, `read_only_retry`, `redis_outage_fail_closed`, `revocation_true_thread_drain`, `sql_heartbeat_during_sdk` all **true**; `sql_successful_jobs` **9**, duplicate healthy target polls **0**, remaining native assignments **4**. This exercised three real replica processes, native `WorkerRuntime`, real SQL claims/heartbeats/non-replay guards and a synthetic loopback HTTP provider. Owned fixtures were Docker Redis 7 on `127.0.0.1:56497` and tmpfs Docker MariaDB 11.4 on `127.0.0.1:56498`; Redis outage used `docker pause/unpause` instead of SIGSTOP/SIGCONT. The empty owned database `drover_ownership_smoke_n7xrnua4e` used ORM schema, not migration-ledger qualification.
+- Prior smoke attempts on earlier sources: attempt 1 failed from harness provider listen-backlog resets (fixed with provider `request_queue_size=256`); attempt 2 failed when InnoDB 1213 deadlock killed the harness consumer loop (fixed by retrying like production). Attempts 3 and 4 passed; the final run on lint-fixed source passed.
+- Defects found and fixed during verification: Lua empty-map encoding in `worker_ownership.py`; control-thread Sentinel `RedisBackend`; lease/heartbeat retention through drain; `operation_id` propagation; reconciliation SDK calls through `run_sync`; attempt checkpoint before dispatch; transaction-bound status writes; atomic callback-timeout rollback; lease identity comparison.
+- `ruff check .`: only **2 pre-existing scoped-access findings** remain, outside this extension and already recorded in task 4.4 (`drover/api/configmaps.py` SIM102, `drover/services/cloud_shell.py` UP017). All **15 ownership-introduced findings** were fixed: import order, unused import, `collections.abc`, builtin `TimeoutError`, PEP 695 `run_sync[T]`, combined operation-status condition and `ExitStack`-owned smoke log handles. CI does not run `ruff format`; HEAD has 60 unformatted files, and no formatting was applied.
+- Architecture stamp/check is recorded in the parent receipt from an isolated clone; the canonical checkout's shared review marker/digest/UTC block was left untouched.
+
+- `drover/worker.py:WorkerRuntime` keeps Redis control on an independent OS thread/event loop. Its dedicated client is constructed through an independent native `RedisBackend` instance, preserving configured Sentinel master selection or direct Redis URL without sharing a domain-loop connection pool. SQL jobs and domain services remain on the original DB event loop. A blocked cluster SDK call cannot prevent Redis server-time membership renewal or ownership scheduling.
+- Only the discovery leader reads the shared SQL cluster registry. Its credential-free target ID publication feeds one global reconciliation quota scheduler and separately assigned cluster health/Stampede targets. Recovery and delegation sweep roles are distributed among live eligible processes, rather than executed on every replica.
+- `drover/services/worker_ownership.py` keeps healthy current owners stable, assigns unowned work across live members, validates unique lease tokens, rejects stale release, and takes over crashed owners after membership expiry. Redis outage and local expiry fail closed. Redis membership is an execution admission fence, not a replacement for tenant authority.
+- Periodic work checkpoints before later state changes and scheduling. Target services reload current eligibility and retain owner/capability checks. POSIX stop immediately revokes local admission, cancels and drains every owned coroutine and shielded SDK thread before releasing tokens and closing resources. Already-sent network requests cannot be undone by revocation.
+- Durable jobs are **still competing SQL consumers on every replica**, not Redis leader work. SQL row/attempt/cluster fences and heartbeat remain authoritative. A possible physical mutation is durably marked before it is sent; accepted/unknown mutation outcomes, cancellation and stale reclaim do not blindly replay cloud actions. Inventory/operator inspection is required for ambiguous work. Errors before mutation and safe observation retain normal bounded retry; caller trusts, source/owner and operation authority validation have no fallback identity.
+- Cancellation settlement keeps a SQL job `running` until its real dispatch/SDK threads have drained, so safe pre-send requeue cannot overlap a late thread. Claimed operation metadata is passed explicitly to every job dispatch kind. Reconciliation recorded-resource and orphan observations use shielded SDK offloads, keeping the domain SQL heartbeat runnable and draining reads on cancellation.
+- Dispatch entry revalidates the exact current SQL attempt before invoking a native domain handler. Cluster status writes—including zero-agent activation with no SDK call—lock and refresh that attempt, cluster source and operation state in the **same SQL write transaction**, keeping the claim fence held through commit. A paused former attempt cannot overwrite a takeover's failed-operation/cluster status with `ACTIVE`.
+- SQL heartbeats keep the cancelled attempt's cluster exclusion live throughout actual SDK drain and stop only afterward. Callback-timeout `FAILED`/cluster `ERROR`, sequenced event and original-delegation rollback admission commit atomically in one transaction; recovery revocation rolls them all back rather than leaving an unqueued failed operation.
+
+Locally passed native coverage includes server-time Lua exclusivity/three-member distribution/sticky ownership, leader publication, expiry takeover, token-only release, Redis outage/revocation, blocked-domain heartbeat/scheduling, true drain, target eligibility/publication fences, and SQL accepted/unknown non-replay. Consumer tests use native Drover services and synthetic boundaries, not production network credentials.
+
+### Local smoke reproduction recipe and observed limits
+
+Prerequisites: installed `redis-server`, POSIX signals, and an existing **disposable loopback MariaDB** service with an empty database and a user able to create tables in that database. The database name must match `drover_ownership_smoke_[A-Za-z0-9_]+`; the hook refuses non-loopback URLs or a nonempty database. Do not use production/deployed tenant data. Create an empty database in the local MariaDB console, for example `CREATE DATABASE drover_ownership_smoke_local;`, using an existing local test account. Put its actual `mysql+aiomysql://` URL into `DROVER_OWNERSHIP_SMOKE_DATABASE_URL` through the shell's hidden prompt, not argv or committed files:
+
+```sh
+cd /Users/pieroot/code/drover
+read -r -s DROVER_OWNERSHIP_SMOKE_DATABASE_URL
+export DROVER_OWNERSHIP_SMOKE_DATABASE_URL
+uv run --frozen --extra service --extra dev python scripts/worker_ownership_smoke.py
+unset DROVER_OWNERSHIP_SMOKE_DATABASE_URL
+```
+
+The standalone hook starts its own loopback Redis and synthetic HTTP provider, then three subprocesses using native `WorkerRuntime`, real SQL claims/heartbeats, native authority binding and physical-send guards. It asserts divided/sticky roles and targets, no healthy-owner duplicate polls, heartbeat under a blocked domain SDK call, cancellation/true thread drain, SIGKILL takeover, Redis outage fencing/rejoin, safe read retry, and single provider acceptance after lost response or accepted-then-killed work. Structured JSON is printed only after assertions complete; the parent's successful Docker-fixture run and its outage-control substitution are recorded above. The standalone hook stops only processes it created and preserves SQL rows for inspection. Rerun with a new empty suffixed database. ORM metadata setup is not migration-ledger verification; synthetic domain dispatch does not test real Keystone policies, provider SDK catalogs, guest rollout or live cloud behavior.
+
+Regression reproduction recipe (the observed full service lane excludes integration tests; results are recorded above, not pending execution):
+
+```sh
+uv run --frozen --extra service --extra dev pytest -q tests/test_worker_ownership.py tests/test_worker_runtime.py tests/test_worker_targets.py tests/test_worker_job_drain_boundaries.py tests/test_staged_credential_drain.py tests/test_job_execution_safety.py tests/test_jobs.py tests/test_operations_jobs.py tests/test_execution_authority.py tests/test_reconciliation.py tests/test_k3s_health.py tests/test_k3s_stampede.py
+uv run --frozen --extra service --extra dev pytest -p no:cacheprovider tests --ignore=tests/integration
+uv run --frozen --extra service --extra dev ruff check .
+openspec validate isolate-service-execution-credentials --strict
+```
+Architecture stamping/checking was handled separately by the parent in an isolated clone and is recorded in the parent receipt; do not restamp or edit the shared review marker/digest/UTC block for this evidence update.
+
+**Not exercised/qualified:** production Redis/Sentinel failover or async-replication lease/journal loss, promoted-node TIME skew, mixed-version rolling upgrade, live provider/cloud (including Keystone/OpenStack/K3s/Nova/Octavia/Glance/KVM), real guest rollout or deployment. Only disposable owned fixtures and synthetic loopback/in-process providers were used: no private configuration or credentials, paid inference, image publication, commit, stage or push. These local passes are not production or live verification.
+
+
+Stop/drain **all old SQL worker binaries before cutover**. The worker-owned ambiguity marker uses existing payload storage, which old binaries ignore; mixed old/new SQL consumers are not qualified. Stable owners do not rebalance on every late join: the initial membership cohort settles before assignment, and later additions receive unowned/new work without stealing healthy targets. Same service Redis/DB is required across every eligible replica; no controller host list is used.
+
+
+
 ---
 
 ## 1. 레거시 기능 그룹별 교체 및 SDK 매핑 서열 (Feature Replacement Mapping)
@@ -108,11 +165,12 @@ drover wheel
         └── drover-migrate.json.j2# Pre-start Migration 컨테이너 템플릿
 ```
 
-소스 role은 root wheel의 `deploy/kolla/ansible/roles/drover` shared data로 설치하며 서비스에는 `drover[service]`가 필요합니다. Registry default/최신 완료 발행·배포는 `v0.4.13`([receipt](release-0.4.0.md#tagged-0413-publication-and-canonical-rollout)); wheel/lock/20role files와 immutable image/runtime parity를 확인했습니다. Published amd64+attestation과 local amd64/arm64를 구분합니다. SDK0.2.21 및 persistence schema/migrations는 불변이며 0.4.13은 Stampede 생성 기본값과 GPU worker label만 바꿨습니다. source default나 Ready는 native consumer 검증을 대체하지 않습니다.
+소스 role은 root wheel의 `deploy/kolla/ansible/roles/drover` shared data로 설치하며 서비스에는 `drover[service]`가 필요합니다. 준비 중인 package/lock/registry tag는0.4.15/v0.4.15이고 SDK0.2.21·ledger001–004는 유지합니다. source-build는 tag가 아닌 full SHA를 검증하므로 부모 corrected-source commit 이후 pin 갱신이 필요합니다. 발행·배포가 미실행인 후보와 역사적 [0.4.13 receipt](release-0.4.0.md#tagged-0413-publication-and-canonical-rollout), [0.4.14 receipt](release-0.4.0.md#live-0414-gpu-csi-and-natural-scale-in-acceptance)를 구분하며 Published amd64+attestation과 local amd64/arm64도 혼동하지 않습니다.
 
 ### Schema Readiness 및 Pre-start Migration
 - API/Worker보다 `drover-migrate`를 먼저 실행하여 manifest checksum ledger의 001–004를 적용합니다. `004_execution_authority.sql`은 delegations, control/guest credential generations, job delegation FK와 `reauthorize` operation kind를 추가합니다. 기존 manager rows/password는 authority로 전환하지 않습니다. [004 upgrade runbook](../drover/migrations/README.md#execution-authority-upgrade-004)을 따릅니다.
 - API 서버는 요청 수신 시 DB 마이그레이션이 완전히 적용되지 않았거나 Redis/Keystone 커넥션이 정상화되지 않은 경우 `/v1/health/ready`에서 HTTP 503을 반환하여 트래픽 입입을 방지합니다.
+- 클러스터 목록은 SQL이 설정된 동안 SQL 장애를 빈 목록이나 Redis fallback으로 숨기지 않습니다. Connection breaker가 열리면 이미 채운 목록 cache를 포함해 `GET /v1/clusters`의 기본/`no_cache`/`refresh_cache` 요청은503 `Cluster inventory unavailable`입니다. Cooldown 뒤 SQL이 복구되어야 목록이 돌아오며 schema/권한 오류는 connection cooldown으로 처리하지 않습니다. DB 미설정 legacy store만 Redis 목록을 유지합니다. 이 수정은 schema·설정 변경이 없고 현재 source의 로컬 검증이며 운영 배포 성공을 뜻하지 않습니다.
 
 ---
 

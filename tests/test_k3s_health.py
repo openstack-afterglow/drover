@@ -232,21 +232,19 @@ async def test_check_cluster_health_healthy_no_nodes():
 
 
 @pytest.mark.asyncio
-async def test_check_all_active_clusters_empty():
-    """ACTIVE 클러스터 없을 때 오류 없이 반환."""
-    from drover.services.health import check_all_active_clusters
+@pytest.mark.parametrize("status", ["CREATING", "ERROR"])
+async def test_assigned_health_target_rechecks_eligibility(status):
+    """An assignment is not authority to poll a target that has become ineligible."""
+    from drover.services.health import check_active_cluster
 
-    with patch(
-        "drover.services.store.list_all_clusters",
-        AsyncMock(
-            return_value=[
-                _make_cluster_record(status="CREATING"),
-                _make_cluster_record(cluster_id="k3s-2", status="ERROR"),
-            ]
-        ),
+    with (
+        patch("drover.services.store.get_cluster_admin", AsyncMock(return_value=_make_cluster_record(status=status))),
+        patch("drover.services.store.list_all_clusters", AsyncMock()) as registry,
+        patch("drover.services.health.check_cluster_health", AsyncMock()) as probe,
     ):
-        # 예외 없이 완료되어야 함
-        await check_all_active_clusters()
+        await check_active_cluster("k3s-test")
+    probe.assert_not_awaited()
+    registry.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -124,7 +124,7 @@ async def k3s_api_error_handler(request: Request, exc: K3sApiError):
 
 
 app.add_middleware(SlowAPIMiddleware)
-# Keep the socket peer intact for client-IP checks; Uvicorn parsing is disabled.
+# Keep the socket peer intact for trusted client-IP resolution; Uvicorn parsing is disabled.
 app.add_middleware(TrustedProxySchemeMiddleware)
 app.add_middleware(CorrelationMiddleware)
 

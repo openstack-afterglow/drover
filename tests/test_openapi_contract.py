@@ -117,6 +117,7 @@ async def test_public_discovery_endpoints_runtime():
 async def test_discovery_and_slash_redirect_use_only_trusted_proxy_scheme(
     monkeypatch, peer, trusted_proxies, proto, expected_scheme,
 ):
+    """Both URL producers use the trusted scheme without trusting forwarded host/client data."""
     monkeypatch.setenv("TRUSTED_PROXIES", trusted_proxies)
     headers = {
         "X-Openstack-Request-Id": "req-proxy-discovery",
@@ -142,6 +143,13 @@ async def test_discovery_and_slash_redirect_use_only_trusted_proxy_scheme(
         assert response.headers["location"] == f"{expected_scheme}://api.example:8011/v1/?probe=1"
         assert response.headers["X-Openstack-Request-Id"] == "req-proxy-discovery"
 
+
+def test_standalone_entrypoint_preserves_connection_peer():
+    from drover.main import run
+
+    with patch("drover.main.uvicorn.run") as uvicorn_run:
+        run()
+    uvicorn_run.assert_called_once_with("drover.main:app", host="0.0.0.0", port=8011, proxy_headers=False)
 
 @pytest.mark.asyncio
 async def test_repaired_cluster_health_list_route():

@@ -12,8 +12,9 @@ owner project 의 Barbican 에서 k8s 용 KEK (key encryption key) 를 조회하
 
 from __future__ import annotations
 
-import asyncio
 import logging
+
+from drover.services import worker_ownership
 
 _logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ async def ensure_project_kek(conn) -> str:
     3. 없으면 secret order 발급 (aes/cbc/256, async). PENDING → ACTIVE 폴링.
     4. Secret ref URL 의 마지막 segment 가 UUID.
     """
-    return await asyncio.to_thread(_ensure_project_kek_sync, conn)
+    return await worker_ownership.run_sync(_ensure_project_kek_sync, conn)
 
 
 def _ensure_project_kek_sync(conn) -> str:

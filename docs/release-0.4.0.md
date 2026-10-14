@@ -544,3 +544,80 @@ The native Manila data plane required an approved supplementary `private_provide
 Final read-only preservation at **19:51–19:52Z** confirmed restored `78ba1d31-ea1e-48a1-b8c9-6573626d7045` ERROR with healthz200, two Ready nodes and the same latest Pod creation `2026-10-10T09:03:17Z`; legacy `cac87f5d-dbcc-4e78-b2c1-8dfac6a3471c` DELETED; fixture `f63db749-a27f-4785-9315-da34a0c7d487` ERROR with both baseline VMs/nodes healthy and Pod UID `870c770a-d942-427e-a22c-ec6ca02bcf12` Running on its original node. Existing GPU group `04319d21-d602-4578-a1be-90e10a894060` retained count1/tracking, and `e33fd259-3563-4efe-9978-9763fc9ffdfb` remained `error_deleting` with no attachments. Both protected supplementary ports remained ACTIVE on their original VMs. KEK `416228dd-7747-4205-a071-4b7b368f283f` remained ACTIVE through **metadata-only GET**; no payload, force-delete, reset-state or direct SQL was used. Afterglow dashboard work remains separately pending/unarchived.
 
 
+
+## 0.4.15 patch — latest-dev WIP integration and distributed worker cutover
+
+**Locally qualified integrated source; not published or deployed.** This section describes the preserved public WIP integrated onto latest fetched `dev` (`0a68ae3c280568187cea154feec1790c6842c960`; no newer dev commits at re-fetch). The parent's 2026-10-14 receipts below qualify the current integrated source in an isolated integration clone, after lint-only repairs. They are local/disposable evidence, not CI, immutable release, real-cloud or production evidence. No commit, push, tag, package/image publication, operator change or production deployment had happened at receipt time.
+
+Root `pyproject.toml`, `drover.__version__`, native `uv.lock` and Kolla registry tag are `0.4.15` / `v0.4.15`. `uv lock --offline` reused the existing 83-package resolution and updated Drover from 0.4.14 to 0.4.15; no dependency upgrade was requested. `drover-sdk` remains 0.2.21. **Pending two-commit source-pin sequence:** first commit the corrected integrated source; then, in a separate release-metadata commit, set `drover_source_version` to that source commit's exact full SHA and restamp the architecture; only then tag. The role asserts a full checkout SHA, not a tag. The existing 0.4.14 pin `7f9f4391321a64e9d5d278c3043b5a282e014a01` remains unchanged pending those commits (the 0.4.13/0.4.14 pattern). Local candidate qualification does not qualify source-build deployment while that pin remains old; no future SHA is fabricated.
+
+### Current integrated-source local qualification — 2026-10-14
+
+Parent receipts are retained under the private proof-root name `release-all-20261014T073153Z-c2ba90`; no private values are reproduced here.
+
+- Lint-only integration repairs removed merge-duplicated fixture/helper definitions in `tests/test_config.py` and `tests/test_reconciliation.py`, removed a duplicate import in `tests/test_secret_file_credentials.py`, and replaced the unused `TypeVar` generic on `worker_ownership.run_sync` with `Any`. PEP 695 syntax would violate the root package's declared Python `>=3.11` support; no behavior change was intended.
+- Service: `uv sync --python 3.12 --frozen --extra service --extra dev`, then `uv run pytest tests -q`: **1,560 passed, 3 skipped**. Repository `ruff check .`: **passed**.
+- SDK (`sdk/`, frozen all-extras): **114 passed**; Ruff **passed**.
+- Canonical `docker/Dockerfile` targets **drover-api** and **drover-worker** built for **linux/amd64** and **linux/arm64**. All four images executed, reported `0.4.15` with `x86_64` / `aarch64`, and imported their `drover.main` / `drover.worker` entrypoints. This is local image execution, not registry-platform or deployment proof.
+- Current-source `scripts/worker_ownership_smoke.py` ran **inside the canonical linux/arm64 worker image**, with a qualification-only `redis-server` overlay (no deliverable change), against an empty disposable MariaDB 11.4 `drover_ownership_smoke_*` database: **exit 0**. It observed initial owner counts **[11, 11, 11]**, sticky assignment, **9 SQL jobs**, accepted-lost-reply and accepted-then-killed **no replay**, read-only retry, SQL heartbeat during SDK work, independent control heartbeat, revocation true-thread drain, hard-crash takeover, Redis-outage fail-closed behavior, **0 duplicate healthy polls** and **4 remaining assignments**. The provider was synthetic; this is not real Keystone, guest, migration-upgrade or production proof, and does not claim an amd64 ownership-smoke run.
+- `uv build --wheel` produced `drover-0.4.15-py3-none-any.whl`, including the packaged role's `tasks/source_build.yml`. This is local packaging, not wheel publication or qualification of the still-old source pin.
+
+### Historical pre-integration ownership receipt — not current-source qualification
+
+Keep the earlier 2026-10-14 frozen-original-WIP receipt separate: **374 focused ownership/job tests**, **1,323 service tests / 1 skipped**, and a three-replica native smoke **exit 0** with owner counts **[11, 11, 11]**, seven smoke flags true, 9 successful SQL jobs, 0 duplicate healthy target polls and 4 remaining assignments. That snapshot retained two pre-existing Ruff findings outside ownership (`configmaps.py` SIM102 and `cloud_shell.py` UP017). Its architecture stamp/check and detailed smoke recipe/limits in [feature coverage](drover-feature-coverage.md#local-smoke-reproduction-recipe-and-observed-limits) are historical; they do not qualify the merged source. The current-source receipt above supersedes neither that history nor its observed boundaries.
+
+### Source integration boundaries
+
+- Preserve latest native provisioning: direct Nova/Cinder work, per-GPU-create admission, failed flavor metadata propagation and early initial-agent preflight, default-on Stampede with explicit opt-out and protected initial groups, accelerator labels, narrow GPU CSI node tolerations, versioned Barbican interface/region/catalog-prefix and same-origin order polling. Deleted provisioning-intent code and `tests/test_afterglow_provisioning.py` stay deleted.
+- Integrate service-local Redis server-time membership, independent control threading, sticky periodic role/target ownership, discovery-only registry publication, fresh SQL target eligibility, fail-closed revocation and token-only release. All replicas retain independent SQL job consumption, claims, attempt/cluster fences and heartbeats; Redis is not the job queue or job leader.
+- Accepted/unknown physical mutations are durably marked in existing job payload storage before send and are not automatically replayed. Authentication, SDK reads and mutation threads drain before connection/resource closure; cancelled dispatch remains excluded until actual drain. A lease cannot undo an already-sent provider request.
+- Retain current directory-validated direct system-admin grants, application-credential required roots and safe current role-ID inference closure, requester operation trusts and separate restricted user-owned control/guest credentials. Staged credential authentication closes its sessions and activation checks execution ownership.
+- Keep latest reconciliation lifecycle/deletion guards, callback-timeout and deleted-operation recovery, nullable durable event messages, scheme-only proxy handling and native RedisBackend Sentinel/DB-index routing. Configured SQL list inventory fails with 503 through warm-cache/cooldown paths rather than using Redis inventory; explicit empty environment keys retain precedence over TOML.
+- Account for original files that were untracked at the old base but are now tracked upstream: merge credential execution/drain logic and ownership OpenSpec additions rather than overwrite newer implementations. The archived typed-TOML artifacts and all public worker/inventory regression files are retained.
+
+### Schema, worker and credential prerequisites
+
+There is **no new 0.4.15 schema or migration**. Keep ledger 001–004 immutable. Existing 004 adds delegation records, encrypted control/guest credential generations, the job delegation FK and `reauthorize` operation kind; it does not backfill requester trusts, convert legacy manager rows, drop historical quota/manager tables or reauthorize clusters. Existing deployments below that ledger must follow the [004 ordered runbook](../drover/migrations/README.md#execution-authority-upgrade-004), with a DB backup and preserved encryption key.
+
+Before introducing the new worker set, stop mutation admission and automatic sizing, settle queued/running work and callback/HA/agent continuations, then **stop and fully drain every old SQL worker binary**. Start the new API/Worker cohort only afterward. Old workers ignore the new payload ambiguity fence and periodic ownership; mixed old/new SQL consumers are unsafe and unqualified, including rollback to older images while new work remains. Unknown provider outcomes need explicit inventory/operator resolution, never a guessed replay. Shutdown may wait for already-running provider calls; do not confuse cancellation of a future with thread termination or force-close its pool.
+
+All worker replicas need the same Drover MariaDB and configured Redis/Sentinel namespace/DB, correct writer discovery, clock/lease behavior and POSIX graceful-stop handling. Preserve data Redis URL/password-file/TLS options and DB 7 isolation; Sentinel discovery is not a license to alter shared Valkey. Production Sentinel failover, asynchronous-replication lease loss, promoted-node TIME skew and mixed-version rollout remain unqualified.
+
+Operators must provide valid service-project trustee/directory credentials, current project-native capabilities and all required delegated roles, supported trust/app-credential policies and held optional Barbican/Octavia roles. Validate actual catalog endpoints, guest-plugin CA settings, restricted credential inference responses and policy/KEK ACL sufficiency. Legacy ACTIVE clusters need authorized control/guest reauthorization and completed guest rollout before old identities are retired; other-owner/ownerless credentials require explicit owner/operator revocation. There is no service/manager fallback. Keep callback URL/CIDRs, encryption key, resource/image/network/flavor policies, NVIDIA driver/runtime images and configured GPU admission credentials valid. Existing guests/groups are not automatically backfilled.
+
+### Qualification reproduction and remaining release gates
+
+The service/SDK/lint, both-arch image execution, arm64 Docker-contained ownership smoke and wheel receipts above are already observed. The commands below are a reproduction/review checklist, **not a claim that every listed lane ran** (in particular, no current-source OpenSpec or migration-apply-twice result is recorded here). Use Python 3.12 for the CI/container lanes:
+
+```sh
+uv sync --all-extras --frozen
+uv run --frozen --all-extras pytest -q tests/test_worker_ownership.py tests/test_worker_runtime.py tests/test_worker_targets.py tests/test_worker_job_drain_boundaries.py tests/test_staged_credential_drain.py tests/test_job_execution_safety.py tests/test_jobs.py tests/test_operations_jobs.py tests/test_execution_authority.py tests/test_reconciliation.py tests/test_provisioner_agents.py tests/test_native_barbican_endpoint.py tests/test_cluster_app_credentials.py tests/test_k3s_stampede.py tests/test_k3s_nodegroups.py tests/test_cluster_inventory_failures.py tests/test_auth.py tests/test_config.py
+uv run pytest tests
+uv run ruff check .
+uv --directory sdk sync --all-extras --frozen
+uv --directory sdk run pytest
+uv --directory sdk run ruff check .
+uv build --wheel
+openspec validate isolate-service-execution-credentials --strict
+python3 scripts/check_architecture.py --stamp --summary "Review complete 0.4.15 latest-dev integration, worker ownership/drain/non-replay, credential authority, SQL inventory and native provisioning protections"
+python3 scripts/check_architecture.py
+```
+
+This documentation handoff reviews the worker ownership/job drain and non-replay boundaries and stamps the integrated working-source architecture snapshot. The parent must review the final source/pin metadata and restamp after the exact-SHA pin commit, then run the architecture-first CI gate; neither the preserved historical marker nor this local stamp is CI qualification. The current-source ownership smoke above is complete. Migration qualification is separate: run `uv run drover-migrate --apply` twice against owned disposable MariaDB 11.4 and verify the 001–004 ledger and second no-op plus DB/Redis readiness. Full readiness also requires real Keystone; a DB/Redis smoke does not prove that. For ownership-smoke reproduction, use only the loopback empty-database/name and hidden-credential setup in [feature coverage](drover-feature-coverage.md#local-smoke-reproduction-recipe-and-observed-limits).
+
+For reproduction, build canonical `docker/Dockerfile` targets **drover-api and drover-worker** separately for **linux/amd64 and linux/arm64** (a multi-platform image cannot be loaded into every Docker daemon):
+
+```sh
+for platform in linux/amd64 linux/arm64; do
+  for target in drover-api drover-worker; do
+    image="afterglow-local/${target}:0.4.15-${platform##*/}"
+    docker buildx build --platform "$platform" --file docker/Dockerfile --target "$target" --load --tag "$image" .
+    docker run --rm --network none --platform "$platform" --entrypoint python "$image" -c 'import platform, drover; print(platform.machine(), drover.__version__); assert drover.__version__ == "0.4.15"'
+  done
+done
+```
+
+Extend actual image execution to settings/authority/native endpoint and drain acceptance; imports alone are not deployment proof. CI publishes hosted amd64 unless its declared platforms change; local arm64 builds do not prove registry arm64. Inspect immutable image manifests/digests, wheel role contents and runtime/source parity separately. Wheel publication still does not wait for the tag suite and Trivy findings remain nonblocking; no CI bypass was added here.
+
+The parent/operator owns authorized canonical Kolla `prechecks`, `genconfig`, `pull` and `reconfigure`/`deploy` using the installed role and reviewed inventory, the coordinated worker stop/drain before new processes, controller parity/readiness and authenticated native cloud acceptance. Use inspected peer/proxy addresses and correct PATH for the deployment venv, preserve shared services/data/volumes and existing fixtures, and report any shared HAProxy/census effects rather than claiming blanket isolation. Current-source local qualification is recorded above; source commit → exact-SHA pin commit/restamp → tag, CI/immutable publication, remaining release gates and production cutover/acceptance are still pending. The read-only production baseline remained 0.4.14 (`f7daeec`), with all four Drover migration ledger entries matching the integrated manifest by path and SHA-256; that comparison is not a new migration or rollout.
+

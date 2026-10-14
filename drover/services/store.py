@@ -10,10 +10,14 @@ from datetime import UTC, datetime
 from sqlalchemy import delete, select
 
 from drover.crypto import decrypt_kubeconfig, decrypt_node_token, encrypt_kubeconfig, encrypt_node_token
-from drover.db import get_session_factory, is_db_available
+from drover.db import get_session_factory, is_db_available, is_db_configured
 from drover.models.orm import K3sAgentVM, K3sCluster
 
 _logger = logging.getLogger(__name__)
+
+
+class ClusterInventoryUnavailable(RuntimeError):
+    """Configured SQL inventory is unavailable, not an empty Redis inventory."""
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +177,8 @@ async def get_cluster_admin(cluster_id: str) -> dict | None:
 async def list_clusters(project_id: str, include_deleted: bool = False) -> list[dict]:
     """프로젝트의 클러스터 목록 (최신순). include_deleted=False 이면 deleted_at IS NULL 필터."""
     if not is_db_available():
+        if is_db_configured():
+            raise ClusterInventoryUnavailable("Cluster inventory unavailable")
         from drover.services import redis_store as _redis
 
         return await _redis.list_clusters(project_id)
@@ -226,6 +232,9 @@ async def update_cluster_status(
     **extra_fields,
 ) -> None:
     """상태 업데이트 + 추가 필드 (server_ip, api_address, node_token 등)."""
+    from drover.services.execution_safety import ownership_checkpoint
+
+    await ownership_checkpoint()
     if not is_db_available():
         from drover.services import redis_store as _redis
 
@@ -233,6 +242,7 @@ async def update_cluster_status(
 
     factory = get_session_factory()
     async with factory() as session:
+        await ownership_checkpoint(session)
         stmt = select(K3sCluster).where(K3sCluster.id == cluster_id, K3sCluster.project_id == project_id)
         result = await session.execute(stmt)
         cluster = result.scalar_one_or_none()
@@ -292,6 +302,9 @@ async def update_cluster_reconciliation(
     Reconciliation observes cloud state outside this transaction. Deletion/provisioning may
     change lifecycle meanwhile; the current locking read must never overwrite those transitions.
     """
+    from drover.services.execution_safety import ownership_checkpoint
+
+    await ownership_checkpoint()
     if not is_db_available():
         from drover.services import redis_store as _redis
 
@@ -306,6 +319,7 @@ async def update_cluster_reconciliation(
         return
 
     async with factory() as session:
+        await ownership_checkpoint(session)
         stmt = (
             select(K3sCluster)
             .where(
@@ -318,6 +332,7 @@ async def update_cluster_reconciliation(
         result = await session.execute(stmt)
         cluster = result.scalar_one_or_none()
         if cluster is not None:
+            await ownership_checkpoint(session)
             cluster.last_reconciled_at = last_reconciled_at
             cluster.drift_status = drift_status
             if status is not None:

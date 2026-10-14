@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import random
 import string
 from urllib.parse import urlsplit
 
 from drover.services import store as k3s_cluster
+from drover.services import worker_ownership
 from drover.utils.ssh_keys import normalize_ssh_public_key
 
 _logger = logging.getLogger(__name__)
@@ -33,12 +33,10 @@ async def _guest_plugin_settings(conn, settings, resource_snapshot: dict):
     if not k3s_plugins.get_active_plugins(settings):
         return k3s_plugins.with_resource_policy_snapshot(settings, resource_snapshot)
 
-    endpoint = await asyncio.to_thread(
-        conn.session.get_endpoint,
-        service_type="identity",
-        interface="public",
-        region_name=settings.os_region_name,
-    )
+    endpoint = await worker_ownership.run_sync(conn.session.get_endpoint,
+    service_type="identity",
+    interface="public",
+    region_name=settings.os_region_name,)
     if not isinstance(endpoint, str) or any(char.isspace() for char in endpoint):
         raise RuntimeError("Public identity endpoint is missing or invalid for guest plugins")
     try:
@@ -72,7 +70,7 @@ async def _resolve_ha_join_endpoint(
     lb_vip_address = ""
     if lb_id:
         try:
-            lb = await asyncio.to_thread(octavia.get_load_balancer, conn, lb_id)
+            lb = await worker_ownership.run_sync(octavia.get_load_balancer, conn, lb_id)
             lb_vip_address = lb.get("vip_address") or ""
         except Exception as e:
             _logger.warning("HA bootstrap: failed to resolve private LB VIP: %s", e)
@@ -235,7 +233,7 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
         _logger.error("k3s agent provision: cannot get OpenStack connection: %s", e)
         raise
     try:
-        flavors = await asyncio.to_thread(nova.list_flavors, conn)
+        flavors = await worker_ownership.run_sync(nova.list_flavors, conn)
         selected = next((flavor for flavor in flavors if flavor.id == agent_flavor_id), None)
         if selected is None:
             raise RuntimeError("Selected agent flavor is unavailable")
@@ -259,15 +257,13 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
 
                     await afterglow.require_gpu_admission(project_id, agent_flavor_id, settings=s)
                 vol_metadata = inventory.build_drover_metadata(cluster_id, None, "volume")
-                vol = await asyncio.to_thread(
-                    cinder.create_volume_from_image,
-                    conn,
-                    f"{agent_name}-boot",
-                    image_id,
-                    boot_volume_size,
-                    volume_availability_zone,
-                    metadata=vol_metadata,
-                )
+                vol = await worker_ownership.run_sync(cinder.create_volume_from_image,
+                conn,
+                f"{agent_name}-boot",
+                image_id,
+                boot_volume_size,
+                volume_availability_zone,
+                metadata=vol_metadata,)
                 await inventory.record_resource(
                     None,
                     cluster_id=cluster_id,
@@ -296,19 +292,17 @@ async def provision_agents(project_id: str, cluster_id: str, server_ip: str, nod
                 agent_vm_metadata.update(
                     {"k3s_horse_generator_role": "k3s_agent", "k3s_horse_generator_cluster_id": cluster_id}
                 )
-                vm = await asyncio.to_thread(
-                    nova.create_server,
-                    conn,
-                    agent_name,
-                    agent_flavor_id,
-                    network_id,
-                    vol.id,
-                    userdata=agent_userdata.data,
-                    metadata=agent_vm_metadata,
-                    delete_boot_volume_on_termination=True,
-                    security_groups=[sg_id] if sg_id else None,
-                    config_drive=agent_userdata.config_drive,
-                )
+                vm = await worker_ownership.run_sync(nova.create_server,
+                conn,
+                agent_name,
+                agent_flavor_id,
+                network_id,
+                vol.id,
+                userdata=agent_userdata.data,
+                metadata=agent_vm_metadata,
+                delete_boot_volume_on_termination=True,
+                security_groups=[sg_id] if sg_id else None,
+                config_drive=agent_userdata.config_drive,)
                 await inventory.record_resource(
                     None,
                     cluster_id=cluster_id,
@@ -408,17 +402,15 @@ async def bootstrap_ha_servers(
         )
 
         try:
-            subnets = await asyncio.to_thread(lambda: list(conn.network.subnets(network_id=network_id)))
+            subnets = await worker_ownership.run_sync(lambda: list(conn.network.subnets(network_id=network_id)))
             subnet_id = subnets[0].id if subnets else None
-            member = await asyncio.to_thread(
-                octavia.add_member,
-                conn,
-                lb_pool_id,
-                server_ip,
-                6443,
-                subnet_id=subnet_id,
-                name=f"{cluster_name}-server-1",
-            )
+            member = await worker_ownership.run_sync(octavia.add_member,
+            conn,
+            lb_pool_id,
+            server_ip,
+            6443,
+            subnet_id=subnet_id,
+            name=f"{cluster_name}-server-1",)
             await inventory.record_resource(
                 None,
                 cluster_id=cluster_id,
@@ -459,14 +451,12 @@ async def bootstrap_ha_servers(
                 # HA 콜백 토큰 (server_index 포함 — callback.py가 분기 처리)
                 ha_token = await k3s_cluster.create_ha_callback_token(project_id, cluster_id, idx)
 
-                boot_vol = await asyncio.to_thread(
-                    cinder.create_volume_from_image,
-                    conn,
-                    f"{server_vm_name}-boot",
-                    image_id,
-                    boot_volume_size,
-                    volume_availability_zone,
-                )
+                boot_vol = await worker_ownership.run_sync(cinder.create_volume_from_image,
+                conn,
+                f"{server_vm_name}-boot",
+                image_id,
+                boot_volume_size,
+                volume_availability_zone,)
                 await inventory.record_resource(
                     None,
                     cluster_id=cluster_id,
@@ -497,23 +487,21 @@ async def bootstrap_ha_servers(
                     ha_node_token=node_token,
                 )
 
-                vm = await asyncio.to_thread(
-                    nova.create_server,
-                    conn,
-                    server_vm_name,
-                    server_flavor_id,
-                    network_id,
-                    boot_vol.id,
-                    userdata=userdata_result.data,
-                    metadata={
-                        "k3s_horse_generator_role": "k3s_server",
-                        "k3s_horse_generator_cluster_id": cluster_id,
-                        "k3s_horse_generator_cluster_name": cluster_name,
-                    },
-                    delete_boot_volume_on_termination=True,
-                    security_groups=[sg_id] if sg_id else None,
-                    config_drive=userdata_result.config_drive,
-                )
+                vm = await worker_ownership.run_sync(nova.create_server,
+                conn,
+                server_vm_name,
+                server_flavor_id,
+                network_id,
+                boot_vol.id,
+                userdata=userdata_result.data,
+                metadata={
+                    "k3s_horse_generator_role": "k3s_server",
+                    "k3s_horse_generator_cluster_id": cluster_id,
+                    "k3s_horse_generator_cluster_name": cluster_name,
+                },
+                delete_boot_volume_on_termination=True,
+                security_groups=[sg_id] if sg_id else None,
+                config_drive=userdata_result.config_drive,)
                 _logger.info("HA: server#%d VM %s created: %s", idx, server_vm_name, vm.id)
                 await inventory.record_resource(
                     None,
@@ -608,7 +596,7 @@ async def create_cluster_job(
             raise RuntimeError("Creation-time network snapshot is missing")
         if int(payload.get("agent_count") or 0) > 0:
             # Fail known agent metadata outages before creating the control plane.
-            flavors = await asyncio.to_thread(nova.list_flavors, conn)
+            flavors = await worker_ownership.run_sync(nova.list_flavors, conn)
             if not any(flavor.id == payload.get("agent_flavor_id") for flavor in flavors):
                 raise RuntimeError("Selected agent flavor is unavailable")
         # Step 1: Security Group
@@ -623,9 +611,7 @@ async def create_cluster_job(
 
         sg_name = f"k3s-{name}-{cluster_id[:8]}"
         sg_tags = inventory.build_drover_tags(cluster_id, operation_id, "security_group")
-        sg = await asyncio.to_thread(
-            neutron.create_security_group, conn, sg_name, f"k3s cluster {name} security group", tags=sg_tags
-        )
+        sg = await worker_ownership.run_sync(neutron.create_security_group, conn, sg_name, f"k3s cluster {name} security group", tags=sg_tags)
         sg_id = sg["id"]
         await inventory.record_resource(
             None,
@@ -639,7 +625,7 @@ async def create_cluster_job(
 
         rules = _cluster_security_group_rules(allowed_cidrs, sg_id)
         for rule_kwargs in rules:
-            rule = await asyncio.to_thread(neutron.create_security_group_rule, conn, sg_id, **rule_kwargs)
+            rule = await worker_ownership.run_sync(neutron.create_security_group_rule, conn, sg_id, **rule_kwargs)
             rule_id = rule.get("id") if isinstance(rule, dict) else getattr(rule, "id", None)
             if rule_id:
                 await inventory.record_resource(
@@ -668,14 +654,12 @@ async def create_cluster_job(
             if not lb_subnet_id:
                 raise RuntimeError("K3s API load-balancer subnet policy is required for HA clusters")
             lb_tags = inventory.build_drover_tags(cluster_id, operation_id, "load_balancer")
-            ha_lb = await asyncio.to_thread(
-                octavia.create_load_balancer,
-                conn,
-                f"k3s-ha-{name}-{cluster_id[:8]}",
-                lb_subnet_id,
-                vip_network_id=(policy_snapshot.get("k3s.api_lb_vip_network") or {}).get("id"),
-                tags=lb_tags,
-            )
+            ha_lb = await worker_ownership.run_sync(octavia.create_load_balancer,
+            conn,
+            f"k3s-ha-{name}-{cluster_id[:8]}",
+            lb_subnet_id,
+            vip_network_id=(policy_snapshot.get("k3s.api_lb_vip_network") or {}).get("id"),
+            tags=lb_tags,)
             ha_lb_id = ha_lb["id"]
             await inventory.record_resource(
                 None,
@@ -689,10 +673,8 @@ async def create_cluster_job(
             ha_lb_vip_address = ha_lb.get("vip_address") or ""
             if ha_lb_vip_address:
                 extra_tls_sans.append(ha_lb_vip_address)
-            await asyncio.to_thread(octavia.wait_for_load_balancer, conn, ha_lb_id)
-            listener = await asyncio.to_thread(
-                octavia.create_listener, conn, ha_lb_id, "TCP", 6443, name=f"k3s-ha-{name}-6443"
-            )
+            await worker_ownership.run_sync(octavia.wait_for_load_balancer, conn, ha_lb_id)
+            listener = await worker_ownership.run_sync(octavia.create_listener, conn, ha_lb_id, "TCP", 6443, name=f"k3s-ha-{name}-6443")
             await inventory.record_resource(
                 None,
                 cluster_id=cluster_id,
@@ -702,14 +684,12 @@ async def create_cluster_job(
                 operation_id=operation_id,
                 name=listener.get("name"),
             )
-            ha_lb_pool_id_raw = await asyncio.to_thread(
-                octavia.create_pool,
-                conn,
-                ha_lb_id,
-                "TCP",
-                name=f"k3s-ha-{name}-pool",
-                listener_id=listener["id"],
-            )
+            ha_lb_pool_id_raw = await worker_ownership.run_sync(octavia.create_pool,
+            conn,
+            ha_lb_id,
+            "TCP",
+            name=f"k3s-ha-{name}-pool",
+            listener_id=listener["id"],)
             ha_lb_pool_id = ha_lb_pool_id_raw["id"]
             await inventory.record_resource(
                 None,
@@ -725,13 +705,11 @@ async def create_cluster_job(
             if _fip_net:
                 _lb_vip_port = ha_lb.get("vip_port_id")
                 fip_tags = inventory.build_drover_tags(cluster_id, operation_id, "floating_ip")
-                _fip = await asyncio.to_thread(
-                    neutron.create_floating_ip,
-                    conn,
-                    floating_network_id=_fip_net,
-                    port_id=_lb_vip_port,
-                    tags=fip_tags,
-                )
+                _fip = await worker_ownership.run_sync(neutron.create_floating_ip,
+                conn,
+                floating_network_id=_fip_net,
+                port_id=_lb_vip_port,
+                tags=fip_tags,)
                 ha_fip_id = _fip.id if hasattr(_fip, "id") else _fip["id"]
                 ha_fip_address = (
                     _fip.floating_ip_address if hasattr(_fip, "floating_ip_address") else _fip["floating_ip_address"]
@@ -777,15 +755,13 @@ async def create_cluster_job(
             )
 
         vol_metadata = inventory.build_drover_metadata(cluster_id, operation_id, "volume")
-        boot_vol = await asyncio.to_thread(
-            cinder.create_volume_from_image,
-            conn,
-            f"{server_vm_name}-boot",
-            server_image_id,
-            boot_volume_size,
-            volume_availability_zone,
-            metadata=vol_metadata,
-        )
+        boot_vol = await worker_ownership.run_sync(cinder.create_volume_from_image,
+        conn,
+        f"{server_vm_name}-boot",
+        server_image_id,
+        boot_volume_size,
+        volume_availability_zone,
+        metadata=vol_metadata,)
         boot_volume_id = boot_vol.id
         await inventory.record_resource(
             None,
@@ -820,7 +796,7 @@ async def create_cluster_job(
 
         _internal_network_name = ""
         try:
-            _net_obj = await asyncio.to_thread(lambda: conn.network.get_network(network_id))
+            _net_obj = await worker_ownership.run_sync(lambda: conn.network.get_network(network_id))
             _internal_network_name = _net_obj.name or ""
         except Exception:
             pass
@@ -855,7 +831,7 @@ async def create_cluster_job(
 
         manifest_kwargs: dict = {"app_credential": app_cred, "cluster_id": cluster_id}
         if active_plugins.get("octavia_ingress", False):
-            subnets = await asyncio.to_thread(lambda: list(conn.network.subnets(network_id=network_id)))
+            subnets = await worker_ownership.run_sync(lambda: list(conn.network.subnets(network_id=network_id)))
             if not subnets:
                 raise RuntimeError(
                     f"네트워크 {network_id}에 subnet이 없습니다. Octavia Ingress를 위한 subnet 도출 실패."
@@ -914,19 +890,17 @@ async def create_cluster_job(
                 "k3s_horse_generator_cluster_name": name,
             }
         )
-        server_vm = await asyncio.to_thread(
-            nova.create_server,
-            conn,
-            server_vm_name,
-            server_flavor_id,
-            network_id,
-            boot_volume_id,
-            userdata=userdata_result.data,
-            metadata=server_vm_metadata,
-            delete_boot_volume_on_termination=True,
-            security_groups=[sg_id],
-            config_drive=userdata_result.config_drive,
-        )
+        server_vm = await worker_ownership.run_sync(nova.create_server,
+        conn,
+        server_vm_name,
+        server_flavor_id,
+        network_id,
+        boot_volume_id,
+        userdata=userdata_result.data,
+        metadata=server_vm_metadata,
+        delete_boot_volume_on_termination=True,
+        security_groups=[sg_id],
+        config_drive=userdata_result.config_drive,)
         server_vm_id = server_vm.id
         await inventory.record_resource(
             None,

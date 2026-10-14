@@ -17,6 +17,9 @@ python3 scripts/check_architecture.py
 
 The root `drover` wheel owns the Python package and the Kolla-Ansible role as wheel shared data. Installing the wheel places the role at `share/kolla-ansible/ansible/roles/drover` under the installation prefix; it does not install Kolla-Ansible or service runtime dependencies.
 
+**Prepared 0.4.15 candidate (not tested, built or deployed here):** latest-dev native provisioning/credential protections plus distributed periodic worker ownership, SQL mutation non-replay/drain and fail-closed SQL inventory. Registry/package metadata is 0.4.15; immutable source-build SHA awaits the parent’s corrected-source commit. Stop/drain every old worker before the new cohort; mixed old/new SQL consumers are unsafe. See [candidate gates and prerequisites](docs/release-0.4.0.md#0415-patch--latest-dev-wip-integration-and-distributed-worker-cutover).
+
+
 Use the `service` extra to run the API, worker, or migration entry points locally:
 
 ```bash

@@ -1,4 +1,4 @@
-"""Correlation middleware and logging context utilities for Drover."""
+"""Trusted proxy scheme handling, correlation middleware and logging context utilities."""
 
 from __future__ import annotations
 
@@ -104,6 +104,7 @@ class TrustedProxySchemeMiddleware:
         if scope["type"] == "http" and (peer := scope.get("client")):
             schemes = [value.strip() for name, value in scope.get("headers", [])
                        if name.lower() == b"x-forwarded-proto"]
+            # Ambiguous lists, duplicate headers, and non-HTTP schemes are not authoritative.
             if (len(schemes) == 1 and schemes[0] in {b"http", b"https"}
                     and is_ip_in_cidrs(peer[0], get_settings().trusted_proxies)):
                 scope["scheme"] = schemes[0].decode("ascii")

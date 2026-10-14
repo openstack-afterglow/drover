@@ -9,6 +9,7 @@ from sqlalchemy import select
 from drover.db import get_session_factory, is_db_available
 from drover.models.orm import DroverJob, K3sCluster, K3sNodegroup, K3sNodegroupVM
 from drover.models.schemas import _validate_nodegroup_resource_id
+from drover.services.worker_ownership import checkpoint
 
 _logger = logging.getLogger(__name__)
 
@@ -355,6 +356,7 @@ async def merge_stampede_state(cluster_id: str, nodegroup_id: str, updates: dict
         )).scalar_one_or_none()
         if ng is None:
             return None
+        await checkpoint()
         ng.stampede_state = {**(ng.stampede_state or {}), **updates}
         ng.updated_at = datetime.now(UTC)
         return dict(ng.stampede_state)

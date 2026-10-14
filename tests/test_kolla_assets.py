@@ -87,6 +87,23 @@ def test_jinja2_templates_compile():
 
 
 
+def test_api_image_preserves_socket_peer():
+    """Container startup leaves forwarding semantics to Drover's trusted proxy boundary."""
+    dockerfile = (REPO_ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+    api_stage = dockerfile.split("FROM drover-runtime AS drover-api\n", 1)[1].split("\nFROM ", 1)[0]
+    assert '"--no-proxy-headers"' in api_stage
+    assert '"--proxy-headers"' not in api_stage
+    assert '"--forwarded-allow-ips"' not in api_stage
+    defaults = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
+    assert defaults["drover_trusted_proxies"] == "127.0.0.1/32,::1/128"
+    command = defaults["drover_services"]["drover-api"]["command"]
+    assert "--no-proxy-headers" in command
+    assert "--proxy-headers" not in command
+    assert "--forwarded-allow-ips" not in command
+    template = (ROLE_DIR / "templates" / "drover.conf.j2").read_text(encoding="utf-8")
+    assert 'trusted_proxies = "{{ drover_trusted_proxies }}"' in template
+
+
 def test_action_dispatch_and_ordering():
     """Verify action validation, task inclusion, and migration-before-start ordering."""
     main_tasks_file = ROLE_DIR / "tasks" / "main.yml"

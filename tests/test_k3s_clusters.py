@@ -944,13 +944,13 @@ async def test_dashboard_cluster_stats_chunks_hmget_and_times_out_without_partia
 
 
 # ---------------------------------------------------------------------------
-# DB OperationalError → 빈 목록 graceful degrade
+# DB failure remains unavailable, not successfully empty inventory.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_list_drover_clusters_db_operational_error_returns_empty(client):
-    """DB OperationalError 발생 시 list_drover_clusters가 200 + 빈 배열을 반환한다."""
+async def test_list_drover_clusters_db_operational_error_returns_503(client):
+    """OperationalError must not be represented as an empty 200 inventory."""
     from sqlalchemy.exc import OperationalError
 
     with (
@@ -960,14 +960,14 @@ async def test_list_drover_clusters_db_operational_error_returns_empty(client):
         mock_db.list_clusters = AsyncMock(side_effect=OperationalError("lost connection", None, None))
         resp = await client.get("/v1/clusters")
 
-    assert resp.status_code == 200
-    assert resp.json() == []
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "Cluster inventory unavailable"}
     mock_mark.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_list_drover_clusters_db_interface_error_returns_empty(client):
-    """DB InterfaceError 발생 시 list_drover_clusters가 200 + 빈 배열을 반환한다."""
+async def test_list_drover_clusters_db_interface_error_returns_503(client):
+    """InterfaceError must not be represented as an empty 200 inventory."""
     from sqlalchemy.exc import InterfaceError
 
     with (
@@ -977,8 +977,8 @@ async def test_list_drover_clusters_db_interface_error_returns_empty(client):
         mock_db.list_clusters = AsyncMock(side_effect=InterfaceError("connection reset", None, None))
         resp = await client.get("/v1/clusters")
 
-    assert resp.status_code == 200
-    assert resp.json() == []
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "Cluster inventory unavailable"}
     mock_mark.assert_called_once()
 
 

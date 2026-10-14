@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -622,3 +624,53 @@ async def test_final_persistence_preserves_lifecycle_change_after_observation(
     assert row.last_reconciled_at is None
     assert row.drift_status is None
     assert row.updated_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["recorded", "orphans"])
+async def test_reconciliation_sdk_reads_leave_domain_heartbeat_runnable_and_drain(test_store, monkeypatch, boundary):
+    test_store.add_cluster("project", "cluster", {"server_vm_id": "server"})
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    domain_thread = threading.get_ident()
+
+    def block():
+        assert threading.get_ident() != domain_thread
+        entered.set()
+        assert release.wait(2)
+        finished.set()
+
+    def fetch(*args, **kwargs):
+        if boundary == "recorded":
+            block()
+        return DummyServer("server", "primary", "project", "cluster")
+
+    def orphans(*args, **kwargs):
+        if boundary == "orphans":
+            block()
+        return []
+
+    monkeypatch.setattr(reconciliation, "fetch_recorded_resource", fetch)
+    monkeypatch.setattr(reconciliation, "scan_orphan_resources", orphans)
+    task = asyncio.create_task(reconciliation.reconcile_cluster("project", "cluster", conn=_empty_connection()))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), timeout=1.5)
+        heartbeat = asyncio.Event()
+
+        async def heartbeat_tick():
+            await asyncio.sleep(0)
+            heartbeat.set()
+
+        await heartbeat_tick()
+        assert heartbeat.is_set() and not finished.is_set()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "Cancellation abandoned an outstanding provider observation"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)

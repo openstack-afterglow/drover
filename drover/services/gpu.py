@@ -5,7 +5,7 @@ import re
 
 import httpx
 
-from drover.services import kube, store
+from drover.services import execution_safety, kube, store
 
 _TOOLKIT_VERSION = "1.20.1-1"
 _DEVICE_PLUGIN_IMAGE = "nvcr.io/nvidia/k8s-device-plugin:v0.17.3"
@@ -149,6 +149,7 @@ async def ensure_device_plugin(cluster_id: str) -> None:
     context = kube._make_ssl_context(cert, key)
     endpoint = f"{server}/apis/apps/v1/namespaces/kube-system/daemonsets"
     async with httpx.AsyncClient(verify=context, timeout=30) as client:
+        execution_safety.protect_httpx_client(client)
         response = await client.get(endpoint)
         if response.status_code != 200:
             raise RuntimeError(f"GPU device-plugin discovery failed HTTP {response.status_code}")

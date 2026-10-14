@@ -10,6 +10,7 @@ import openstack.connection
 from openstack.exceptions import NotFoundException, ResourceNotFound
 
 from drover.services import cluster_authority, execution, inventory, keystone, operations, store
+from drover.services.worker_ownership import checkpoint, run_sync
 
 _logger = logging.getLogger("drover.reconciliation")
 
@@ -544,7 +545,7 @@ async def reconcile_cluster(
             meta = target["metadata"]
 
             # Query OpenStack by recorded ID (transient errors bubble up)
-            resource_obj = fetch_recorded_resource(conn, svc, rtype, rid, metadata=meta)
+            resource_obj = await run_sync(fetch_recorded_resource, conn, svc, rtype, rid, metadata=meta)
             checked_count += 1
 
             if resource_obj is not None:
@@ -599,7 +600,7 @@ async def reconcile_cluster(
                 })
 
         # Scan for unknown tagged orphan resources (report-only, no deletion)
-        orphaned_resources = scan_orphan_resources(conn, project_id, cluster_id, known_resource_ids)
+        orphaned_resources = await run_sync(scan_orphan_resources, conn, project_id, cluster_id, known_resource_ids)
 
         has_missing_required = any(m.get("is_required", True) for m in missing_resources)
         has_drift = bool(missing_resources or orphaned_resources or state_mismatches)
@@ -686,8 +687,8 @@ async def reconcile_cluster(
             await keystone.close_connection(conn)
 
 
-async def schedule_worker_reconciliations(max_per_project: int = 2) -> list[str]:
-    """Schedule cluster reconciliations for active clusters bounded per-project and serialized per-cluster."""
+async def schedule_worker_reconciliations(cluster_ids: list[str], max_per_project: int = 2) -> list[str]:
+    """Schedule discovery-published targets, bounded per-project and serialized per-cluster."""
     from collections import defaultdict
 
     from sqlalchemy import select
@@ -697,13 +698,15 @@ async def schedule_worker_reconciliations(max_per_project: int = 2) -> list[str]
     from drover.services import jobs
 
     factory = get_session_factory()
-    if factory is None:
+    if factory is None or not cluster_ids:
         return []
 
     enqueued_job_ids: list[str] = []
 
     async with factory() as session:
+        await checkpoint()
         stmt = select(K3sCluster).where(
+            K3sCluster.id.in_(cluster_ids),
             K3sCluster.deleted_at.is_(None),
             K3sCluster.status.in_(["ACTIVE", "ERROR"]),
         )
@@ -761,6 +764,7 @@ async def schedule_worker_reconciliations(max_per_project: int = 2) -> list[str]
                 if c.id in clusters_with_active_jobs:
                     continue
 
+                await checkpoint()
                 job_id = await jobs.enqueue_job(
                     cluster_id=c.id,
                     project_id=project_id,

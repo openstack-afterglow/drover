@@ -28,7 +28,7 @@ from starlette.requests import Request
 
 from drover.auth import CacheMode, cache_mode, get_os_conn, get_token_info
 from drover.config import get_settings
-from drover.db import mark_db_unhealthy
+from drover.db import is_db_available, is_db_configured, mark_db_unhealthy
 from drover.models.schemas import (
     CreateK3sClusterRequest,
     K3sAttachInterfaceRequest,
@@ -49,6 +49,7 @@ from drover.services.cache import cached_call, invalidate, ttl_normal
 from drover.services.cache import invalidation as cache_invalidation
 from drover.services.cache import keys as cache_keys
 from drover.services.deletion import delete_cluster_progress as _delete_cluster_progress
+from drover.services.store import ClusterInventoryUnavailable
 from drover.utils.ssh_keys import normalize_ssh_public_key
 
 router = APIRouter()
@@ -116,24 +117,24 @@ async def list_k3s_clusters(
 ):
     project_id = token_info["project_id"]
     authorize("drover:clusters:get", {"project_id": project_id}, token_info)
+    # An open SQL breaker is authoritative even when a previous list is cached.
+    if is_db_configured() and not is_db_available():
+        raise HTTPException(status_code=503, detail="Cluster inventory unavailable")
     sub = "all" if include_deleted else None
     cache_key = cache_keys.project_key("k3s", project_id, "clusters", sub=sub)
 
     async def _fetch():
-        try:
-            clusters = await k3s_cluster.list_clusters(project_id, include_deleted=include_deleted)
-        except (OperationalError, InterfaceError):
-            _logger.warning("k3s 클러스터 목록 DB 조회 실패 — 빈 목록 반환", exc_info=True)
-            mark_db_unhealthy()
-            return []
+        clusters = await k3s_cluster.list_clusters(project_id, include_deleted=include_deleted)
         return [_cluster_to_info(c) for c in clusters]
 
     try:
         return await cached_call(cache_key, ttl_normal(), _fetch, enabled=cm.enabled, refresh=cm.refresh)
+    except ClusterInventoryUnavailable:
+        raise HTTPException(status_code=503, detail="Cluster inventory unavailable") from None
     except (OperationalError, InterfaceError):
-        _logger.warning("k3s 클러스터 목록 DB 조회 실패 — 빈 목록 반환", exc_info=True)
+        _logger.warning("k3s cluster inventory database unavailable", exc_info=True)
         mark_db_unhealthy()
-        return []
+        raise HTTPException(status_code=503, detail="Cluster inventory unavailable") from None
 
 
 @router.get("/{cluster_id}", response_model=K3sClusterInfo)

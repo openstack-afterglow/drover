@@ -1,5 +1,6 @@
 """Tests for file-backed credentials and cloud-init secret exclusions."""
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -79,6 +80,7 @@ def test_validate_config_with_file_backed_credentials(tmp_path):
 
 
 
+
 def test_kolla_secret_files_are_root_group_readable_for_non_root_container():
     role_root = Path(__file__).parents[1] / "deploy" / "kolla" / "ansible" / "roles" / "drover"
     tasks_text = (role_root / "tasks" / "config.yml").read_text()
@@ -124,7 +126,6 @@ def test_fcos_ignition_cloud_conf_mode_0600():
     )
 
     import base64
-    import json
 
     ign_dict = json.loads(base64.b64decode(res.data).decode())
     files = ign_dict.get("storage", {}).get("files", [])

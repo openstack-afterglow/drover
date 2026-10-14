@@ -65,6 +65,19 @@ TOML keys under `[drover]` (Settings/Kolla use the corresponding `drover_` prefi
 
 Role configuration rejects `admin` and `manager`. Barbican `member` authorization and Octavia `load-balancer_member` policy sufficiency are **[INFERENCE]**, not live-verified defaults; qualify the deployed service policies/KEK ACL before rollout.
 
+Use TOML arrays for the role lists. An explicitly present environment key takes precedence over TOML, including an empty value; role lists must be a JSON array and an empty string fails validation, for example `DROVER_DELEGATED_REQUIRED_ROLES='["member"]'`; comma-separated strings fail with `SettingsError`. Before the 2026-10-08 settings-bridge correction, every TOML-backed startup failed in `get_settings()` with `SettingsError` for `drover_delegated_required_roles` before `drover-migrate --apply` reached the database. This included files without role keys (the defaults are still arrays) and Kolla's `tojson`-rendered file.
+
 Remove retired Settings/Kolla variables `drover_afterglow_provisioning_url`, `drover_afterglow_provisioning_token`, `drover_afterglow_provisioning_token_file`, TOML `afterglow_provisioning_url/token/token_file` and environment `DROVER_AFTERGLOW_PROVISIONING_TOKEN_FILE`. Afterglow provisioning intents are gone. Kolla `tasks/config.yml` removes the `afterglow_k3s_provisioning_token` file. Keep GPU admission URL/token/file settings and the separate admission token file: native GPU worker creates re-check admission before each new create when that URL is configured; admission is a live-usage check, not a capacity reservation.
 
 Sources: [`delegation.py`](../services/delegation.py), [`execution.py`](../services/execution.py), [`cluster_authority.py`](../services/cluster_authority.py), [`guest_rollout.py`](../services/guest_rollout.py), [`jobs.py`](../services/jobs.py), [`authorization.py`](../api/authorization.py), [`Kolla role`](../../deploy/kolla/ansible/roles/drover/). See the [API reference](../../docs/drover-api-v1-reference.md) for responses and SDK helpers.
+
+## Distributed worker cutover (0.4.15)
+
+This version adds no migration beyond ledger 001–004 and no destructive/backfill SQL. Worker-owned accepted/unknown mutation fences use existing job payload storage, not a new queue table.
+
+Stop mutation admission and automatic sizing, settle queued/running work and callback/HA/agent continuations, then stop and fully drain **all** old SQL workers before starting the new API/Worker cohort. SQL consumers on every replica remain independent of Redis periodic ownership. Old binaries ignore ambiguity markers and periodic leases, so mixed-version consumers and rollback while new work remains are unsafe and unqualified. Keep an ambiguous job’s provider inventory for explicit operator resolution; do not clear its marker or blindly replay it. Graceful cancellation must drain actual SDK/authentication threads before releasing ownership/closing pools; already-sent provider requests cannot be undone.
+
+All replicas require the same MariaDB and service-local Redis/Sentinel namespace/DB. Preserve callback/cache writer discovery and DB index, encryption key and configured requester/control/guest authority. Redis errors revoke periodic admission; async-replication lease loss, promoted-node TIME skew and production Sentinel failover still require qualification. Legacy reauthorization and owner/operator credential retirement follow the 004 ordering above.
+
+The current candidate has no gate/build/runtime/deployment evidence from this integration. See [0.4.15 release prerequisites and parent commands](../../docs/release-0.4.0.md#0415-patch--latest-dev-wip-integration-and-distributed-worker-cutover); historical original-WIP smoke receipts do not qualify the merged candidate.
+

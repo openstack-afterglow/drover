@@ -1,6 +1,6 @@
 """Stampede Reconciler — k3s 노드 오토스케일 내부 루프.
 
-drover worker.py에서 주기적으로 run_all()을 호출.
+The worker polls only its assigned ACTIVE + stampede_enabled targets.
 ACTIVE + stampede_enabled 클러스터의 각 노드그룹을 순회하며:
   - Unschedulable pod 감지 → fit-check → VM 추가 (scale-up)
   - 유휴 노드 감지 → cordon/drain/삭제 (scale-down)
@@ -14,6 +14,7 @@ import uuid
 
 from drover.config import get_settings
 from drover.services import gpu
+from drover.services.worker_ownership import checkpoint, run_sync
 
 _logger = logging.getLogger("drover.stampede")
 
@@ -27,6 +28,7 @@ async def _record_stampede_event(
     extra: dict | None = None,
 ) -> None:
     """Record best-effort Redis activity; durable jobs retain operation events."""
+    await checkpoint()
     try:
         from drover.services.activity import record
 
@@ -290,7 +292,7 @@ async def _get_available_flavors(project_id: str) -> list[dict]:
     from drover.services import execution, nova
 
     async with execution.connection(project_id) as conn:
-        raw = await asyncio.to_thread(nova.list_flavors, conn)
+        raw = await run_sync(nova.list_flavors, conn)
     return [{"id": flavor.id, "name": flavor.name, "vcpus_m": int(flavor.vcpus or 0) * 1000,
              "ram_bytes": int(flavor.ram or 0) * 1024 * 1024, "gpu": gpu.flavor_gpu_count(flavor.extra_specs or {}),
              "extra_specs": flavor.extra_specs or {}} for flavor in raw]
@@ -299,6 +301,7 @@ async def _get_available_flavors(project_id: str) -> list[dict]:
 async def _update_stampede_state(nodegroup_id: str, cluster_id: str, updates: dict) -> None:
     from drover.services import nodegroup
 
+    await checkpoint()
     await nodegroup.merge_stampede_state(cluster_id, nodegroup_id, updates)
 
 
@@ -358,6 +361,7 @@ async def _scale_up_nodegroup(
             return
         gpu_required = gpu_required or admitted_gpu
     await _update_stampede_state(ng_id, cluster_id, {"quota_state": {"allowed": True}, "flavor_summary": {**flavor, "estimated_allocatable": estimated}})
+    await checkpoint()
     reservation = await jobs.enqueue_stampede_job(
         cluster_id, project_id, ng_id, direction="up", requested_count=min(needed, room),
         expected_node_count=nodegroup.get("node_count", 0),
@@ -505,6 +509,7 @@ async def _scale_down_nodegroup(
         return
     remove_node = min(candidates, key=lambda item: (item[0], item[1]["name"]))[1]
     entry = next(vm for vm in nodegroup["vms"] if vm.get("name") == remove_node["name"])
+    await checkpoint()
     reservation = await enqueue_stampede_job(
         cluster_id, project_id, ng_id, direction="down", requested_count=1,
         expected_node_count=nodegroup.get("node_count", 0),
@@ -533,7 +538,7 @@ async def _delete_and_track(project_id: str, cluster_id: str, payload: dict, ope
     if entries:
         async with execution.connection(project_id) as conn:
             for vm_id in tracked_ids | requested_ids:
-                server = await asyncio.to_thread(nova.observe_server, conn, vm_id)
+                server = await run_sync(nova.observe_server, conn, vm_id)
                 if server is not None and not nova.is_server_deleting(server):
                     live_ids.add(vm_id)
     # Lookup/auth failures propagate; absent/deleting servers only resume cleanup.
@@ -576,6 +581,7 @@ async def reconcile_cluster(cluster: dict) -> None:
     if not cluster_id or not project_id:
         return
     settings = get_settings()
+    await checkpoint()
     groups = [ng for ng in await nodegroup.list_nodegroups(cluster_id) if ng.get("stampede_enabled") and ng.get("role") == "agent" and ng.get("flavor_id")]
     if not groups:
         return
@@ -593,12 +599,14 @@ async def reconcile_cluster(cluster: dict) -> None:
         try:
             if flavors is None:
                 raise RuntimeError("flavor observation unavailable")
+            await checkpoint()
             pending, capacities, pods = await asyncio.gather(kube.list_unschedulable_pods(cluster_id), kube.get_node_capacity(cluster_id), kube.get_pod_resource_usage(cluster_id))
         except Exception:
             _logger.warning("Stampede observation failed cluster_id=%s", cluster_id)
             for ng in groups:
                 await _update_stampede_state(ng["id"], cluster_id, {"idle_since": {}, "last_decision": "observation_failed", "last_blocked_reason": "observation_unavailable"})
             return
+        await checkpoint()
         await _decide(cluster_id, project_id, groups, flavors, pending, capacities, pods, settings)
 
 
@@ -630,13 +638,14 @@ async def _decide(cluster_id: str, project_id: str, groups: list[dict], flavors:
             await _update_stampede_state(ng["id"], cluster_id, {"idle_since": {}, "last_decision": "decision_failed", "last_blocked_reason": "decision_unavailable"})
 
 
-async def run_all() -> None:
+async def run_cluster(cluster_id: str) -> None:
+    """Observe one assigned target after reloading its current SQL eligibility."""
     from drover.services import store
 
+    await checkpoint()
     if not get_settings().drover_stampede_enabled:
         return
-    clusters = [cluster for cluster in await store.list_all_clusters(include_deleted=False) if cluster.get("status") == "ACTIVE" and cluster.get("stampede_enabled")]
-    results = await asyncio.gather(*(reconcile_cluster(cluster) for cluster in clusters), return_exceptions=True)
-    for cluster, result in zip(clusters, results, strict=True):
-        if isinstance(result, Exception):
-            _logger.warning("Stampede reconcile failed cluster_id=%s", cluster["id"])
+    cluster = await store.get_cluster_admin(cluster_id)
+    if cluster and cluster.get("status") == "ACTIVE" and cluster.get("stampede_enabled") and not cluster.get("deleted_at"):
+        await checkpoint()
+        await reconcile_cluster(cluster)

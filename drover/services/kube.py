@@ -15,6 +15,7 @@ from decimal import ROUND_CEILING, Decimal, localcontext
 import httpx
 import yaml
 
+from drover.services import execution_safety
 from drover.services import store as k3s_db
 from drover.services.errors import K3sApiError
 
@@ -83,6 +84,7 @@ async def delete_k8s_node(cluster_id: str, node_name: str) -> bool:
         ssl_ctx = _make_ssl_context(cert_pem, key_pem)
 
         async with httpx.AsyncClient(verify=ssl_ctx, timeout=10.0) as client:
+            execution_safety.protect_httpx_client(client)
             resp = await client.delete(
                 f"{server_url}/api/v1/nodes/{node_name}",
                 headers={"Accept": "application/json"},
@@ -133,6 +135,7 @@ async def _kube_client(cluster_id: str, *, project_id: str | None = None, verify
         if verify_server else _make_ssl_context(cert_pem, key_pem)
     )
     async with httpx.AsyncClient(verify=ssl_ctx, timeout=15.0) as client:
+        execution_safety.protect_httpx_client(client)
         yield client, server_url
 
 

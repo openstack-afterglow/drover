@@ -76,3 +76,26 @@ Cluster deletion SHALL use only the current authorized actor's delegation. Crede
 #### Scenario: Original creator left
 - **WHEN** a current clusters admin deletes a cluster created by a user who has left the project
 - **THEN** deletion runs under the admin's trust and completes
+
+### Requirement: Service-local periodic ownership
+Workers sharing Drover's Redis and MariaDB SHALL register independent Redis-server-time membership. Only the discovery owner SHALL discover the shared cluster registry. Live eligible replicas SHALL divide recovery, reconciliation and delegation roles and health/Stampede targets, retaining healthy current owners rather than shuffling them on every heartbeat. Ownership SHALL NOT replace durable SQL job competing claims, attempt fences, operation authority, caller trusts, resource-owner/source validation or accepted/unknown non-replay.
+
+#### Scenario: Three native replicas
+- **WHEN** three worker processes share the same service Redis and DB
+- **THEN** a single discovery owner publishes targets, roles/targets are divided among eligible processes, and healthy target owners do not duplicate polling
+
+#### Scenario: Blocked SDK and revocation
+- **WHEN** cluster SDK work blocks a domain event loop or an assignment is revoked
+- **THEN** membership and assignment scheduling continue independently, the old token cannot release a newer assignment, and the former owner cannot begin subsequent mutations after the revocation fence
+
+#### Scenario: POSIX stop and crash
+- **WHEN** a worker receives SIGTERM/SIGINT or crashes
+- **THEN** graceful stop revokes and cancels every owned task and drains before token-only release; crash takeover waits for server-time membership expiry
+
+#### Scenario: Ambiguous external mutation
+- **WHEN** a physical mutation was accepted or its result is unknown after error, cancellation or worker loss
+- **THEN** the SQL job is not automatically replayed, existing operation/caller/resource authority remains required, and operators inspect durable status and provider inventory rather than blindly retrying
+
+
+**Integration boundary (0.4.15):** The dated results above qualify the preserved original WIP only, not the latest-dev integration. This integration has not run tests, lint, builds, architecture stamping, native smoke or deployment; the parent owns those gates. Latest native role-inference, Sentinel and GPU/plugin protections are retained.
+

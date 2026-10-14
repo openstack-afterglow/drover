@@ -4,6 +4,7 @@ import os
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 from pydantic_settings import SettingsError
 
 from drover import config
@@ -110,6 +111,86 @@ def test_get_settings_explicit_json_environment_overrides_toml_arrays(isolated_t
     assert settings.os_auth_url == "https://environment.example.test/v3"
 
 
+def test_file_startup_without_explicit_roles_preserves_held_role_delegation(isolated_toml_settings):
+    from drover.services.delegation import select_delegated_roles
+
+    isolated_toml_settings.write_text('[openstack]\nauth_url = "https://keystone.example.test/v3"\n', encoding="utf-8")
+
+    assert select_delegated_roles({"member": "member-id", "admin": "admin-id"}) == (["member"], ["member-id"])
+
+
+def test_file_startup_loads_role_and_callback_arrays(isolated_toml_settings):
+    from drover.services.delegation import DelegationDenied, select_delegated_roles
+
+    isolated_toml_settings.write_text(
+        '[drover]\ndelegated_required_roles = ["member", "compute_user"]\n'
+        'delegated_optional_roles = ["load-balancer_member", "network_user"]\n'
+        'callback_allowed_cidrs = ["192.0.2.0/24", "2001:db8::/64"]\n',
+        encoding="utf-8",
+    )
+
+    settings = config.get_settings()
+    assert settings.drover_callback_allowed_cidrs == ["192.0.2.0/24", "2001:db8::/64"]
+    with pytest.raises(DelegationDenied):
+        select_delegated_roles({"member": "member-id"})
+    assert select_delegated_roles(
+        {
+            "member": "member-id",
+            "compute_user": "compute-id",
+            "network_user": "network-id",
+            "admin": "admin-id",
+        }
+    ) == (["member", "compute_user", "network_user"], ["member-id", "compute-id", "network-id"])
+
+
+def test_json_environment_roles_override_file_roles(isolated_toml_settings):
+    from drover.services.delegation import select_delegated_roles
+
+    isolated_toml_settings.write_text(
+        '[drover]\ndelegated_required_roles = ["file_user"]\ndelegated_optional_roles = ["file_optional"]\n',
+        encoding="utf-8",
+    )
+    os.environ["DROVER_DELEGATED_REQUIRED_ROLES"] = '["member"]'
+    os.environ["DROVER_DELEGATED_OPTIONAL_ROLES"] = '["network_user"]'
+
+    assert select_delegated_roles(
+        {
+            "member": "member-id",
+            "network_user": "network-id",
+            "file_user": "file-id",
+            "file_optional": "optional-id",
+        }
+    ) == (["member", "network_user"], ["member-id", "network-id"])
+
+
+@pytest.mark.parametrize("source", ["toml", "environment"])
+@pytest.mark.parametrize("field", ["delegated_required_roles", "delegated_optional_roles"])
+@pytest.mark.parametrize("role", ["admin", "Manager"])
+def test_file_startup_rejects_privileged_delegation(isolated_toml_settings, source, field, role):
+    isolated_toml_settings.write_text(
+        f'[drover]\n{field} = ["{role}"]\n' if source == "toml" else "[drover]\n",
+        encoding="utf-8",
+    )
+    if source == "environment":
+        os.environ[f"DROVER_{field.upper()}"] = f'["{role}"]'
+
+    with pytest.raises(ValidationError, match="must not include admin or manager"):
+        config.get_settings()
+
+
+@pytest.mark.parametrize("source", ["toml", "environment"])
+def test_file_startup_rejects_empty_required_delegation(isolated_toml_settings, source):
+    isolated_toml_settings.write_text(
+        "[drover]\ndelegated_required_roles = []\n" if source == "toml" else "[drover]\n",
+        encoding="utf-8",
+    )
+    if source == "environment":
+        os.environ["DROVER_DELEGATED_REQUIRED_ROLES"] = "[]"
+
+    with pytest.raises(ValidationError, match="must contain at least one role"):
+        config.get_settings()
+
+
 def test_afterglow_openstack_section_is_mapped(monkeypatch):
     monkeypatch.setattr(
         config,
@@ -121,7 +202,6 @@ def test_afterglow_openstack_section_is_mapped(monkeypatch):
 
     assert settings["os_auth_url"] == "https://keystone.example.test/v3"
     assert settings["os_region_name"] == "RegionTwo"
-
 
 
 def test_declared_runtime_settings_toml_mapping(monkeypatch):

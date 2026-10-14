@@ -36,7 +36,7 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - Active GPU quota 소유권의 Afterglow 단독 이관에 따른 Drover legacy `gpu_quotas` 테이블의 소스 은퇴(Source Table Retirement) 절차
    - 마이그레이션 데이터 감사(Audit), Afterglow 권한 롤아웃 검증 및 물리적 `DROP TABLE` 전제 조건 체크리스트
 
-5. **[Drover 0.4.0–0.4.14 릴리스 노트](release-0.4.0.md)**
+5. **[Drover 0.4.0–0.4.15 릴리스 노트](release-0.4.0.md)**
    - Pod 요청/Node allocatable 계산, GPU 준비성, 원자적 예약/fencing, 300–600초 안정화 및 drain 축소
    - Afterglow 상태/이벤트 API, 부분 삭제 재시도와 실제 배포 검증 범위
    - 0.4.1 patch: project에 공유된 private(GPU) flavor를 nodegroup flavor로 허용
@@ -56,6 +56,7 @@ Drover는 OpenStack 환경에서 K3s Kubernetes 클러스터의 라이프사이�
    - [0.4.13 발행·배포·live 검증](release-0.4.0.md#live-default-on-and-accelerator-acceptance): 생략 필드 기본값, GPU0→1 `accelerator` nodeSelector Pod 실행·자동 label, 정리·보존 확인과 taint 없는 GPU worker의 축소 차단 경계([발행·rollout receipt](release-0.4.0.md#tagged-0413-publication-and-canonical-rollout))
    - [0.4.14 GPU API·CSI 호환](release-0.4.0.md#0414-patch--fail-closed-flavor-metadata-and-gpu-csi-tolerations): flavor metadata fail-closed, GPU NoSchedule CSI toleration, API 전용 image/taint·Pod resources/mount/scale-in과 Afterglow 별도 인계
    - [0.4.14 실제 GPU·CSI·자연축소 receipt](release-0.4.0.md#live-0414-gpu-csi-and-natural-scale-in-acceptance): GPU NoSchedule 격리, RTX3060 실행, native Cinder RWO/Manila NFS RWX I/O, 기존 600초 idle/300초 cooldown의1→0 SUCCEEDED와 실제 VM/Node/volume404·시험 자원 정리·보존
+   - [0.4.15 로컬 qualification과 pending cutover](release-0.4.0.md#0415-patch--latest-dev-wip-integration-and-distributed-worker-cutover): 현재 통합 소스 service1560/3skip·SDK114·Ruff, amd64/arm64 API/Worker 실행, arm64 Docker-contained ownership smoke exit0·wheel receipt; 이전 WIP 증거는 historical로 분리. source commit → 별도 exact-SHA pin commit/restamp → tag·CI/발행/배포는 pending; admission/autosizing 중지·old SQL worker 전원 drain·mixed cohort 금지, 새 migration 없음
 
 6. **[Drover 0.3.0 및 0.3.1 준비 기록](release-0.3.0.md)**
    - 구조화 요청/job 로그, opt-in `LOG_LEVEL=DEBUG`, Redis 5 종료 API 수정과 당시 검증 기록

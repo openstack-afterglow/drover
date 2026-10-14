@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -16,12 +16,13 @@ from drover.db import get_session_factory
 from drover.logging import safe_metadata
 from drover.models.orm import DroverJob, DroverOperation, K3sCluster, K3sNodegroup, K3sNodegroupVM
 from drover.services import delegation as _delegation
-from drover.services import execution, operations
+from drover.services import execution, execution_safety, operations, worker_ownership
 from drover.services.delegation import AdmittedDelegation
 
 _logger = logging.getLogger("drover.jobs")
 _LEASE_SECONDS = 900
 _MAX_ATTEMPTS = 3
+_EXECUTION_START = "_drover_execution_started"
 _BATCH_SIZE = 5
 _SUPPORTED_KINDS = frozenset(
     {
@@ -86,8 +87,11 @@ async def enqueue_job(
         raise ValueError("A job references exactly one delegation")
     if kind not in _SUPPORTED_KINDS:
         raise ValueError(f"unsupported Drover job kind: {kind}")
+    if any(key in payload for key in (_EXECUTION_START, "_delegation_id", "_operation_id")):
+        raise ValueError("Execution checkpoint metadata is owned by the worker")
 
     async def persist() -> str:
+        await worker_ownership.checkpoint()
         target_op_id = operation_id
         if not target_op_id:
             mapped_op_kind = op_kind or JOB_TO_OP_KIND.get(kind, "create")
@@ -111,6 +115,7 @@ async def enqueue_job(
             if delegation.project_id != project_id or delegation.cluster_id != cluster_id:
                 raise ValueError("Delegation scope does not match the job")
             job_delegation_id = await _delegation.persist(session, delegation, target_op_id)
+        await worker_ownership.checkpoint()
         job = DroverJob(
             id=str(uuid.uuid4()),
             cluster_id=cluster_id,
@@ -163,6 +168,7 @@ async def enqueue_stampede_job(
         raise RuntimeError("Database unavailable for Stampede reservation")
     async with factory() as session, session.begin():
         cluster = await session.get(K3sCluster, cluster_id, with_for_update=True)
+        await worker_ownership.checkpoint()
         if (
             cluster is None
             or cluster.project_id != project_id
@@ -197,6 +203,7 @@ async def enqueue_stampede_job(
             return None
         now = _now()
         job_payload = dict(payload)
+        await worker_ownership.checkpoint()
         if direction == "up":
             count = min(requested_count, max(0, ng.max_size - ng.node_count))
             if count <= 0:
@@ -225,6 +232,7 @@ async def enqueue_stampede_job(
             )
             if vm is None:
                 return None
+            await worker_ownership.checkpoint()
             count = 1
             ng.node_count -= count
             kind = "nodegroup_reconcile"
@@ -275,6 +283,7 @@ async def _execute_job_direct(
     project_id: str,
     operation_id: str | None = None,
 ) -> None:
+    await execution_safety.ownership_checkpoint()
     authority = _authority_for(kind, payload, cluster_id, project_id)
     if authority is None:
         await _dispatch_job(kind, payload, cluster_id, project_id, operation_id)
@@ -453,6 +462,76 @@ async def _mark_cluster_failed(session, job: DroverJob, error: str, *, authority
         cluster.updated_at = _now()
 
 
+def _mutation_started(job: DroverJob) -> bool:
+    return _EXECUTION_START in (getattr(job, "payload_json", None) or {})
+
+
+def _lease_is_live(job: DroverJob, attempt: int) -> bool:
+    if job is None or job.status != "running" or job.attempts != attempt or job.claimed_at is None:
+        return False
+    claimed_at = job.claimed_at
+    if claimed_at.tzinfo is None:
+        claimed_at = claimed_at.replace(tzinfo=UTC)
+    return claimed_at >= _now() - timedelta(seconds=_LEASE_SECONDS)
+
+
+async def _execution_checkpoint(
+    job_id: str, *, attempt: int, kind: str, cluster_id: str, project_id: str, mutation: bool = True,
+    session: AsyncSession | None = None,
+) -> float:
+    """Fence attempts and keep SQL domain validation in the write transaction.
+
+    External mutation checkpoints commit the non-replay marker before sending.
+    Domain writes hold the job row until their transaction commits, so reclaim
+    cannot pass validation and race a later cluster status mutation.
+    """
+    async def validate(active_session):
+        locking = mutation or session is not None
+        job = await active_session.get(DroverJob, job_id, with_for_update=locking, populate_existing=True)
+        if (
+            not _lease_is_live(job, attempt)
+            or job.kind != kind
+            or job.cluster_id != cluster_id
+            or job.project_id != project_id
+        ):
+            raise execution_safety.OwnershipLost("SQL job attempt no longer owns dispatch")
+        cluster = await active_session.get(K3sCluster, cluster_id, with_for_update=locking, populate_existing=True)
+        if cluster is None or cluster.project_id != project_id or cluster.deleted_at is not None:
+            raise execution_safety.OwnershipLost("SQL job cluster no longer authorizes dispatch")
+        if mutation and kind == "reconcile":
+            raise execution_safety.OwnershipLost("Read-only reconciliation cannot dispatch a mutation")
+        op_id = getattr(job, "operation_id", None)
+        if op_id:
+            op = await active_session.get(DroverOperation, op_id, with_for_update=locking, populate_existing=True)
+            if (
+                op is None or op.status in {"FAILED", "CANCELLED", "SUCCEEDED"}
+                or op.cluster_id != cluster_id or op.project_id != project_id
+            ):
+                raise execution_safety.OwnershipLost("Job operation no longer authorizes dispatch")
+        claimed_at = job.claimed_at
+        if claimed_at.tzinfo is None:
+            claimed_at = claimed_at.replace(tzinfo=UTC)
+        deadline = time.monotonic() + max(0, _LEASE_SECONDS - (_now() - claimed_at).total_seconds())
+        if not mutation:
+            return deadline
+        payload = dict(job.payload_json or {})
+        marker = payload.get(_EXECUTION_START)
+        if _EXECUTION_START in payload and (not isinstance(marker, dict) or marker.get("attempt") != attempt):
+            raise execution_safety.OwnershipLost("A previous attempt already started mutation dispatch")
+        payload[_EXECUTION_START] = {"attempt": attempt}
+        job.payload_json = payload
+        job.updated_at = _now()
+        return deadline
+
+    if session is not None:
+        return await validate(session)
+    factory = get_session_factory()
+    if factory is None:
+        raise execution_safety.OwnershipLost("SQL job ownership is unavailable")
+    async with factory() as owned_session, owned_session.begin():
+        return await validate(owned_session)
+
+
 async def _claim_one() -> tuple[str, int, str, str, str, dict] | None:
     factory = get_session_factory()
     if factory is None:
@@ -516,8 +595,12 @@ async def _claim_one() -> tuple[str, int, str, str, str, dict] | None:
             ).scalar_one_or_none()
             if active_other is not None:
                 return None
-            if job.attempts >= _MAX_ATTEMPTS:
-                error = job.last_error or "Drover job retry limit exceeded"
+            ambiguous = _mutation_started(job) or (job.status == "running" and job.kind != "reconcile")
+            if ambiguous or job.attempts >= _MAX_ATTEMPTS:
+                error = (
+                    "Mutation execution outcome is uncertain; automatic replay is disabled"
+                    if ambiguous else job.last_error or "Drover job retry limit exceeded"
+                )
                 job.status = "failed"
                 job.last_error = error
                 job.claimed_at = None
@@ -534,14 +617,12 @@ async def _claim_one() -> tuple[str, int, str, str, str, dict] | None:
                             session,
                             op.id,
                             phase="job_failed",
-                            message=f"Job {job.kind} retry limit exceeded: {error}",
+                            message=f"Job {job.kind} stopped without replay: {error}",
                             payload_json={"job_id": job.id, "error": error},
                         )
                 await _delegation.release_if_idle(session, getattr(job, "delegation_id", None), reason="job failed")
                 continue
 
-            is_lease_recovery = job.status == "running" and job.claimed_at is not None
-            prior_attempts = job.attempts
             job.status = "running"
             job.attempts += 1
             job.claimed_at = now
@@ -550,14 +631,14 @@ async def _claim_one() -> tuple[str, int, str, str, str, dict] | None:
             op_id = getattr(job, "operation_id", None)
             if op_id:
                 op = await session.get(DroverOperation, op_id, with_for_update=True)
-                if op:
-                    if op.status == "QUEUED":
-                        op.status = "RUNNING"
-                        if not op.started_at:
-                            op.started_at = now
-                    if is_lease_recovery or prior_attempts > 0:
-                        pass
+                if op and op.status == "QUEUED":
+                    op.status = "RUNNING"
+                    if not op.started_at:
+                        op.started_at = now
             payload = dict(job.payload_json or {})
+            payload.pop(_EXECUTION_START, None)
+            payload.pop("_delegation_id", None)
+            payload.pop("_operation_id", None)
             if getattr(job, "operation_id", None):
                 payload["_operation_id"] = job.operation_id
             if getattr(job, "delegation_id", None):
@@ -579,7 +660,7 @@ async def _complete(job_id: str, *, attempt: int) -> bool:
         return False
     async with factory() as session, session.begin():
         job = await session.get(DroverJob, job_id, with_for_update=True)
-        if job is None or job.status != "running" or job.attempts != attempt:
+        if not _lease_is_live(job, attempt):
             return False
         job.status = "completed"
         job.claimed_at = None
@@ -624,8 +705,10 @@ async def _complete(job_id: str, *, attempt: int) -> bool:
         return True
 
 
-async def _retry_or_fail(job_id: str, *, attempt: int, error: str, terminal: bool = False) -> bool:
-    """Requeue a failed attempt, terminalizing on the third failure or on an authorization failure."""
+async def _retry_or_fail(
+    job_id: str, *, attempt: int, error: str, terminal: bool = False, authority_failure: bool = False,
+) -> bool:
+    """Retry only attempts without a mutation boundary; preserve authority failure semantics."""
     factory = get_session_factory()
     if factory is None:
         return False
@@ -634,9 +717,16 @@ async def _retry_or_fail(job_id: str, *, attempt: int, error: str, terminal: boo
         job = await session.get(DroverJob, job_id, with_for_update=True)
         if job is None or job.status != "running" or job.attempts != attempt:
             return False
+        mutation_started = _mutation_started(job)
+        if mutation_started:
+            clean_error = (
+                "Mutation outcome may be uncertain; automatic replay disabled; inspect provider resources before "
+                "operator recovery: " + clean_error
+            )[:4096]
         job.last_error = clean_error
         job.claimed_at = None
         job.updated_at = _now()
+        terminal = terminal or mutation_started
 
         op = None
         op_id = getattr(job, "operation_id", None)
@@ -645,7 +735,7 @@ async def _retry_or_fail(job_id: str, *, attempt: int, error: str, terminal: boo
 
         if terminal or job.attempts >= _MAX_ATTEMPTS:
             job.status = "failed"
-            await _mark_cluster_failed(session, job, clean_error, authority_failure=terminal)
+            await _mark_cluster_failed(session, job, clean_error, authority_failure=authority_failure)
             if op:
                 op.status = "FAILED"
                 op.error = clean_error
@@ -678,23 +768,33 @@ async def _renew_lease(job_id: str, *, attempt: int) -> bool:
         return False
     async with factory() as session, session.begin():
         job = await session.get(DroverJob, job_id, with_for_update=True)
-        if job is None or job.status != "running" or job.attempts != attempt:
+        if not _lease_is_live(job, attempt):
             return False
         job.claimed_at = _now()
         job.updated_at = _now()
         return True
 
 
-async def _heartbeat_lease(job_id: str, *, attempt: int, stop: asyncio.Event) -> None:
-    """Renew long jobs before their reclaim deadline; stop when ownership changes."""
+async def _heartbeat_lease(
+    job_id: str, *, attempt: int, stop: asyncio.Event,
+    guard: execution_safety.DispatchGuard, dispatch: asyncio.Task,
+) -> None:
+    """Revoke and cancel dispatch on any heartbeat loss, including SQL errors."""
     interval = max(1, _LEASE_SECONDS // 3)
     while True:
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
             return
         except TimeoutError:
-            if not await _renew_lease(job_id, attempt=attempt):
+            try:
+                renewed = await _renew_lease(job_id, attempt=attempt)
+            except Exception:
+                renewed = False
+            if not renewed:
+                guard.revoke()
+                dispatch.cancel()
                 return
+            guard.renewed(_LEASE_SECONDS)
 
 
 def _log_job_completion(job_id: str, attempt: int, kind: str, outcome: str) -> None:
@@ -725,24 +825,72 @@ async def process_one_job() -> bool:
             safe_metadata({"status": "running", "kind": kind, "attempt": attempt, "cluster_id": cluster_id}),
         )
     stop = asyncio.Event()
-    heartbeat = asyncio.create_task(_heartbeat_lease(job_id, attempt=attempt, stop=stop))
+    guard = execution_safety.DispatchGuard(
+        lambda: _execution_checkpoint(job_id, attempt=attempt, kind=kind, cluster_id=cluster_id, project_id=project_id),
+        ownership_checkpoint=lambda: _execution_checkpoint(
+            job_id, attempt=attempt, kind=kind, cluster_id=cluster_id, project_id=project_id, mutation=False,
+        ),
+        transaction_checkpoint=lambda session: _execution_checkpoint(
+            job_id, attempt=attempt, kind=kind, cluster_id=cluster_id, project_id=project_id,
+            mutation=False, session=session,
+        ),
+    )
+    operation_id = payload.pop("_operation_id", None)
+    with execution_safety.bound(guard):
+        dispatch = asyncio.create_task(_execute_job_direct(kind, payload, cluster_id, project_id, operation_id))
+    heartbeat = asyncio.create_task(_heartbeat_lease(job_id, attempt=attempt, stop=stop, guard=guard, dispatch=dispatch))
     delegation_id = payload.get("_delegation_id")
+    cancelled = False
+    propagate_cancel = False
     try:
-        await _execute_job_direct(kind, payload, cluster_id, project_id)
+        await asyncio.shield(dispatch)
+        guard.check()
         if await _complete(job_id, attempt=attempt):
             _log_job_completion(job_id, attempt, kind, "success")
-    except execution.ExecutionAuthorityError as exc:
-        # Revoked, mismatched or missing authority is never retried and never replaced by another identity.
-        if await _retry_or_fail(job_id, attempt=attempt, error=str(exc), terminal=True):
+    except asyncio.CancelledError:
+        guard.revoke()
+        dispatch.cancel()
+        cancelled = True
+        propagate_cancel = bool(asyncio.current_task().cancelling())
+    except (execution.ExecutionAuthorityError, execution_safety.OwnershipLost) as exc:
+        # Authority and ownership failures never replace the actor or start a new attempt.
+        guard.revoke()
+        if await _retry_or_fail(
+            job_id, attempt=attempt, error=str(exc), terminal=True,
+            authority_failure=isinstance(exc, execution.ExecutionAuthorityError),
+        ):
             _log_job_completion(job_id, attempt, kind, "error")
     except Exception as exc:
         if await _retry_or_fail(job_id, attempt=attempt, error=str(exc)):
-            _log_job_completion(job_id, attempt, kind, "error" if attempt >= _MAX_ATTEMPTS else "retry")
+            _log_job_completion(job_id, attempt, kind, "error" if guard.started or attempt >= _MAX_ATTEMPTS else "retry")
     finally:
-        stop.set()
-        heartbeat.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat
+        guard.revoke()
+        dispatch.cancel()
+
+        async def drain() -> None:
+            await asyncio.gather(dispatch, return_exceptions=True)
+            await guard.drain()
+            stop.set()
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+
+        draining = asyncio.create_task(drain())
+        while not draining.done():
+            try:
+                await asyncio.shield(draining)
+            except asyncio.CancelledError:
+                # Further shutdown cancellation must not abandon an issued SDK send.
+                continue
+        try:
+            await draining
+            if cancelled:
+                # Keep the SQL lease nonclaimable until real SDK work drains.
+                # Only then may a pre-send cancellation be safely retried.
+                await _retry_or_fail(job_id, attempt=attempt, error="Execution cancelled")
+        finally:
+            guard.close()
+    if propagate_cancel:
+        raise asyncio.CancelledError
     # A released or revoked trust is deleted right away through its own token; the sweep retries failures.
     await _delegation.delete_released(delegation_id)
     return True

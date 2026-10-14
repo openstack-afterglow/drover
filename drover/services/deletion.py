@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator
@@ -20,6 +19,7 @@ from drover.services import (
     nova,
     octavia,
     operations,
+    worker_ownership,
 )
 from drover.services import kube as k3s_kube
 from drover.services import store as k3s_cluster
@@ -33,7 +33,7 @@ async def _occm_service_annotations(
 ) -> dict[str, dict[str, str]] | None:
     """Service annotations deciding OCCM floating IPs, or ``None`` (keep them all) when they cannot be read."""
     try:
-        if not await asyncio.to_thread(octavia.list_occm_service_load_balancers, conn, project_id, cluster_id):
+        if not await worker_ownership.run_sync(octavia.list_occm_service_load_balancers, conn, project_id, cluster_id):
             return {}  # An LB OCCM creates from now on has no captured Service, so its floating IP is kept.
         return await k3s_kube.list_service_annotations(cluster_id)
     except Exception as e:
@@ -147,7 +147,7 @@ async def delete_cluster_progress(
 
     for vid in all_server_ids:
         try:
-            await asyncio.to_thread(nova.delete_server_safe, conn, vid, project_id, cluster_id)
+            await worker_ownership.run_sync(nova.delete_server_safe, conn, vid, project_id, cluster_id)
             await inventory.mark_resource_deleted(None, service="nova", resource_type="server", resource_id=vid)
             _logger.info("k3s delete: Nova server %s fully deleted", vid)
         except Exception as e:
@@ -157,7 +157,7 @@ async def delete_cluster_progress(
         try:
             pool_id = (r.metadata_json or {}).get("pool_id") if isinstance(r.metadata_json, dict) else None
             if pool_id:
-                await asyncio.to_thread(octavia.remove_member, conn, pool_id, r.resource_id)
+                await worker_ownership.run_sync(octavia.remove_member, conn, pool_id, r.resource_id)
             await inventory.mark_resource_deleted(None, service="octavia", resource_type="member", resource_id=r.resource_id)
             _logger.info("k3s delete: Octavia member %s deleted", r.resource_id)
         except Exception as e:
@@ -177,7 +177,7 @@ async def delete_cluster_progress(
 
     for r in octavia_pools:
         try:
-            await asyncio.to_thread(octavia.delete_pool, conn, r.resource_id)
+            await worker_ownership.run_sync(octavia.delete_pool, conn, r.resource_id)
             await inventory.mark_resource_deleted(None, service="octavia", resource_type="pool", resource_id=r.resource_id)
             _logger.info("k3s delete: Octavia pool %s deleted", r.resource_id)
         except Exception as e:
@@ -185,7 +185,7 @@ async def delete_cluster_progress(
 
     for r in octavia_listeners:
         try:
-            await asyncio.to_thread(octavia.delete_listener, conn, r.resource_id)
+            await worker_ownership.run_sync(octavia.delete_listener, conn, r.resource_id)
             await inventory.mark_resource_deleted(None, service="octavia", resource_type="listener", resource_id=r.resource_id)
             _logger.info("k3s delete: Octavia listener %s deleted", r.resource_id)
         except Exception as e:
@@ -194,7 +194,7 @@ async def delete_cluster_progress(
     # Step 3: Octavia load balancers
     for lb_id in all_lb_ids:
         try:
-            await asyncio.to_thread(octavia.delete_load_balancer_safe, conn, lb_id, project_id, cluster_id, cascade=True)
+            await worker_ownership.run_sync(octavia.delete_load_balancer_safe, conn, lb_id, project_id, cluster_id, cascade=True)
             await inventory.mark_resource_deleted(None, service="octavia", resource_type="load_balancer", resource_id=lb_id)
             _logger.info("k3s delete: Octavia LB %s fully deleted", lb_id)
         except Exception as e:
@@ -202,9 +202,7 @@ async def delete_cluster_progress(
 
     # OCCM Service LBs are not in Drover inventory; the VMs are gone, so OCCM cannot recreate them.
     try:
-        occm_lb_ids = await asyncio.to_thread(
-            octavia.delete_occm_service_load_balancers, conn, project_id, cluster_id, services=occm_services
-        )
+        occm_lb_ids = await worker_ownership.run_sync(octavia.delete_occm_service_load_balancers, conn, project_id, cluster_id, services=occm_services)
         for lb_id in occm_lb_ids:
             _logger.info("k3s delete: OCCM Service LB %s fully deleted", lb_id)
     except Exception as e:
@@ -224,7 +222,7 @@ async def delete_cluster_progress(
 
     for fip_id in all_fip_ids:
         try:
-            await asyncio.to_thread(neutron.delete_floating_ip_safe, conn, fip_id, project_id, cluster_id)
+            await worker_ownership.run_sync(neutron.delete_floating_ip_safe, conn, fip_id, project_id, cluster_id)
             await inventory.mark_resource_deleted(None, service="neutron", resource_type="floating_ip", resource_id=fip_id)
             _logger.info("k3s delete: FIP %s deleted", fip_id)
         except Exception as e:
@@ -233,7 +231,7 @@ async def delete_cluster_progress(
     # Step 5: Cinder boot volumes
     for r in cinder_volumes:
         try:
-            await asyncio.to_thread(cinder.delete_volume_safe, conn, r.resource_id, project_id, cluster_id)
+            await worker_ownership.run_sync(cinder.delete_volume_safe, conn, r.resource_id, project_id, cluster_id)
             await inventory.mark_resource_deleted(None, service="cinder", resource_type="volume", resource_id=r.resource_id)
             _logger.info("k3s delete: Cinder volume %s deleted", r.resource_id)
         except Exception as e:
@@ -249,8 +247,8 @@ async def delete_cluster_progress(
 
     for r in neutron_ports:
         try:
-            await asyncio.to_thread(conn.network.delete_port, r.resource_id, ignore_missing=True)
-            await asyncio.to_thread(neutron.wait_port_deleted, conn, r.resource_id)
+            await worker_ownership.run_sync(conn.network.delete_port, r.resource_id, ignore_missing=True)
+            await worker_ownership.run_sync(neutron.wait_port_deleted, conn, r.resource_id)
             await inventory.mark_resource_deleted(None, service="neutron", resource_type="port", resource_id=r.resource_id)
             _logger.info("k3s delete: Neutron port %s deleted", r.resource_id)
         except Exception as e:
@@ -258,14 +256,14 @@ async def delete_cluster_progress(
 
     for r in neutron_sg_rules:
         try:
-            await asyncio.to_thread(neutron.delete_security_group_rule, conn, r.resource_id)
+            await worker_ownership.run_sync(neutron.delete_security_group_rule, conn, r.resource_id)
             await inventory.mark_resource_deleted(None, service="neutron", resource_type="security_group_rule", resource_id=r.resource_id)
         except Exception as e:
             _logger.warning("k3s delete: SG rule %s delete failed: %s", r.resource_id, e)
 
     for sg_id in all_sg_ids:
         try:
-            await asyncio.to_thread(neutron.delete_security_group_safe, conn, sg_id, project_id, cluster_id)
+            await worker_ownership.run_sync(neutron.delete_security_group_safe, conn, sg_id, project_id, cluster_id)
             await inventory.mark_resource_deleted(None, service="neutron", resource_type="security_group", resource_id=sg_id)
             _logger.info("k3s delete: SG %s deleted", sg_id)
         except Exception as e:

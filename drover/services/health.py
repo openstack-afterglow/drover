@@ -4,7 +4,6 @@
 메인 API는 Redis에서 읽기만 함.
 """
 
-import asyncio
 import base64
 import logging
 import ssl
@@ -15,6 +14,7 @@ import httpx
 import yaml
 
 from drover.models.schemas import K3sClusterHealth, K3sNodeHealth
+from drover.services.worker_ownership import checkpoint, run_sync
 
 _logger = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ async def _redis():
 
 async def store_health_result(cluster_id: str, result: K3sClusterHealth) -> None:
     """헬스체크 결과를 Redis에 저장 (TTL 10분)."""
+    await checkpoint()
     try:
         r = await _redis()
         key = f"{_HEALTH_KEY_PREFIX}{cluster_id}"
@@ -123,7 +124,7 @@ async def _get_probe_ip(
         # Read-only lookup under the reauthorized cluster's control credential; no authority means private IP.
         with execution.bound(execution.ResourceAuthority(project_id, cluster_id, CAPABILITY_READ)):
             async with execution.connection(project_id) as conn:
-                server = await asyncio.to_thread(nova.get_server, conn, server_vm_id)
+                server = await run_sync(nova.get_server, conn, server_vm_id)
                 for ip_info in server.ip_addresses:
                     if ip_info.type == "floating":
                         return ip_info.addr
@@ -292,31 +293,14 @@ def _parse_nodes(api_response: dict) -> list[K3sNodeHealth]:
 # ---------------------------------------------------------------------------
 
 
-async def check_all_active_clusters() -> None:
-    """모든 ACTIVE K3s 클러스터를 순회하며 헬스체크 후 Redis에 저장."""
-    from drover.services import store as k3s_db
+async def check_active_cluster(cluster_id: str) -> None:
+    """Poll one assigned target using current SQL state, never a shared registry scan."""
+    from drover.services import store
 
-    try:
-        all_clusters = await k3s_db.list_all_clusters(include_deleted=False)
-    except Exception:
-        _logger.warning("k3s health: 클러스터 목록 조회 실패", exc_info=True)
+    await checkpoint()
+    cluster = await store.get_cluster_admin(cluster_id)
+    if not cluster or cluster.get("status") != "ACTIVE" or cluster.get("deleted_at"):
         return
-
-    active = [c for c in all_clusters if c.get("status") == "ACTIVE"]
-    if not active:
-        _logger.debug("k3s health: ACTIVE 클러스터 없음")
-        return
-
-    _logger.info("k3s health: %d개 ACTIVE 클러스터 헬스체크 시작", len(active))
-    for cluster in active:
-        try:
-            result = await check_cluster_health(cluster)
-            await store_health_result(cluster["id"], result)
-            _logger.debug(
-                "k3s health: cluster=%s status=%s nodes=%d",
-                cluster["id"],
-                result.status,
-                len(result.nodes),
-            )
-        except Exception:
-            _logger.warning("k3s health: 클러스터 %s 체크 중 오류", cluster["id"], exc_info=True)
+    await checkpoint()
+    result = await check_cluster_health(cluster)
+    await store_health_result(cluster_id, result)

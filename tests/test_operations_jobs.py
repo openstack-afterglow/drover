@@ -1,6 +1,5 @@
 """Focused tests for Drover Operation and Job transactional orchestration (Step 2.2)."""
 
-import asyncio
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
@@ -86,6 +85,9 @@ class _TestSession:
             return _Result(ops)
         if "k3s_clusters" in sql:
             clusters = [v for k, v in self.store.items() if k[0] == K3sCluster and v.deleted_at is None]
+            target_ids = statement.compile().params.get("id_1")
+            if isinstance(target_ids, list):
+                clusters = [cluster for cluster in clusters if cluster.id in target_ids]
             return _Result(clusters)
         if "drover_jobs" in sql:
             jobs_list = [v for k, v in self.store.items() if k[0] == DroverJob]
@@ -180,6 +182,7 @@ async def test_job_claim_and_terminal_success_transition(monkeypatch):
         kind="scale",
         status="running",
         attempts=1,
+        claimed_at=datetime.now(UTC),
         payload_json={"desired_count": 5},
         operation_id="op-1",
         created_at=datetime.now(UTC),
@@ -296,6 +299,7 @@ async def test_waiting_callback_to_running_transition(monkeypatch):
         kind="create",
         status="running",
         attempts=1,
+        claimed_at=datetime.now(UTC),
         payload_json={"server_vm_id": "vm-server-1"},
         operation_id="op-3",
         created_at=datetime.now(UTC),
@@ -342,6 +346,7 @@ async def test_create_operation_completes_only_after_cluster_is_active(monkeypat
         kind="create",
         status="running",
         attempts=1,
+        claimed_at=datetime.now(UTC),
         payload_json={},
         operation_id=op.id,
         created_at=datetime.now(UTC),
@@ -375,6 +380,7 @@ async def test_create_operation_completes_only_after_cluster_is_active(monkeypat
         kind="provision_agents",
         status="running",
         attempts=1,
+        claimed_at=datetime.now(UTC),
         payload_json={},
         operation_id=op.id,
         created_at=datetime.now(UTC),
@@ -409,6 +415,7 @@ async def test_terminal_create_operation_is_not_reopened_by_late_job(monkeypatch
         kind="bootstrap_ha",
         status="running",
         attempts=1,
+        claimed_at=datetime.now(UTC),
         payload_json={},
         operation_id=op.id,
         created_at=datetime.now(UTC),
@@ -457,6 +464,7 @@ async def test_ha_bootstrap_completion_keeps_create_operation_nonterminal(monkey
         operation_id=op.id,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
+        claimed_at=datetime.now(UTC),
     )
     cluster = K3sCluster(
         id=op.cluster_id,
@@ -573,6 +581,7 @@ async def test_recover_expired_callback_operations(monkeypatch):
     )
     monkeypatch.setattr(operations, "get_session_factory", lambda: _factory(session))
     monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
+    monkeypatch.setattr("drover.services.delegation.active_delegation_for_operation", AsyncMock(return_value=None))
 
     recovered = await operations.recover_expired_callback_operations(timeout_seconds=1800)
 
@@ -586,10 +595,60 @@ async def test_recover_expired_callback_operations(monkeypatch):
     timeout_events = [e for e in session.events if e.phase == "callback_timeout"]
     assert len(timeout_events) == 1
     assert timeout_events[0].operation_id == "op-cb-expired"
-
     delete_jobs = [j for (mod, _), j in session.store.items() if mod == DroverJob and j.kind == "delete"]
     assert len(delete_jobs) == 1
     assert delete_jobs[0].cluster_id == "cluster-cb-1"
+
+
+@pytest.mark.asyncio
+async def test_timeout_recovery_revocation_rolls_back_failure_and_rollback_admission(monkeypatch):
+    from datetime import timedelta
+
+    from drover.services.worker_ownership import OwnershipLost
+
+    op = DroverOperation(id="expired", project_id="project", cluster_id="cluster", kind="create",
+                        status="WAITING_CALLBACK", created_at=datetime.now(UTC) - timedelta(minutes=40))
+    cluster = K3sCluster(id="cluster", project_id="project", name="cluster", status="PROVISIONING")
+
+    class Transaction(_Transaction):
+        async def __aenter__(self):
+            self.original_store = dict(self.session.store)
+            self.original_events = list(self.session.events)
+            self.op_state = op.status, op.error, op.finished_at
+            self.cluster_state = cluster.status, cluster.status_reason, cluster.updated_at
+            return self.session
+
+        async def __aexit__(self, error, *args):
+            if error is not None:
+                self.session.store = self.original_store
+                self.session.events[:] = self.original_events
+                op.status, op.error, op.finished_at = self.op_state
+                cluster.status, cluster.status_reason, cluster.updated_at = self.cluster_state
+            else:
+                self.session.committed = True
+            return False
+
+    class Session(_TestSession):
+        committed = False
+
+        def begin(self):
+            return Transaction(self)
+
+    session = Session(store={(DroverOperation, op.id): op, (K3sCluster, cluster.id): cluster})
+    delegation = AsyncMock(return_value="create-delegation")
+    monkeypatch.setattr(operations, "get_session_factory", lambda: _factory(session))
+    monkeypatch.setattr("drover.services.delegation.active_delegation_for_operation", delegation)
+    monkeypatch.setattr(operations, "checkpoint", AsyncMock(side_effect=[None, None, OwnershipLost("revoked at commit")]))
+    with pytest.raises(OwnershipLost):
+        await operations.recover_expired_callback_operations()
+    delegation.assert_awaited_once_with(session, op.id)
+    admitted_jobs = [row for row in session.added if isinstance(row, DroverJob)]
+    assert len(admitted_jobs) == 1 and admitted_jobs[0].delegation_id == "create-delegation"
+    assert op.status == "WAITING_CALLBACK" and cluster.status == "PROVISIONING"
+    assert not session.committed and not session.events
+    assert not any(model == DroverJob for model, _ in session.store)
+
+
 
 
 @pytest.mark.asyncio
@@ -600,6 +659,7 @@ async def test_schedule_worker_reconciliations_dedupe_and_concurrency(monkeypatc
     c1 = K3sCluster(id="c1", project_id="proj-A", name="cl-1", status="ACTIVE")
     c2 = K3sCluster(id="c2", project_id="proj-A", name="cl-2", status="ACTIVE")
     c3 = K3sCluster(id="c3", project_id="proj-A", name="cl-3", status="ACTIVE")
+    unpublished = K3sCluster(id="c4", project_id="proj-B", name="unpublished", status="ACTIVE")
 
     j1 = DroverJob(id="j1", cluster_id="c1", project_id="proj-A", kind="reconcile", status="running")
 
@@ -608,60 +668,54 @@ async def test_schedule_worker_reconciliations_dedupe_and_concurrency(monkeypatc
             (K3sCluster, "c1"): c1,
             (K3sCluster, "c2"): c2,
             (K3sCluster, "c3"): c3,
+            (K3sCluster, "c4"): unpublished,
             (DroverJob, "j1"): j1,
         }
     )
     monkeypatch.setattr("drover.db.get_session_factory", lambda: _factory(session))
     monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
-    # Only clusters with an active control credential are reconciled; all three are authorized here.
+    # Even authorized clusters must have been published by the discovery owner.
     monkeypatch.setattr(
-        "drover.services.cluster_authority.authorized_cluster_ids", AsyncMock(return_value={"c1", "c2", "c3"})
+        "drover.services.cluster_authority.authorized_cluster_ids", AsyncMock(return_value={"c1", "c2", "c3", "c4"})
     )
 
-    enqueued = await reconciliation.schedule_worker_reconciliations(max_per_project=2)
+    enqueued = await reconciliation.schedule_worker_reconciliations(["c1", "c2", "c3"], max_per_project=2)
     assert len(enqueued) == 1
+    assert not any(model == DroverJob and row.cluster_id == "c4" for (model, _), row in session.store.items())
 
     c1_jobs = [j for (mod, _), j in session.store.items() if mod == DroverJob and j.cluster_id == "c1"]
     assert len(c1_jobs) == 1
 
-    enqueued_next = await reconciliation.schedule_worker_reconciliations(max_per_project=2)
+    enqueued_next = await reconciliation.schedule_worker_reconciliations(["c1", "c2", "c3"], max_per_project=2)
     assert len(enqueued_next) == 0
+
+
 @pytest.mark.asyncio
-async def test_reconcile_worker_loop_execution(monkeypatch):
-    """Maintenance invokes callback recovery, deleted-target recovery, and reconciliation in order."""
+async def test_worker_recovery_and_scheduling_are_independent_roles(monkeypatch):
+    """Recovery and quota scheduling can belong to different eligible worker processes."""
     from drover import worker
     from drover.services import operations, reconciliation
 
-    called_recover = False
-    called_schedule = False
     calls = []
 
-    async def mock_recover(timeout_seconds=1800):
-        nonlocal called_recover
-        called_recover = True
+    async def callback(timeout_seconds):
+        assert timeout_seconds == 1800
         calls.append("callback")
-        return []
 
-    async def mock_deleted_recover():
+    async def deleted():
         calls.append("deleted")
-        return []
 
-    async def mock_schedule(max_per_project=2):
-        nonlocal called_schedule
-        called_schedule = True
+    async def schedule(cluster_ids, max_per_project):
+        assert cluster_ids == ["c1"]
+        assert max_per_project == worker.get_settings().drover_reconcile_concurrency_per_project
         calls.append("schedule")
-        return []
 
-    monkeypatch.setattr(operations, "recover_expired_callback_operations", mock_recover)
-    monkeypatch.setattr(operations, "recover_deleted_cluster_operations", mock_deleted_recover)
-    monkeypatch.setattr(reconciliation, "schedule_worker_reconciliations", mock_schedule)
-    monkeypatch.setattr(asyncio, "sleep", AsyncMock(side_effect=[None, asyncio.CancelledError()]))
-
-    with pytest.raises(asyncio.CancelledError):
-        await worker._reconcile_worker_loop()
-
-    assert called_recover is True
-    assert called_schedule is True
+    monkeypatch.setattr(operations, "recover_expired_callback_operations", callback)
+    monkeypatch.setattr(operations, "recover_deleted_cluster_operations", deleted)
+    monkeypatch.setattr(reconciliation, "schedule_worker_reconciliations", schedule)
+    await worker.execute_owned("recovery", ["reconcile:c1"])
+    assert calls == ["callback", "deleted"]
+    await worker.execute_owned("reconciliation", ["reconcile:c1"])
     assert calls == ["callback", "deleted", "schedule"]
 
 
@@ -809,6 +863,7 @@ async def test_nine_deleted_create_operations_recover_once_after_jobs_complete(m
         job = DroverJob(
             id=f"job-{i}", cluster_id=cluster.id, project_id=cluster.project_id,
             operation_id=op.id, kind="create", status="running", attempts=1,
+            claimed_at=datetime.now(UTC),
         )
         session.store[(DroverJob, job.id)] = job
         ops.append(op)

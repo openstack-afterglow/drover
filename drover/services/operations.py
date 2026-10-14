@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from drover.db import get_session_factory
 from drover.models.orm import DroverJob, DroverOperation, DroverOperationEvent, K3sCluster
+from drover.services.worker_ownership import checkpoint
 
 _logger = logging.getLogger("drover.operations")
 
@@ -406,6 +407,7 @@ async def recover_deleted_cluster_operations(
             if op is None:
                 continue
 
+            await checkpoint()
             reason = "Target cluster was deleted before the operation completed"
             op.status = "CANCELLED"
             op.finished_at = _now()
@@ -417,6 +419,7 @@ async def recover_deleted_cluster_operations(
                     "previous_status": "RUNNING", "status": "CANCELLED",
                 },
             )
+            await checkpoint()
             recovered.append(op.id)
     return recovered
 
@@ -430,6 +433,7 @@ async def recover_expired_callback_operations(timeout_seconds: int = 1800) -> li
 
     cutoff = _now() - timedelta(seconds=timeout_seconds)
     recovered_op_ids: list[str] = []
+    from drover.services import delegation, jobs
 
     async with factory() as session, session.begin():
         stmt = (
@@ -444,6 +448,7 @@ async def recover_expired_callback_operations(timeout_seconds: int = 1800) -> li
         expired_ops = list(res.scalars().all())
 
         for op in expired_ops:
+            await checkpoint()
             now = _now()
             op.status = "FAILED"
             op.error = "Cloud-init callback timed out"
@@ -458,28 +463,26 @@ async def recover_expired_callback_operations(timeout_seconds: int = 1800) -> li
             )
 
             cluster = await session.get(K3sCluster, op.cluster_id, with_for_update=True)
+            await checkpoint()
             if cluster is not None and cluster.project_id == op.project_id:
                 cluster.status = "ERROR"
                 cluster.status_reason = "Cloud-init callback timed out"
                 cluster.updated_at = now
 
+            # Failure and rollback admission commit together, under the same
+            # recovery fence; revocation cannot leave a failed orphan behind.
+            await jobs.enqueue_job(
+                cluster_id=op.cluster_id,
+                project_id=op.project_id,
+                kind="delete",
+                payload={"reason": "Cloud-init callback timed out", "expired_operation_id": op.id},
+                op_kind="delete",
+                delegation_id=await delegation.active_delegation_for_operation(session, op.id),
+                session=session,
+            )
             recovered_op_ids.append(op.id)
+        await checkpoint()
 
-    if recovered_op_ids:
-        from drover.services import delegation, jobs
-
-        for op_id in recovered_op_ids:
-            op = await get_operation(None, op_id)
-            if op:
-                # Rollback continues the admitted create operation only; without its delegation the job fails closed.
-                await jobs.enqueue_job(
-                    cluster_id=op.cluster_id,
-                    project_id=op.project_id,
-                    kind="delete",
-                    payload={"reason": "Cloud-init callback timed out", "expired_operation_id": op.id},
-                    op_kind="delete",
-                    delegation_id=await delegation.active_delegation_for_operation(None, op.id),
-                )
 
     return recovered_op_ids
 async def fail_waiting_callback_operations(

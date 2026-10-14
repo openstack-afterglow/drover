@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -126,12 +126,13 @@ async def test_old_worker_cannot_complete_reclaimed_attempt(monkeypatch):
 
 
 async def test_lease_renewal_is_fenced_to_the_claimed_attempt(monkeypatch):
-    job = SimpleNamespace(status="running", attempts=2, claimed_at=None, updated_at=None)
+    claimed_at = datetime.now(UTC)
+    job = SimpleNamespace(status="running", attempts=2, claimed_at=claimed_at, updated_at=None)
     session = _Session(objects={(DroverJob, "job-1"): job})
     monkeypatch.setattr(jobs, "get_session_factory", lambda: _factory(session))
 
     assert await jobs._renew_lease("job-1", attempt=1) is False
-    assert job.claimed_at is None
+    assert job.claimed_at == claimed_at
     assert await jobs._renew_lease("job-1", attempt=2) is True
     assert job.claimed_at is not None
 
@@ -173,15 +174,15 @@ async def test_third_failure_terminalizes_job_and_cluster(monkeypatch):
     assert cluster.status_reason == "quota exceeded"
 
 
-async def test_claim_reclaims_stale_jobs_with_skip_locked(monkeypatch):
+async def test_claim_reclaims_stale_read_only_jobs_with_skip_locked(monkeypatch):
     job = SimpleNamespace(
         id="job-1",
         cluster_id="cluster-1",
         project_id="project-1",
-        kind="scale",
+        kind="reconcile",
         status="running",
         attempts=1,
-        claimed_at=None,
+        claimed_at=datetime.now(UTC) - timedelta(seconds=jobs._LEASE_SECONDS + 1),
         last_error="worker exited",
         payload_json={"desired_count": 2},
         updated_at=None,
@@ -195,7 +196,7 @@ async def test_claim_reclaims_stale_jobs_with_skip_locked(monkeypatch):
 
     claimed = await jobs._claim_one()
 
-    assert claimed == ("job-1", 2, "scale", "cluster-1", "project-1", {"desired_count": 2})
+    assert claimed == ("job-1", 2, "reconcile", "cluster-1", "project-1", {"desired_count": 2})
     assert job.status == "running"
     assert job.attempts == 2
     assert job.claimed_at is not None

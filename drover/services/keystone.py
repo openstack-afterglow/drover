@@ -355,6 +355,9 @@ def _close_connection_sync(conn) -> None:
 
 async def close_connection(conn) -> None:
     """Release every resource held by an openstacksdk connection."""
+    from drover.services.execution_safety import drain_connection
+
+    await drain_connection(conn)
     await asyncio.to_thread(_close_connection_sync, conn)
 
 

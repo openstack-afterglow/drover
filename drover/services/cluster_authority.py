@@ -276,8 +276,10 @@ def _authenticate_sync(snap: _CredentialSnapshot, secret: str):
     try:
         access = plugin.get_access(session)
     except (ks_exc.Unauthorized, ks_exc.Forbidden, ks_exc.NotFound) as exc:
+        session.session.close()
         raise AuthorityRevoked("Keystone no longer honors the cluster application credential") from exc
     except ks_exc.ClientException as exc:
+        session.session.close()
         raise ExecutionAuthorityUnavailable("Keystone application credential authentication is unavailable") from exc
     credential = getattr(access, "_application_credential", None) or {}
     from drover.services.delegation import token_roles_within_delegation
@@ -289,8 +291,14 @@ def _authenticate_sync(snap: _CredentialSnapshot, secret: str):
         or credential.get("id") != snap.app_credential_id
         or not token_roles_within_delegation(access, snap.role_ids)
     ):
+        session.session.close()
         raise AuthorityRevoked("The application credential token does not match the recorded cluster authority")
     return session
+
+
+def _verify_staged_credential_sync(snap: _CredentialSnapshot, secret: str) -> None:
+    session = _authenticate_sync(snap, secret)
+    session.session.close()
 
 
 def _connect_control_sync(snap: _CredentialSnapshot, capability: str):
@@ -485,11 +493,13 @@ async def _activate(project_id: str, cluster_id: str, generation: int) -> None:
     """Atomically activate a fully rolled-out generation and retire everything it superseded."""
     from drover.db import get_session_factory
     from drover.models.orm import DroverClusterCredential, K3sCluster
+    from drover.services.execution_safety import ownership_checkpoint
 
     factory = get_session_factory()
     if factory is None:
         raise RuntimeError("Database unavailable for credential activation")
     async with factory() as session, session.begin():
+        await ownership_checkpoint(session)
         cluster = await session.get(K3sCluster, cluster_id, with_for_update=True)
         if cluster is None or cluster.project_id != project_id or cluster.deleted_at is not None:
             raise RuntimeError("Cluster disappeared before credential activation")
@@ -528,6 +538,8 @@ async def execute_reauthorization(project_id: str, cluster_id: str, payload: dic
     from drover.services import guest_rollout, operations
     from drover.services import store as k3s_store
     from drover.services.delegation import revalidate_principal_sync
+    from drover.services.execution_safety import ownership_checkpoint
+    from drover.services.worker_ownership import run_sync
 
     generation = int(payload["generation"])
     control = await _snapshot(cluster_id, CONTROL, state="staged", generation=generation)
@@ -537,12 +549,12 @@ async def execute_reauthorization(project_id: str, cluster_id: str, payload: dic
         raise RuntimeError("Staged credential generation is missing")
     guest = await _snapshot(cluster_id, GUEST, state="staged", generation=generation)
     try:
-        await asyncio.to_thread(
+        await run_sync(
             revalidate_principal_sync, control.owner_user_id, project_id, ACTION_REAUTHORIZE, control.role_ids
         )
         for snap in (control, guest):
             if snap is not None:
-                await asyncio.to_thread(_authenticate_sync, snap, decrypt_app_credential_secret(snap.secret_encrypted))
+                await run_sync(_verify_staged_credential_sync, snap, decrypt_app_credential_secret(snap.secret_encrypted))
         if guest is not None:
             cluster = await k3s_store.get_cluster(project_id, cluster_id)
             if not cluster or cluster.get("deleted_at") or cluster.get("status") != "ACTIVE":
@@ -563,6 +575,7 @@ async def execute_reauthorization(project_id: str, cluster_id: str, payload: dic
                     None, operation_id, phase="guest_credential_rolled_out",
                     message=f"Guest credential generation {generation} rolled out", payload_json=summary,
                 )
+        await ownership_checkpoint()
         await _activate(project_id, cluster_id, generation)
     except Exception as exc:
         await _record_staged_error(cluster_id, generation, str(exc) or exc.__class__.__name__)

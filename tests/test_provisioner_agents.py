@@ -1,9 +1,11 @@
 """Provisioner guest rendering, persistence, and scaling-token contracts."""
 
+import asyncio
 import base64
 import gzip
 import json
 import shlex
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -192,7 +194,6 @@ async def test_initial_agent_metadata_error_prevents_cloud_mutation(status):
     plugin.assert_not_awaited()
     update_status.assert_not_awaited()
     close.assert_awaited_once_with(connection)
-
 
 async def test_named_key_without_snapshot_fails_before_execution_connection() -> None:
     payload = {"key_name": "caller-key"}
@@ -510,6 +511,68 @@ def native_nodegroup(monkeypatch):
         cluster=cluster, real_generate_agent_userdata=real_generate_agent_userdata,
         list_flavors=list_flavors, plugin=plugin,
     )
+
+
+@pytest.mark.parametrize("route", ["initial-agent", "create-preflight", "manual-nodegroup", "stampede-flavors"])
+async def test_native_flavor_read_drains_before_connection_close(native_nodegroup, monkeypatch, route):
+    """Cancellation retains the SDK session until its real flavor thread exits."""
+    from drover.services import stampede
+
+    mocks = native_nodegroup
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def read_flavors(conn):
+        assert conn is mocks.connection
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release the flavor read")
+        completed.set()
+        return [SimpleNamespace(id="flavor-1", extra_specs={})]
+
+    close = AsyncMock()
+    update_status = AsyncMock()
+    monkeypatch.setattr("drover.services.nova.list_flavors", read_flavors)
+    monkeypatch.setattr("drover.services.keystone.close_connection", close)
+    monkeypatch.setattr(provisioner.k3s_cluster, "get_cluster", AsyncMock(return_value=mocks.cluster))
+    monkeypatch.setattr(provisioner.k3s_cluster, "update_cluster_status", update_status)
+    monkeypatch.setattr(provisioner, "_guest_plugin_settings", AsyncMock())
+    monkeypatch.setattr("drover.services.plugins.with_resource_policy_snapshot", lambda settings, _snapshot: settings)
+
+    if route == "initial-agent":
+        work = provisioner.provision_agents("project-1", "cluster-1", "192.0.2.10", "node-token")
+    elif route == "create-preflight":
+        work = provisioner.create_cluster_job("project-1", "cluster-1", mocks.cluster)
+    elif route == "manual-nodegroup":
+        work = autoscale.provision_nodegroup_vms(
+            "project-1", "cluster-1", "nodegroup-1", 1, flavor_id="flavor-1",
+        )
+    else:
+        work = stampede._get_available_flavors("project-1")
+
+    task = asyncio.create_task(work)
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        close.assert_not_awaited()
+    finally:
+        release.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert completed.is_set()
+    close.assert_awaited_once_with(mocks.connection)
+    mocks.create_volume.assert_not_called()
+    mocks.create_server.assert_not_called()
+    mocks.plugin.assert_not_awaited()
+    mocks.add.assert_not_awaited()
+    update_status.assert_not_awaited()
 
 
 async def _provision_native(add_count=1):
@@ -850,8 +913,6 @@ async def test_nova_create_can_return_resource_for_immediate_tracking(wait):
         connection.compute.wait_for_server.assert_not_called()
 
 
-
-
 @pytest.fixture
 def worker_bootstrap(native_nodegroup, monkeypatch):
     mocks = native_nodegroup
@@ -1035,5 +1096,4 @@ async def test_nodegroup_metadata_error_prevents_cloud_mutation(native_nodegroup
     mocks.create_volume.assert_not_called()
     mocks.create_server.assert_not_called()
     mocks.add.assert_not_awaited()
-
 

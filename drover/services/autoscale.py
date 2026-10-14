@@ -4,13 +4,13 @@ clusters.py의 _scale_agents 로직을 노드그룹 단위로 일반화·추출.
 Stampede Reconciler(k3s_stampede.py)와 수동 스케일 핸들러(clusters.py) 양쪽에서 호출.
 """
 
-import asyncio
 import hashlib
 import logging
 import random
 import string
 
 from drover.config import get_settings
+from drover.services import worker_ownership
 from drover.utils.ssh_keys import normalize_ssh_public_key
 
 _logger = logging.getLogger(__name__)
@@ -73,7 +73,7 @@ async def _find_native_resources(conn, cluster_id: str, nodegroup_id: str, name:
             raise RuntimeError("Ambiguous provisioning resources; refusing to create duplicates")
         return next(iter(servers.values()), None), next(iter(volumes.values()), None)
 
-    server, volume = await asyncio.to_thread(recover)
+    server, volume = await worker_ownership.run_sync(recover)
     return server, volume, {v["vm_id"] for v in recorded}
 
 
@@ -145,7 +145,7 @@ async def provision_nodegroup_vms(
             provisioning_key_prefix is None or inspect_flavor_gpu or gpu_required
         ):
             # Manual provisioning reads Nova; Stampede uses the planner's flavor snapshot.
-            flavors = await asyncio.to_thread(nova.list_flavors, conn)
+            flavors = await worker_ownership.run_sync(nova.list_flavors, conn)
             selected = next((flavor for flavor in flavors if flavor.id == flavor_id), None)
             if selected is None:
                 raise RuntimeError("Selected nodegroup flavor is unavailable")
@@ -223,7 +223,7 @@ async def provision_nodegroup_vms(
                             resource_id=vol.id, name=f"{agent_name}-boot", metadata=vol.metadata or {},
                         )
                     if str(existing_vm.status).upper() != "ACTIVE":
-                        await asyncio.to_thread(conn.compute.wait_for_server, existing_vm, status="ACTIVE", wait=600)
+                        await worker_ownership.run_sync(conn.compute.wait_for_server, existing_vm, status="ACTIVE", wait=600)
                     new_entries.append(entry)
                     continue
                 if gpu_required:
@@ -236,17 +236,15 @@ async def provision_nodegroup_vms(
                 if provisioning_key is not None:
                     vol_metadata["drover.provisioning_idempotency_key"] = provisioning_key
                 if vol is None:
-                    vol = await asyncio.to_thread(
-                        cinder.create_volume_from_image,
-                        conn,
-                        f"{agent_name}-boot",
-                        image_id,
-                        boot_volume_size,
-                        volume_availability_zone,
-                        metadata=vol_metadata,
-                    )
+                    vol = await worker_ownership.run_sync(cinder.create_volume_from_image,
+                    conn,
+                    f"{agent_name}-boot",
+                    image_id,
+                    boot_volume_size,
+                    volume_availability_zone,
+                    metadata=vol_metadata,)
                 elif str(vol.status).lower() != "available":
-                    vol = await asyncio.to_thread(cinder.wait_volume_available, conn, vol.id, timeout=300)
+                    vol = await worker_ownership.run_sync(cinder.wait_volume_available, conn, vol.id, timeout=300)
                 await inventory.record_resource(
                     None,
                     cluster_id=cluster_id,
@@ -267,20 +265,18 @@ async def provision_nodegroup_vms(
                     os_type=os_type,
                     gpu_required=gpu_required,
                 )
-                vm = await asyncio.to_thread(
-                    nova.create_server,
-                    conn,
-                    agent_name,
-                    flavor_id,
-                    network_id,
-                    vol.id,
-                    userdata=userdata.data,
-                    metadata=agent_metadata,
-                    delete_boot_volume_on_termination=True,
-                    security_groups=[sg_id] if sg_id else None,
-                    config_drive=userdata.config_drive,
-                    wait=provisioning_key is None,
-                )
+                vm = await worker_ownership.run_sync(nova.create_server,
+                conn,
+                agent_name,
+                flavor_id,
+                network_id,
+                vol.id,
+                userdata=userdata.data,
+                metadata=agent_metadata,
+                delete_boot_volume_on_termination=True,
+                security_groups=[sg_id] if sg_id else None,
+                config_drive=userdata.config_drive,
+                wait=provisioning_key is None,)
                 await inventory.record_resource(
                     None,
                     cluster_id=cluster_id,
@@ -293,8 +289,8 @@ async def provision_nodegroup_vms(
                 new_entries.append({"vm_id": vm.id, "name": agent_name})
                 await k3s_nodegroup.add_nodegroup_vms(nodegroup_id, cluster_id, [new_entries[-1]])
                 if provisioning_key is not None:
-                    server = await asyncio.to_thread(conn.compute.get_server, vm.id)
-                    await asyncio.to_thread(conn.compute.wait_for_server, server, status="ACTIVE", wait=600)
+                    server = await worker_ownership.run_sync(conn.compute.get_server, vm.id)
+                    await worker_ownership.run_sync(conn.compute.wait_for_server, server, status="ACTIVE", wait=600)
                 _logger.info("stampede: nodegroup %s — agent %s (%s) 생성됨", nodegroup_id, agent_name, vm.id)
             except Exception as e:
                 _logger.error("stampede: nodegroup %s — agent %s 생성 실패: %s", nodegroup_id, agent_name, e)
@@ -350,7 +346,7 @@ async def delete_nodegroup_vms(
             vm_id = entry.get("vm_id")
             if not vm_id:
                 raise ValueError("Deletion entry is missing vm_id")
-            server = await asyncio.to_thread(_observe_owned_worker, conn, vm_id, project_id, cluster_id)
+            server = await worker_ownership.run_sync(_observe_owned_worker, conn, vm_id, project_id, cluster_id)
             requires_drain[vm_id] = server is not None and not nova.is_server_deleting(server)
             volumes = {
                 r.resource_id for r in resources
@@ -399,20 +395,20 @@ async def delete_nodegroup_vms(
             vm_id = entry["vm_id"]
             node_name = entry.get("name")
             phase = f"server_delete_failed:{vm_id}"
-            server = await asyncio.to_thread(_observe_owned_worker, conn, vm_id, project_id, cluster_id)
+            server = await worker_ownership.run_sync(_observe_owned_worker, conn, vm_id, project_id, cluster_id)
             # Past the final ownership check Nova may accept DELETE even when the call or wait
             # fails, so Pods must never be rescheduled onto this node again.
             if node_name in cordoned:
                 cordoned.remove(node_name)
             if server is not None:
                 if not nova.is_server_deleting(server):
-                    await asyncio.to_thread(conn.compute.delete_server, vm_id, ignore_missing=True)
-                await asyncio.to_thread(nova.wait_server_deleted, conn, vm_id)
+                    await worker_ownership.run_sync(conn.compute.delete_server, vm_id, ignore_missing=True)
+                await worker_ownership.run_sync(nova.wait_server_deleted, conn, vm_id)
             await inventory.mark_resource_deleted(service="nova", resource_type="server", resource_id=vm_id)
             for volume_id in boot_volumes[vm_id]:
                 phase = f"boot_volume_delete_unverified:{volume_id}"
                 # Only after Nova confirmed the server is gone; intent-provisioned workers keep it.
-                await asyncio.to_thread(cinder.delete_detached_boot_volume, conn, volume_id, project_id, cluster_id)
+                await worker_ownership.run_sync(cinder.delete_detached_boot_volume, conn, volume_id, project_id, cluster_id)
                 await inventory.mark_resource_deleted(service="cinder", resource_type="volume", resource_id=volume_id)
             phase = f"node_delete_failed:{node_name}"
             if node_name and not await k3s_kube.delete_k8s_node(cluster_id, node_name):
@@ -479,7 +475,7 @@ async def reconcile_nodegroup_vms(
                 continue
             # Only a genuine Nova 404 is absence; the absent row stays tracked for its own
             # volume/Node cleanup. Other observation errors propagate.
-            s = await asyncio.to_thread(nova.observe_server, conn, vm_id)
+            s = await worker_ownership.run_sync(nova.observe_server, conn, vm_id)
             # ERROR/SHUTOFF workers still occupy quota and have tracked resources.
             if s is not None and str(s.status or "").upper() not in ("DELETED", "SOFT_DELETED"):
                 verified_vms.append(vm_entry)
