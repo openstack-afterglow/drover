@@ -1,3 +1,7 @@
+## 0.4.16 authority candidate
+
+Native effective project admin/manager/member replace dedicated Drover-role prerequisites for owned resource management; reader retains nonsecret metadata only. Actual custom/group/domain/legacy implications remain native authority, with original reduced-token and human/system boundaries enforced outside operator YAML. `/v1/policy/capabilities` projects the same action engine. Exact additive005 is packaged solely for already-applied schema compatibility; unsupported requester/cleanup data is refused, not interpreted. Qualification/deployment limits: [release0.4.16](release-0.4.16.md).
+
 # Drover 레거시 기능 커버리지 및 오픈스택 통합 사양서
 
 본 문서는 레거시 오퍼레이션 및 이전 직접 오픈스택 API 연동 방식 대비 **Drover 서비스의 기능 커버리지, 교체 매핑, 오픈스택 서비스 통합 구조, 보안 아키텍처 및 의도적 제약사항**을 상세히 기술합니다.

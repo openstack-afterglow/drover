@@ -19,6 +19,12 @@ Drover 서비스의 네이티브 REST, SSE(Server-Sent Events) 및 WebSocket API
 * **`Idempotency-Key`** *(생성 API에서 선택·권장)*: `POST /v1/clusters/async`의 재전송을 같은 오퍼레이션으로 귀속시키는 유니크 키입니다. 현재 스케일·삭제·노드그룹 변경에는 외부 멱동성 계약이 없습니다.
 * **`Content-Type`** *(JSON body 요청에서 필수)*: JSON body를 보내는 요청은 `application/json` 계열 값을 보내야 합니다. FastAPI strict content-type 검사로 헤더 없이 보낸 JSON body도 `422`로 거부됩니다(FastAPI `0.132` 이전에는 허용). JSON 계열이 아닌 값은 이전에도 `422`였습니다.
 
+### 0.4.16 native standard project authority
+
+프로젝트의 effective global `admin`/`manager`/`member`는 소유 자원을 관리하고 `reader`는 비밀 없는 metadata/status를 조회한다. 전용 Drover 역할은 필요하지 않으며 그것만으로 권한을 얻지 않는다. custom/group/domain 및 기존 legacy→core implication은 실제 Keystone role-ID graph 그대로 유지한다. 원래 reduced/application-credential/trust/token-only 자격은 issued-role-ID 범위 metadata 조회만 가능하고 human/system/관리 권한으로 승격하지 않는다. disabled/partial/ambiguous/current-directory 장애는 fail closed 한다.
+
+`GET /v1/policy/capabilities`는 인증된 현재 project에 대한 `{"service":"drover","capabilities":[...],"actions":[...]}`를 정렬해 반환한다. labels는 UI용이며 IAM grant가 아니다. operator YAML은 `[oslo_policy] policy_file/policy_dirs`로 지정하며 `@`도 project/core-role/system/reduced-token 경계를 넘지 못한다. reader/reduced는 ConfigMap/Secret body, logs, shell, kubeconfig 발급·mutation을 할 수 없다.
+
 ### 1.1.1 요청 및 작업 로그
 API는 정상(2xx/3xx) 및 오류(4xx/5xx) HTTP 응답 완료 시 INFO로 method, 라우트 템플릿, status, success/error, 경과 시간과 검증된 request ID를 남깁니다. SSE는 스트림 종료까지 완료가 지연될 수 있습니다. Worker의 내구성 job도 완료·재시도·실패·보류를 INFO로 남깁니다. `LOG_LEVEL=DEBUG`를 **API 및 Worker 각 프로세스**에 지정하면 query/state/result의 제한된 구조 요약(허용된 키 이름과 개수, 값 없음)을 DEBUG로 추가합니다. 쿼리 값, 요청/응답 바디, 동적 URL 경로, 인증 헤더, kubeconfig, node token, Keystone credential, 예외 문자열/traceback은 이 공통 로그에 넣지 않습니다.
 
@@ -123,10 +129,10 @@ LOG_LEVEL=DEBUG drover-worker
 
 ### `GET /v1/clusters/{cluster_id}/kubeconfig?grade=user|editor|admin`
 - **설명**: K3s 클러스터 접근용 Kubeconfig YAML 다운로드. 기본 `grade=user`이며 요청한 grade만 발급하고 상위·하위 grade로 대체하지 않는다.
-  - `user`: `drover-access_user` 또는 `drover-access_admin`. 읽기 전용 ClusterRole에 묶인 ServiceAccount TokenRequest(최대 900초, Keystone 토큰 만료 이내). secret·변경·exec 권한 없음.
-  - `editor`: `drover-workloads_editor` 또는 `drover-access_admin`. 사용자별 격리 namespace의 Role과 admission 정책에 묶인 TokenRequest. 새 ValidatingAdmissionPolicy/binding이 dry-run probe를 거부할 때까지 최대 20회(0.5초 간격) 확인하고, 끝내 거부하지 않으면 토큰 없이 `502`를 반환한다.
-  - `admin`: `drover-access_admin`(또는 검증된 system admin)만. 저장된 전체 kubeconfig.
-  - 모든 grade에 base `member`가 필요하고, system admin이 아닌 raw `admin`/`manager` 역할은 거부한다.
+  - `user`: core project admin/manager/member 또는 검증된 human system-admin. 읽기 전용 ServiceAccount TokenRequest(최대900초, 원래 Keystone expiry 이내).
+  - `editor`: 같은 관리 권한으로 사용자별 격리 namespace의 Role/admission에 묶인 TokenRequest를 발급한다. fail-closed admission probe와502 경계는 유지한다.
+  - `admin`: 같은 관리 권한으로 명시적 `grade=admin`일 때만 저장된 전체 kubeconfig를 반환한다.
+  - reader와 원래 reduced credential은 모든 grade가403이며 상위/하위 grade로 대체하지 않는다.
 - **응답 (200 OK)**: `application/yaml`, `Cache-Control: no-store`. 제한 grade는 `X-Credential-Expires-At`, `X-Workload-Namespace` 헤더를 포함한다.
 - **오류**: 권한 없는 grade `403`, 알 수 없는 grade `422`, 다른 프로젝트 cluster `404`, 발급·admission 실패 `502`(관리자 자격으로 대체하지 않음). `HEAD`는 권한만 확인하고 자격을 발급하지 않는다.
 

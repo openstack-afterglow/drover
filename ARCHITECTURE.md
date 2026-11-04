@@ -12,6 +12,15 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker들이 SQL lease를 얻어 OpenStack 작업을 실행한다. Redis server-time membership은 Worker의 discovery/recovery/reconciliation/delegation 역할과 health/Stampede target 소유권을 분배한다. DB job consumer는 Redis leader 아래로 이동하지 않는다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 credential 없는 임시 ownership·callback token·짧은 상태/헬스 캐시·stampede 이벤트 같은 보조 저장소다.
 
+### Standard project-role candidate 0.4.16
+
+Candidate source starts at remote `dev` `ea0bc07`, separate from the extensive stale shared-checkout work. `auth.py` validates original credentials before rescope, fresh exact enabled principal/project/domain, complete global catalog and actual role-ID DAG, native effective project assignments and raw user/group system grants. `current_project_role_state` remains the provider credential-inference interface. Domain-local aliases never assert global core names.
+
+`policy.py` admits owned metadata to reader-or-higher and project management/content/issuance to admin/manager/member; retired service leaves are neither required nor sufficient. Native legacy/custom/group/domain implications remain authoritative. Hard project/core/system/original-reduced-token ceilings survive operator `@`; verified human system-admin is separate. `main.py` exposes `/v1/policy/capabilities` from the identical action engine. ConfigMap/Secret bodies, logs, shell and kubeconfig are not reader metadata.
+
+`config.py` uses standard `[oslo_policy]` file/directories, replacing Drover-specific policy-file settings. Kolla mounts the operator config directory into API/worker `/etc/drover:ro` without writing policy. `delegation.py` continues native configured provider-role attenuation and rejects application-service roles as guest grants. No IAM mutation, executor runtime, worker/network rewrite or credential expansion is included. Existing001–004 remain immutable; the exact already-applied additive005 is recognized, with unsupported requester/cleanup data refused by canonical migration/startup/readiness. Final local evidence and release/deployment boundaries are in `docs/release-0.4.16.md`.
+
+
 ## Development status
 
 | 기능 | Implementation | Verification evidence | Current limit | Source |
@@ -302,9 +311,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "59f25cdb88d2bded33a0dac3b09c2d8df5a2166398a31df51718c3027b067869",
-  "reviewed_at": "2026-10-14T11:19:37Z",
-  "summary": "0.4.15 post-rollout documentation review: docs-only update recording the two-commit source pin (314c7a6a pinned by 977a1cad), exact-SHA CI, tag Release/Docker publication and the 2026-10-14 DMS Lab production rollout receipt, plus the observation that REDIS_URL targets the read-only dms-controller1 Valkey replica with no Drover error observed. No source, schema, configuration or Kolla role change."
+  "source_sha256": "42b5751bfc2ee458c933b3a671a9bff05b4630ab9abf9f7725edf1bf6b03f6d2",
+  "reviewed_at": "2026-11-04T03:34:35Z",
+  "summary": "standard-project-role 0.4.16 candidate: native core-role floors, negated-policy fail-closed, exact 005 recognition, Kolla oslo_policy mounts"
 }
 ```
 <!-- architecture-review:end -->
