@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -78,6 +79,14 @@ def test_app(store):
         "private-net": SimpleNamespace(id="private-net", name="private", is_router_external=False, is_shared=False),
     }
     conn.network.get_network.side_effect = networks.get
+    from keystoneauth1.exceptions.http import NotFound
+    from openstack.network.v2.quota import QuotaDetails
+
+    conn.network.get_quota.return_value = QuotaDetails(
+        security_group={"limit": 10, "used": 1, "reserved": 0},
+        security_group_rule={"limit": 100, "used": 4, "reserved": 0},
+    )
+    conn.network.get.side_effect = NotFound("legacy rule defaults")
 
     async def mock_os_conn():
         return conn
@@ -325,6 +334,7 @@ async def test_hash_conflict_409(async_client, store):
     )
     assert resp2.status_code == 409
     assert "Idempotency key 'idemp-key-conflict-200' reused with a different request hash" in resp2.json()["detail"]
+    assert "drover_pre_admission_refused" not in resp2.text
 
 
 @pytest.mark.asyncio
@@ -507,6 +517,7 @@ async def test_network_lookup_failure_is_sanitized(async_client, store, test_app
 
     assert response.status_code == 503
     assert "secret-password" not in response.text
+    assert "drover_pre_admission_refused" not in response.text
     assert store.clusters == {}
     assert store.jobs == {}
 
@@ -528,3 +539,179 @@ async def test_queued_create_without_network_never_reaches_nova():
     create_security_group.assert_not_called()
     create_server.assert_not_called()
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["security_group", "security_group_rule"])
+async def test_native_security_quota_shortage_never_issues_or_queues(
+    async_client, store, test_app, resource,
+):
+    from openstack.network.v2.quota import QuotaDetails
+
+    entries = {
+        "security_group": {"limit": 10, "used": 1, "reserved": 0},
+        "security_group_rule": {"limit": 100, "used": 4, "reserved": 0},
+    }
+    entries[resource]["reserved"] = entries[resource]["limit"] - entries[resource]["used"]
+    test_app.state.caller_conn.network.get_quota.return_value = QuotaDetails(**entries)
+    with patch("drover.api.delegated.issue_credentials", new=AsyncMock()) as issue:
+        response = await async_client.post("/v1/clusters/async", json={"name": "quota-shortage"})
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "drover_pre_admission_refused"
+    assert detail["reason"] == "security_group_quota_exceeded"
+    assert resource in detail["message"]
+    assert "proj-test-123" in detail["message"]
+    assert "reserved=" in detail["message"]
+    assert detail["quota"] == {
+        "project_id": "proj-test-123",
+        "resource": resource,
+        "required": 1 if resource == "security_group" else 11,
+        "available": 0,
+        **entries[resource],
+    }
+    issue.assert_not_awaited()
+    assert store.clusters == store.jobs == store.operations == {}
+    assert store.credentials == []
+
+
+@pytest.mark.asyncio
+async def test_native_security_quota_unknown_never_issues_or_queues(async_client, store, test_app):
+    test_app.state.caller_conn.network.get_quota.side_effect = RuntimeError("secret-token=not-for-response")
+    with patch("drover.api.delegated.issue_credentials", new=AsyncMock()) as issue:
+        response = await async_client.post("/v1/clusters/async", json={"name": "quota-unknown"})
+
+    assert response.status_code == 503
+    assert "not-for-response" not in response.text
+    assert response.json()["detail"] == {
+        "code": "drover_pre_admission_refused",
+        "reason": "security_group_quota_unavailable",
+        "project_id": "proj-test-123",
+        "message": "Neutron security-group quota or default-rule budget is unavailable; no creation was queued",
+    }
+    issue.assert_not_awaited()
+    assert store.clusters == store.jobs == store.operations == {}
+
+
+@pytest.mark.asyncio
+async def test_idempotent_receipt_does_not_readmit_security_quota(async_client, store, test_app):
+    headers = {"Idempotency-Key": "quota-receipt"}
+    body = {"name": "quota-receipt"}
+    first = await async_client.post("/v1/clusters/async", headers=headers, json=body)
+    test_app.state.caller_conn.network.get_quota.side_effect = AssertionError("receipt must not readmit")
+    second = await async_client.post("/v1/clusters/async", headers=headers, json=body)
+
+    assert first.status_code == second.status_code == 200
+    assert len(store.clusters) == len(store.jobs) == len(store.operations) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,status", [("shortage", 409), ("unavailable", 503)])
+async def test_native_http_pre_admission_marker_has_no_trust_queue_or_resource_write(
+    async_client, store, test_app, failure, status,
+):
+    from test_native_security_group_quota_http import PROJECT, native_neutron
+
+    with native_neutron() as (conn, state):
+        test_app.state.caller_conn.network = conn.network
+        test_app.state.caller_conn._afterglow_project_id = PROJECT
+        # Existing token-info override is the same synthetic target, not an
+        # administrator rescope or alternate project executor.
+        async def token_info():
+            return {"project_id": PROJECT, "user_id": "user-test-123", "roles": ["member"]}
+
+        test_app.dependency_overrides[get_token_info] = token_info
+        if failure == "shortage":
+            state["quota"]["security_group"]["limit"] = 1
+        else:
+            state["quota_status"] = 503
+        with (
+            patch("drover.api.delegated.admitted_operation") as admit,
+            patch("drover.api.delegated.issue_credentials", new=AsyncMock()) as issue,
+        ):
+            response = await async_client.post("/v1/clusters/async", json={"name": "no-native-write"})
+        assert response.status_code == status
+        detail = response.json()["detail"]
+        assert detail["code"] == "drover_pre_admission_refused"
+        assert detail["message"]
+        assert all(method == "GET" for method, _ in state["requests"])
+        assert ("GET", f"/v2.0/quotas/{PROJECT}/details") in state["requests"]
+        admit.assert_not_called()
+        issue.assert_not_awaited()
+        assert store.clusters == store.jobs == store.operations == {}
+        assert store.credentials == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,status", [("shortage", 409), ("unavailable", 503)])
+async def test_overlapping_keyed_refusal_cannot_claim_no_operation_exists(
+    async_client, store, test_app, monkeypatch, failure, status,
+):
+    from openstack.network.v2.quota import QuotaDetails
+
+    from drover.services import jobs, operations, provisioner
+
+    original_lookup = operations.get_operation_by_idempotency_key
+    original_enqueue = jobs.enqueue_job
+    original_preflight = provisioner.preflight_cluster_security_group
+    both_missed = asyncio.Event()
+    accepted = asyncio.Event()
+    lookups = 0
+    preflights = 0
+
+    async def simultaneous_miss(*args):
+        nonlocal lookups
+        lookups += 1
+        if lookups <= 2:
+            if lookups == 2:
+                both_missed.set()
+            await both_missed.wait()
+            return None
+        return await original_lookup(*args)
+
+    async def enqueue_then_release(*args, **kwargs):
+        result = await original_enqueue(*args, **kwargs)
+        accepted.set()
+        return result
+
+    async def quota_after_other_accepts(*args):
+        nonlocal preflights
+        preflights += 1
+        if preflights == 2:
+            await accepted.wait()
+            if failure == "shortage":
+                test_app.state.caller_conn.network.get_quota.return_value = QuotaDetails(
+                    security_group={"limit": 1, "used": 1, "reserved": 0},
+                    security_group_rule={"limit": 100, "used": 4, "reserved": 0},
+                )
+            else:
+                test_app.state.caller_conn.network.get_quota.side_effect = RuntimeError("quota read unavailable")
+        await original_preflight(*args)
+
+    monkeypatch.setattr(operations, "get_operation_by_idempotency_key", simultaneous_miss)
+    monkeypatch.setattr(jobs, "enqueue_job", enqueue_then_release)
+    monkeypatch.setattr(provisioner, "preflight_cluster_security_group", quota_after_other_accepts)
+    headers = {"Idempotency-Key": "overlapping-key"}
+    body = {"name": "shared-operation"}
+    first, second = await asyncio.gather(
+        async_client.post("/v1/clusters/async", headers=headers, json=body),
+        async_client.post("/v1/clusters/async", headers=headers, json=body),
+    )
+    assert sorted([first.status_code, second.status_code]) == [200, status]
+    refused = first if first.status_code == status else second
+    detail = refused.json()["detail"]
+    assert detail["reason"] == f"security_group_quota_{'exceeded' if failure == 'shortage' else 'unavailable'}"
+    assert detail["message"]
+    assert "code" not in detail
+    assert "pre_admission" not in refused.text
+    assert "no creation was queued" not in refused.text
+    assert len(store.clusters) == len(store.jobs) == len(store.operations) == 1
+    receipt = await operations.get_operation_by_idempotency_key(None, "proj-test-123", headers["Idempotency-Key"])
+    assert receipt is not None
+    assert receipt.id == next(iter(store.operations))
+    # Readback of the same key reuses the admitted operation even though quota
+    # is now unavailable/exhausted; it does not queue or repeat provider writes.
+    replay = await async_client.post("/v1/clusters/async", headers=headers, json=body)
+    assert replay.status_code == 200
+    assert len(store.clusters) == len(store.jobs) == len(store.operations) == 1

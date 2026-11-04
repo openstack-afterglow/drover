@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import threading
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -647,3 +649,82 @@ async def test_zero_agent_activation_revalidates_attempt_inside_its_write_transa
         session.commit.assert_not_awaited()
     finally:
         guard.close()
+
+
+@pytest.mark.parametrize("failure", ["shortage", "forbidden", "unavailable", "malformed", "templates"])
+async def test_worker_quota_denial_survives_real_operation_store_fence_without_requeue(monkeypatch, caplog, failure):
+    from test_jobs import _Result
+    from test_native_security_group_quota_http import PROJECT, _check, native_neutron
+
+    from drover.models.orm import DroverOperationEvent
+    from drover.services import operations, provisioner, store
+
+    job, cluster, session = _state(monkeypatch, kind="create", status="queued", attempt=0)
+    job.project_id = cluster.project_id = PROJECT
+    job.delegation_id = "delegation"
+    job.operation_id = "operation"
+    job.payload_json = {"name": "cluster", "network_id": "network"}
+    cluster.status = "CREATING"
+    operation = DroverOperation(
+        id=job.operation_id, project_id=PROJECT, cluster_id=cluster.id, kind="create", status="QUEUED",
+    )
+    session.objects[(DroverOperation, operation.id)] = operation
+
+    async def execute(statement):
+        session.statements.append(statement)
+        column = statement.column_descriptions[0]
+        if column["entity"] is K3sCluster:
+            return _Result(cluster)
+        if column["entity"] is DroverJob:
+            return _Result(job if column["name"] == "DroverJob" and job.status == "queued" else None)
+        assert column["entity"] is DroverOperationEvent
+        return _Result(max((event.sequence for event in session.added), default=0))
+
+    session.execute = execute
+    session.commit = AsyncMock()
+    monkeypatch.setattr(store, "get_session_factory", lambda: _factory(session))
+    monkeypatch.setattr(store, "is_db_available", lambda: True)
+    monkeypatch.setattr(operations, "get_session_factory", lambda: _factory(session))
+    monkeypatch.setattr(jobs._delegation, "delete_released", AsyncMock())
+    monkeypatch.setattr(provisioner, "_guest_plugin_settings", AsyncMock())
+    monkeypatch.setattr("drover.config.get_settings", lambda: SimpleNamespace(drover_boot_volume_size_gb=30))
+
+    with native_neutron() as (conn, state):
+        _check(conn)  # API-time budget fits; another writer consumes it before claim.
+        if failure == "shortage":
+            state["quota"]["security_group"]["limit"] = 1
+        elif failure == "forbidden":
+            state["quota_status"] = 403
+        elif failure == "unavailable":
+            state["quota_status"] = 503
+        elif failure == "malformed":
+            state["quota"]["security_group"]["reserved"] = None
+        else:
+            state["extension"] = True
+            state["template_payload"] = {}
+        # Keep real open_connection/protect_connection and SQL ownership fences;
+        # replace only the external trust handshake with the synthetic provider.
+        monkeypatch.setattr(jobs._delegation, "open_trust_connection", AsyncMock(return_value=conn))
+        with caplog.at_level(logging.INFO, logger="drover.jobs"):
+            assert await jobs.process_one_job()
+        assert not await jobs.process_one_job()
+        assert all(method == "GET" for method, _ in state["requests"])
+        assert sum(path.endswith("/details") for _, path in state["requests"]) == 2
+
+    assert job.status == "failed" and job.attempts == 1
+    assert operation.status == "FAILED" and cluster.status == "ERROR"
+    expected = (
+        "required=1, available=0, limit=1, used=1, reserved=0"
+        if failure == "shortage" else "Neutron security-group quota or default-rule budget is unavailable"
+    )
+    for error in (job.last_error, operation.error, cluster.status_reason):
+        assert expected in error
+        assert PROJECT in error
+        assert "no longer authorizes dispatch" not in error
+        assert "drover_pre_admission_refused" not in error
+    session.commit.assert_awaited_once()
+    assert [event.phase for event in session.added] == ["failed", "job_failed"]
+    assert all(expected in event.payload_json["error"] for event in session.added)
+    assert all("drover_pre_admission_refused" not in json.dumps(event.payload_json) for event in session.added)
+    assert any("attempt=1 outcome=error" in record.message for record in caplog.records)
+    assert not any("outcome=retry" in record.message for record in caplog.records)

@@ -258,6 +258,7 @@ class Coordinator:
         self._leases: dict[str, Lease] = {}
         self._issued: dict[str, Lease] = {}
         self._lock = threading.Lock()
+        self._generation = 0
         self._joined = False
         self._deadline = 0.0
         self._closed = threading.Event()
@@ -284,8 +285,9 @@ class Coordinator:
             for lease in self._leases.values():
                 lease.revoke()
             self._leases.clear()
-        self._joined = False
-        self._deadline = 0.0
+            self._generation += 1
+            self._joined = False
+            self._deadline = 0.0
 
     async def heartbeat(self) -> None:
         self._control_loop()
@@ -294,20 +296,25 @@ class Coordinator:
         started = time.monotonic()
         if self._joined and started >= self._deadline:
             self.revoke_local()
-        if not self._joined:
-            # Each rejoin is a new incarnation: expired tokens never resurrect.
-            if not self._first_join:
-                self.member_id = uuid.uuid4().hex
-            self._first_join = False
-        joined = self._joined
+        with self._lock:
+            generation = self._generation
+            if not self._joined:
+                # Each rejoin is a new incarnation: expired tokens never resurrect.
+                if not self._first_join:
+                    self.member_id = uuid.uuid4().hex
+                self._first_join = False
+            joined = self._joined
         result = await self._call("heartbeat", int(self.lease_seconds * 1000),
                                   "renew" if joined else "join",
                                   int(self.startup_seconds * 1000))
         if not result:
             self.revoke_local()
             raise OwnershipLost("Ownership membership expired")
-        self._joined = True
-        self._deadline = started + self.lease_seconds
+        with self._lock:
+            if generation != self._generation or self._closed.is_set():
+                raise OwnershipLost("Ownership revoked during heartbeat")
+            self._joined = True
+            self._deadline = started + self.lease_seconds
         if time.monotonic() >= self._deadline:
             self.revoke_local()
             raise OwnershipLost("Ownership heartbeat overdue")

@@ -18,6 +18,7 @@ from drover.models.orm import DroverJob, DroverOperation, K3sCluster, K3sNodegro
 from drover.services import delegation as _delegation
 from drover.services import execution, execution_safety, operations, worker_ownership
 from drover.services.delegation import AdmittedDelegation
+from drover.services.neutron import SecurityGroupQuotaExceeded, SecurityGroupQuotaUnavailable
 
 _logger = logging.getLogger("drover.jobs")
 _LEASE_SECONDS = 900
@@ -852,8 +853,13 @@ async def process_one_job() -> bool:
         dispatch.cancel()
         cancelled = True
         propagate_cancel = bool(asyncio.current_task().cancelling())
-    except (execution.ExecutionAuthorityError, execution_safety.OwnershipLost) as exc:
-        # Authority and ownership failures never replace the actor or start a new attempt.
+    except (
+        execution.ExecutionAuthorityError,
+        execution_safety.OwnershipLost,
+        SecurityGroupQuotaExceeded,
+        SecurityGroupQuotaUnavailable,
+    ) as exc:
+        # Failed quota admission, authority and ownership never start another attempt.
         guard.revoke()
         if await _retry_or_fail(
             job_id, attempt=attempt, error=str(exc), terminal=True,

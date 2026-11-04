@@ -47,6 +47,15 @@ LOG_LEVEL=DEBUG drover-worker
 * `429 Too Many Requests`: Rate Limit(초당/분당 요청 제한) 초과
 * `503 Service Unavailable`: 백엔드 서비스(Redis, DB, Keystone 등) 오류
 
+### Security-group quota admission candidate (unpublished)
+
+`POST /v1/clusters/async` checks fresh native project security-group and rule `limit`, `used`, and `reserved`, including authored cluster rules, provider-generated templates and an empty project's implicit default group. Drover-managed groups are not quota-exempt. A known shortage returns **409** before trust, credentials, cluster records or jobs; unknown/malformed/incomplete quota or templates return **503** without a fallback or native resource write. Administrators must review current native project limits; this endpoint does not raise them.
+
+For **unkeyed** preflight refusals only, nested `detail.code="drover_pre_admission_refused"` proves that this request was refused before admission. Shortages use `reason="security_group_quota_exceeded"`, `message` and `quota={project_id,resource,required,available,limit,used,reserved}`. Unknown budgets use `reason="security_group_quota_unavailable"`, `message`, `project_id`, and no invented quota counts. These structured values support localized client presentation.
+
+Requests carrying `Idempotency-Key` retain structured reason/message/quota but **omit the code and no-operation claim**, because another overlapping request may have queued the same key. Read back the exact key before resubmitting. Generic409/503, worker failures and provider write races do not synthesize this marker. The worker rechecks before its first group write and terminalizes quota denial/unavailability without requeue, preserving the original error in job, operation, cluster and events. Read-only preflight is not an atomic reservation; subsequent native rejection remains possible and unknown writes are not replayed.
+
+
 ### 1.3 Durable execution authority
 
 - create/scale/delete, mutation nodegroup 및 admin scale/delete는 target project-scoped requester token으로 per-operation Keystone trust를 admit합니다. trustor=requester, trustee=service-project에서 resolve한 Drover identity, `impersonation=True`입니다. required roles는 모두 현재 보유해야 하며 optional은 보유한 것만 위임합니다. `admin`/`manager` 위임과 service/tenant-manager fallback은 없습니다. admin API도 target project에 scope된 caller token이 필요합니다.

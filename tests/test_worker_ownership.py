@@ -376,3 +376,52 @@ async def test_live_owner_reservation_survives_unpublication_without_lease_reviv
     with pytest.raises(ownership.OwnershipLost):
         await former.checkpoint()
     await current.checkpoint()
+
+
+async def test_revocation_during_renewal_cannot_restore_stale_consumer_ownership(monkeypatch):
+    client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    coordinator = ownership.Coordinator(client, lease_seconds=3, registry_seconds=3, startup_seconds=0)
+    await coordinator.heartbeat()
+    former = (await coordinator.assignments())["discovery"]
+    await former.checkpoint()
+    former_member = coordinator.member_id
+    original_call = coordinator._call
+    renewed = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def delayed_renewal(action, *args):
+        result = await original_call(action, *args)
+        if action == "heartbeat":
+            # Real Redis renewal succeeded, but local admission has not committed.
+            renewed.set()
+            await finish.wait()
+        return result
+
+    monkeypatch.setattr(coordinator, "_call", delayed_renewal)
+    pending = asyncio.create_task(coordinator.heartbeat())
+    try:
+        await renewed.wait()
+        coordinator.revoke_local()
+        finish.set()
+        with pytest.raises(ownership.OwnershipLost, match="revoked during heartbeat"):
+            await pending
+        assert coordinator._joined is False
+        assert coordinator._deadline == 0
+        assert coordinator._leases == {}
+        with pytest.raises(ownership.OwnershipLost):
+            await former.checkpoint()
+        with pytest.raises(ownership.OwnershipLost):
+            await coordinator.assignments()
+
+        monkeypatch.setattr(coordinator, "_call", original_call)
+        await coordinator.heartbeat()
+        assert coordinator.member_id != former_member
+        assert coordinator._joined is True
+        with pytest.raises(ownership.OwnershipLost):
+            await former.checkpoint()
+    finally:
+        finish.set()
+        await asyncio.gather(pending, return_exceptions=True)
+        monkeypatch.setattr(coordinator, "_call", original_call)
+        await coordinator.close()
+        await client.close()

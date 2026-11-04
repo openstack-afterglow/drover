@@ -409,6 +409,40 @@ async def create_k3s_cluster_async(
 
         k3s_version = await get_required_runtime_setting("k3s.version")
 
+        from drover.services.neutron import SecurityGroupQuotaExceeded
+        from drover.services.provisioner import preflight_cluster_security_group
+
+        try:
+            # A keyed request can overlap another admission after both initial
+            # lookups missed. Its own refusal cannot prove the shared key has
+            # no operation; do not mint an authoritative absence marker.
+            await preflight_cluster_security_group(conn, project_id, req.allowed_cidrs)
+        except SecurityGroupQuotaExceeded as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    **({} if idempotency_key else {"code": "drover_pre_admission_refused"}),
+                    "reason": "security_group_quota_exceeded",
+                    "message": str(exc),
+                    "quota": exc.budget,
+                },
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    **({} if idempotency_key else {"code": "drover_pre_admission_refused"}),
+                    "reason": "security_group_quota_unavailable",
+                    "project_id": project_id,
+                    "message": (
+                        "Neutron security-group quota or default-rule budget is unavailable; "
+                        "check the existing idempotency receipt before resubmitting"
+                        if idempotency_key else
+                        "Neutron security-group quota or default-rule budget is unavailable; no creation was queued"
+                    ),
+                },
+            ) from exc
+
         cluster_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
         _creator_user_id = conn._afterglow_user_id if hasattr(conn, "_afterglow_user_id") else None

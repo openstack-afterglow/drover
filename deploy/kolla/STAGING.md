@@ -37,6 +37,14 @@ Every replica must share MariaDB and the configured service Redis/Sentinel names
 
 Kolla registry metadata is v0.4.15; source-build mode asserts source `314c7a6ab743e7ee766ade41e11ddcb0040e3797`, pinned by release-metadata commit `977a1cad411cc0eafb5a92090bdced272de0611a`. Exact-SHA CI and the tag Release/Docker workflows succeeded. The 2026-10-14 DMS Lab rollout stopped all 3 APIs and 3 workers (exit 0), verified a cold restore of 16 tables / 75,225 rows, needed no migration (ledger 4/4), and changed no generated config. All six replicas ran pinned amd64 digests/revision with 0 restarts, APIs healthy, and readiness 200 on three listeners plus public. Drover's REDIS_URL points at the dms-controller1 read-only Valkey replica (Sentinel master on dms-controller3); no Drover error was observed after cutover. Full digests, local amd64/arm64 qualification and remaining credential/Sentinel evidence limits are in the [0.4.15 receipt](../../docs/release-0.4.0.md#tagged-0415-publication-and-dms-lab-production-rollout--2026-10-14).
 
+## 0.4.17 quota and revocation-fence candidate
+
+Prepared 2026-11-04 Asia/Seoul (UTC+09:00); unpublished and undeployed. Registry defaults select numeric image tag `0.4.17`. Source mode requires the immutable implementation SHA carried by the separate release-metadata commit; a commit cannot contain its own SHA. Do not publish the implementation commit before the final source pin and exact-SHA suite are qualified.
+
+Security-group/rule detail and generated-rule template reads use existing requester/worker authority. Verify native policy permits these reads; denied or malformed reads now fail503 instead of queuing a predictably failing create. Native quota enforcement still arbitrates later races. Existing project quotas are not raised. Preserve005 compatibility checks, encryption keys, effective config, unknown-outcome inventory and the complete worker-cohort drain boundary described below. API and worker must run matching new source.
+
+Local wheel/image execution and synthetic Neutron/worker tests are not production Keystone/quota-policy, Galera locking, Sentinel failover or guest acceptance. See [0.4.17 release notes](../../docs/release-0.4.17.md).
+
 ## 0.4.16 candidate and existing005
 
 Registry mode uses numeric image tag `0.4.16`. Source mode is pinned to `b25378e23e34109b183444b2ebdc6a0e836027b2` (0.4.16 implementation + version metadata) by the release-metadata commit tagged `0.4.16`. API/worker mount the same operator-owned config directory at `/etc/drover:ro` and render `[oslo_policy]` file/directories; no policy YAML is generated or overwritten. Review old role-leaf-specific overrides before rollout.

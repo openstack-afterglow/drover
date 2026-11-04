@@ -255,6 +255,7 @@ async def test_primary_server_uses_snapshot_without_key_name() -> None:
     with (
         patch("drover.config.get_settings", return_value=SimpleNamespace(drover_boot_volume_size_gb=30, drover_callback_base_url="https://drover.test")),
         patch("drover.services.execution.open_connection", new=AsyncMock(return_value=connection)),
+        patch("drover.services.neutron.check_security_group_quota"),
         patch("drover.services.neutron.create_security_group", return_value={"id": "sg-1"}),
         patch("drover.services.neutron.create_security_group_rule", return_value={"id": "rule-1"}),
         patch("drover.services.cinder.create_volume_from_image", return_value=SimpleNamespace(id="volume-1")),
@@ -313,6 +314,7 @@ async def test_create_cluster_renders_public_identity_url_without_changing_backe
     with (
         patch("drover.config.get_settings", return_value=settings),
         patch("drover.services.execution.open_connection", new=AsyncMock(return_value=connection)),
+        patch("drover.services.neutron.check_security_group_quota"),
         patch(
             "drover.services.cluster_authority.active_guest_credential",
             new=AsyncMock(return_value={"id": "cred-1", "secret": "secret-1"}),

@@ -1,3 +1,11 @@
+## Unpublished quota and worker-fence candidate — 2026-11-04
+
+Changes: strict native security-group/rule admission before trust/queue and again before worker writes; structured shortage/unavailable detail with an unkeyed-only authoritative refusal marker; keyed-overlap receipt preservation; terminal quota-error settlement through the operation/store fence; local-generation rejection of stale heartbeat renewal after revocation. Removed/deprecated features: None.
+
+This isolated candidate starts at published 0.4.16 source and preserves its GPU metadata/initial-agent behavior, core-role authority, Sentinel client lifecycle, packaging, dependency lock and schema. It does not import unrelated shared-tree credential-cleanup/system-executor changes or revert release code. No publication, production deployment or live cloud acceptance is implied. Synthetic runtime and Python3.12 qualification are recorded separately from the earlier shared-tree Python3.13 results.
+
+Isolated candidate qualification on Python3.12.13: full native suite **1807 passed, 3 skipped**; full Ruff and source-linked architecture check passed. Actual installed-SDK loopback Neutron smoke confirmed zero preflight writes and exactly one later native409 POST without replay. Source digest: `8df860086416a248a42a6f81ca7cf15627e8113ab0784c919b3ee62be806b27b` / 235 files. Durable logs: `/Users/pieroot/.local/share/afterglow-proofs/drover-release-qualification-20261104/`. These are synthetic local results, not image/deployment, MariaDB locking or live quota-policy acceptance.
+
 ## 0.4.16 authority candidate
 
 Native effective project admin/manager/member replace dedicated Drover-role prerequisites for owned resource management; reader retains nonsecret metadata only. Actual custom/group/domain/legacy implications remain native authority, with original reduced-token and human/system boundaries enforced outside operator YAML. `/v1/policy/capabilities` projects the same action engine. Exact additive005 is packaged solely for already-applied schema compatibility; unsupported requester/cleanup data is refused, not interpreted. Qualification/deployment limits: [release0.4.16](release-0.4.16.md).

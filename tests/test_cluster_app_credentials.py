@@ -143,6 +143,7 @@ async def test_3_create_failure_before_provision_call():
     with (
         patch("drover.config.get_settings", return_value=mock_s),
         patch("drover.services.execution.open_connection", AsyncMock(return_value=conn_mock)),
+        patch("drover.services.neutron.check_security_group_quota"),
         patch(
             "drover.services.cluster_authority.active_guest_credential",
             new=AsyncMock(side_effect=RuntimeError("Guest credential unavailable")),

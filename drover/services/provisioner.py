@@ -182,6 +182,25 @@ def _cluster_security_group_rules(
     return rules
 
 
+async def preflight_cluster_security_group(conn, project_id: str, allowed_cidrs: list[str] | None) -> None:
+    from drover.services import neutron
+
+    try:
+        await worker_ownership.run_sync(
+            neutron.check_security_group_quota,
+            conn,
+            project_id,
+            len(_cluster_security_group_rules(allowed_cidrs, "pending-cluster-group")),
+        )
+    except neutron.SecurityGroupQuotaExceeded:
+        raise
+    except Exception as exc:
+        raise neutron.SecurityGroupQuotaUnavailable(
+            f"Project {project_id}: Neutron security-group quota or default-rule budget is unavailable; "
+            "inspect native quota-read permissions and provider health before resubmitting."
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # 에이전트 VM 프로비저닝 (단일 마스터 / HA 모두 공통)
 # ---------------------------------------------------------------------------
@@ -599,6 +618,7 @@ async def create_cluster_job(
             flavors = await worker_ownership.run_sync(nova.list_flavors, conn)
             if not any(flavor.id == payload.get("agent_flavor_id") for flavor in flavors):
                 raise RuntimeError("Selected agent flavor is unavailable")
+        await preflight_cluster_security_group(conn, project_id, allowed_cidrs)
         # Step 1: Security Group
         if operation_id:
             await operations.append_operation_event(
@@ -945,6 +965,10 @@ async def create_cluster_job(
 
     except Exception as e:
         _logger.error("k3s cluster creation job for cluster %s failed: %s", cluster_id, e, exc_info=True)
+        # Commit the guarded cluster write while the operation still authorizes
+        # this attempt; terminalizing the operation first would fence this write
+        # and replace the original provider/admission error with OwnershipLost.
+        await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"클러스터 생성 실패: {e}")
         if operation_id:
             await operations.append_operation_event(
                 None,
@@ -954,7 +978,6 @@ async def create_cluster_job(
                 payload_json={"step": K3sProgressStep.FAILED.value, "progress": 0, "error": str(e)},
             )
             await operations.update_operation_status(None, operation_id, "FAILED", error=str(e))
-        await k3s_cluster.update_cluster_status(project_id, cluster_id, "ERROR", f"클러스터 생성 실패: {e}")
         raise
     finally:
         await keystone.close_connection(conn)

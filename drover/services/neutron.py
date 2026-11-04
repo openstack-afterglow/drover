@@ -236,6 +236,108 @@ def cleanup_instance_fips(conn: openstack.connection.Connection, instance_id: st
 # ---------------------------------------------------------------------------
 
 
+class SecurityGroupQuotaExceeded(ValueError):
+    """A fresh native quota observation cannot fit the cluster's group plan."""
+
+    def __init__(self, message: str, *, budget: dict[str, str | int]):
+        super().__init__(message)
+        self.budget = budget
+
+
+class SecurityGroupQuotaUnavailable(RuntimeError):
+    """The native quota/default-rule budget cannot be established safely."""
+
+
+def check_security_group_quota(
+    conn: openstack.connection.Connection,
+    project_id: str,
+    requested_rules: int,
+) -> None:
+    """Read-only admission; Neutron still arbitrates races at each native write."""
+    from keystoneauth1.exceptions.http import NotFound
+
+    quota = conn.network.get_quota(project_id, details=True).to_dict(original_names=True)
+    budget = {}
+    for resource in ("security_group", "security_group_rule"):
+        entry = quota.get(resource)
+        if not isinstance(entry, dict):
+            raise ValueError(f"Neutron {resource} detailed quota is unavailable")
+        for field in ("limit", "used", "reserved"):
+            value = entry.get(field)
+            minimum = -1 if field == "limit" else 0
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"Neutron {resource} quota {field} is unavailable")
+        budget[resource] = entry
+
+    # Neutron ensures a project's default group before creating its first custom
+    # group. Do not list groups here: that GET can itself materialize the default.
+    needs_default = budget["security_group"]["used"] == 0
+    required_groups = 2 if needs_default else 1
+
+    def require_capacity(resource: str, required: int) -> None:
+        entry = budget[resource]
+        available = entry["limit"] - entry["used"] - entry["reserved"]
+        if entry["limit"] != -1 and available < required:
+            raise SecurityGroupQuotaExceeded(
+                f"Project {project_id}: Neutron {resource} quota insufficient "
+                f"(required={required}, available={max(0, available)}, "
+                f"limit={entry['limit']}, used={entry['used']}, reserved={entry['reserved']}). "
+                "Drover-managed resources consume the same project quota; "
+                "remove unused resources or request an authorized quota review.",
+                budget={
+                    "project_id": project_id,
+                    "resource": resource,
+                    "required": required,
+                    "available": max(0, available),
+                    "limit": entry["limit"],
+                    "used": entry["used"],
+                    "reserved": entry["reserved"],
+                },
+            )
+
+    require_capacity("security_group", required_groups)
+    try:
+        extension = conn.network.get("/extensions/security-group-default-rules", raise_exc=True).json()
+    except NotFound:
+        # Pre-extension Neutron's documented fixed defaults: IPv4/IPv6 egress
+        # for custom groups, plus IPv4/IPv6 self-ingress for the default group.
+        generated_rules = 2 + (4 if needs_default else 0)
+    else:
+        if (
+            not isinstance(extension, dict)
+            or not isinstance(extension.get("extension"), dict)
+            or extension["extension"].get("alias") != "security-group-default-rules"
+        ):
+            raise ValueError("Neutron default-rule extension response is incomplete")
+        # Keep collection presence and raw booleans: an SDK iterator can turn a
+        # malformed missing collection into an apparently valid empty plan.
+        response = conn.network.get("/default-security-group-rules", raise_exc=True).json()
+        templates = response.get("default_security_group_rules") if isinstance(response, dict) else None
+        links = response.get("default_security_group_rules_links", []) if isinstance(response, dict) else None
+        if (
+            not isinstance(templates, list)
+            or not isinstance(links, list)
+            or any(not isinstance(link, dict) or link.get("rel") == "next" for link in links)
+        ):
+            raise ValueError("Neutron security-group rule template collection is incomplete")
+        generated_rules = 0
+        seen = set()
+        for raw in templates:
+            if not isinstance(raw, dict):
+                raise ValueError("Neutron security-group rule template is malformed")
+            template_id = raw.get("id")
+            if not isinstance(template_id, str) or not template_id or template_id in seen:
+                raise ValueError("Neutron security-group rule templates are incomplete")
+            seen.add(template_id)
+            for field in ("used_in_default_sg", "used_in_non_default_sg"):
+                if type(raw.get(field)) is not bool:
+                    raise ValueError("Neutron security-group rule template applicability is unavailable")
+            generated_rules += int(raw["used_in_non_default_sg"])
+            if needs_default:
+                generated_rules += int(raw["used_in_default_sg"])
+    require_capacity("security_group_rule", requested_rules + generated_rules)
+
+
 def get_network_quota(conn: openstack.connection.Connection, project_id: str, *, strict: bool = False) -> dict:
     """프로젝트의 Neutron 할당량 (limit + in_use) 조회."""
 
