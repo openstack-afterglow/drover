@@ -69,9 +69,26 @@ jobs:
           target: drover-worker
           load: true
           tags: drover-worker:local
+      # setup-trivy's installer now downloads through get.trivy.dev, which returned NXDOMAIN
+      # (2026-11-04). Install the same pinned Trivy release directly from GitHub with its
+      # published checksum; the pinned trivy-action still performs every scan.
+      - name: Install pinned Trivy from GitHub release
+        run: |
+          set -euo pipefail
+          version=0.69.3
+          asset="trivy_${version}_Linux-64bit.tar.gz"
+          base="https://github.com/aquasecurity/trivy/releases/download/v${version}"
+          tmp="$(mktemp -d)"
+          curl -fsSL --retry 3 -o "${tmp}/${asset}" "${base}/${asset}"
+          curl -fsSL --retry 3 -o "${tmp}/checksums.txt" "${base}/trivy_${version}_checksums.txt"
+          (cd "${tmp}" && grep " ${asset}\$" checksums.txt | sha256sum -c -)
+          mkdir -p "${HOME}/.local/bin/trivy-bin"
+          tar -xzf "${tmp}/${asset}" -C "${HOME}/.local/bin/trivy-bin" trivy
+          echo "${HOME}/.local/bin/trivy-bin" >> "${GITHUB_PATH}"
       - name: Scan drover-api image for vulnerabilities
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
+          skip-setup-trivy: 'true'
           image-ref: drover-api:local
           format: table
           exit-code: '0'
@@ -79,6 +96,7 @@ jobs:
       - name: Scan drover-worker image for vulnerabilities
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
+          skip-setup-trivy: 'true'
           image-ref: drover-worker:local
           format: table
           exit-code: '0'

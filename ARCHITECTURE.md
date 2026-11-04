@@ -311,9 +311,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "fa77c89a52e48ffe6cde2c52e76c173a53378f23f7988dc9c8c995fe6505eee9",
-  "reviewed_at": "2026-11-04T04:47:15Z",
-  "summary": "0.4.16 release metadata: Kolla source pin b25378e23e34; STAGING/release docs pin text"
+  "source_sha256": "2875dd392f40b22ab87e67b45789aa8c8ddecfe2d252bc226ecffc5dcaf67fcd",
+  "reviewed_at": "2026-11-04T04:52:48Z",
+  "summary": "CI: install pinned Trivy 0.69.3 from GitHub release with checksum; get.trivy.dev NXDOMAIN broke setup-trivy"
 }
 ```
 <!-- architecture-review:end -->

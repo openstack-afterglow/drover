@@ -99,6 +99,15 @@ def test_ci_workflow_structure():
     assert all(
         s["uses"] == "aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1" for s in trivy_steps
     ), "Trivy action must use the immutable known-safe 0.35.0 revision"
+    assert all(s["with"].get("skip-setup-trivy") == "true" for s in trivy_steps), (
+        "Scans use the checksum-verified pinned binary instead of setup-trivy's external installer"
+    )
+    install = [s for s in steps if s.get("name") == "Install pinned Trivy from GitHub release"]
+    assert len(install) == 1
+    script = install[0]["run"]
+    assert "version=0.69.3" in script and "sha256sum -c -" in script
+    assert "releases/download/v${version}" in script and "GITHUB_PATH" in script
+    assert steps.index(install[0]) < min(steps.index(s) for s in trivy_steps)
 
     # Validate db-migration-and-readiness services & steps
     db_job = jobs["db-migration-and-readiness"]
