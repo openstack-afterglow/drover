@@ -39,7 +39,7 @@ Kolla registry metadata is v0.4.15; source-build mode asserts source `314c7a6ab7
 
 ## 0.4.16 candidate and existing005
 
-Registry mode uses numeric image tag `0.4.16`. Source mode must be pinned to the scoped implementation SHA by release integration, not the retained0.4.15 pin. API/worker mount the same operator-owned config directory at `/etc/drover:ro` and render `[oslo_policy]` file/directories; no policy YAML is generated or overwritten. Review old role-leaf-specific overrides before rollout.
+Registry mode uses numeric image tag `0.4.16`. Source mode is pinned to `b25378e23e34109b183444b2ebdc6a0e836027b2` (0.4.16 implementation + version metadata) by the release-metadata commit tagged `0.4.16`. API/worker mount the same operator-owned config directory at `/etc/drover:ro` and render `[oslo_policy]` file/directories; no policy YAML is generated or overwritten. Review old role-leaf-specific overrides before rollout.
 
 Package manifest recognizes exact005 checksum `c2353fa25dec5c210b826de5a2c8004b0580371db416f7ddfc3dd6fe61d1bd6a`.001–004 remain immutable. Canonical migration/startup/readiness refuse unknown/drifted ledgers, nonNULL requester_user_id in delegation/credential rows and nonempty cleanup references because this candidate does not include the unpublished executor/cleanup cutover. Preserve those rows; use their real implementation instead of coercion/deletion. Already-applied compatible005 requires no newDDL. Older sites use canonical migration bootstrap. Existing backup/encryption-key and whole-worker drain boundaries remain mandatory. This document is not a deployment receipt.
 

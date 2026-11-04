@@ -311,9 +311,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "42b5751bfc2ee458c933b3a671a9bff05b4630ab9abf9f7725edf1bf6b03f6d2",
-  "reviewed_at": "2026-11-04T03:34:35Z",
-  "summary": "standard-project-role 0.4.16 candidate: native core-role floors, negated-policy fail-closed, exact 005 recognition, Kolla oslo_policy mounts"
+  "source_sha256": "fa77c89a52e48ffe6cde2c52e76c173a53378f23f7988dc9c8c995fe6505eee9",
+  "reviewed_at": "2026-11-04T04:47:15Z",
+  "summary": "0.4.16 release metadata: Kolla source pin b25378e23e34; STAGING/release docs pin text"
 }
 ```
 <!-- architecture-review:end -->

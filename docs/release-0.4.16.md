@@ -36,7 +36,7 @@ ConfigMap/Secret bodies, logs, shell and kubeconfig issuance are not reader meta
 
 ## Publication workflow
 
-Canonical tag/image identity is **0.4.16**; workflow filters now accept numeric X.Y.Z and historical v-prefixed tags. Root package/import/lock and Kolla registry image defaults must agree. API/worker image publication waits for the reusable full suite; GitHub wheel Release remains a separate existing workflow without a tag-suite dependency, so parent must explicitly verify both exact-SHA workflow receipts before reporting release completion. No CI speedup is claimed. Build targets remain `docker/Dockerfile` drover-api and drover-worker. Source-build mode requires a full immutable source SHA: parent must pin the scoped implementation commit in a subsequent release-metadata commit before publishing; the existing0.4.15 pin is not acceptance for this candidate. Do not move an existing tag.
+Canonical tag/image identity is **0.4.16**; workflow filters now accept numeric X.Y.Z and historical v-prefixed tags. Root package/import/lock and Kolla registry image defaults must agree. API/worker image publication waits for the reusable full suite; GitHub wheel Release remains a separate existing workflow without a tag-suite dependency, so the tag is placed only on a commit whose exact-SHA suite already passed. No CI speedup is claimed. Build targets remain `docker/Dockerfile` drover-api and drover-worker. Source-build mode pins implementation commit `b25378e23e34109b183444b2ebdc6a0e836027b2` through the release-metadata commit that carries tag `0.4.16`. Do not move an existing tag.
 
 ## Local qualification
 
