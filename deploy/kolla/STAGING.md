@@ -39,7 +39,7 @@ Kolla registry metadata is v0.4.15; source-build mode asserts source `314c7a6ab7
 
 ## 0.4.17 quota and revocation-fence candidate
 
-Prepared 2026-11-04 Asia/Seoul (UTC+09:00); unpublished and undeployed. Registry defaults select numeric image tag `0.4.17`. Source mode requires the immutable implementation SHA carried by the separate release-metadata commit; a commit cannot contain its own SHA. Do not publish the implementation commit before the final source pin and exact-SHA suite are qualified.
+Prepared 2026-11-04 Asia/Seoul (UTC+09:00); unpublished and undeployed. Registry defaults select numeric image tag `0.4.17`. Source mode pins implementation/version commit `adea1ae71bfa9c80f76273054ce027313561cf14` through a separate release-metadata commit, because a commit cannot contain its own SHA. Only the final metadata commit may be tagged/published after exact-SHA qualification; its runtime Python code, dependencies, templates and migrations match the pinned implementation.
 
 Security-group/rule detail and generated-rule template reads use existing requester/worker authority. Verify native policy permits these reads; denied or malformed reads now fail503 instead of queuing a predictably failing create. Native quota enforcement still arbitrates later races. Existing project quotas are not raised. Preserve005 compatibility checks, encryption keys, effective config, unknown-outcome inventory and the complete worker-cohort drain boundary described below. API and worker must run matching new source.
 

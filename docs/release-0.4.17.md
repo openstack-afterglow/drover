@@ -28,7 +28,7 @@ Quota/template reads retain caller or verified worker authority. Native policy d
 
 Canonical tag/image version is numeric **0.4.17**. Existing workflow filters accept numeric X.Y.Z and historical v-prefixed tags; no trigger or publication gate is weakened. Root package/import/lock and Kolla registry defaults agree. API/worker publication waits for the reusable full suite. The wheel Release workflow retains its documented independent publication gap: place the numeric tag only after the **final exact commit SHA** passes the full remote suite. No push/tag/publication is authorized by this preparation.
 
-A commit cannot embed its own SHA. The implementation/version commit is followed by a release-metadata commit that pins Kolla source mode to the immutable implementation commit. The numeric release tag must identify the final metadata commit, and image/wheel builds must use that exact final source. Do not move existing tags. The final metadata records the concrete implementation SHA.
+A commit cannot embed its own SHA. Implementation/version commit `adea1ae71bfa9c80f76273054ce027313561cf14` is followed by a release-metadata commit that pins Kolla source mode to that immutable implementation. The numeric release tag must identify the final metadata commit, and image/wheel builds must use that exact final source. Do not move existing tags. The implementation and final metadata commits have identical runtime Python code, dependencies, templates and migration bytes; only the source pin, architecture marker and release evidence differ.
 
 ## Qualification and operational boundary
 

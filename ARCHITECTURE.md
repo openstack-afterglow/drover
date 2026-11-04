@@ -20,6 +20,11 @@ Candidate source starts at remote `dev` `ea0bc07`, separate from the extensive s
 
 `config.py` uses standard `[oslo_policy]` file/directories, replacing Drover-specific policy-file settings. Kolla mounts the operator config directory into API/worker `/etc/drover:ro` without writing policy. `delegation.py` continues native configured provider-role attenuation and rejects application-service roles as guest grants. No IAM mutation, executor runtime, worker/network rewrite or credential expansion is included. Existing001–004 remain immutable; the exact already-applied additive005 is recognized, with unsupported requester/cleanup data refused by canonical migration/startup/readiness. Final local evidence and release/deployment boundaries are in `docs/release-0.4.16.md`.
 
+### Quota admission and revocation-fence candidate 0.4.17
+
+The isolated 0.4.17 candidate starts at published0.4.16/current remote dev `bb153e5fbe30f0d602d4dfe86edbdff1e1fe5a51`. Kolla registry mode selects numeric0.4.17; source mode pins implementation/version commit `adea1ae71bfa9c80f76273054ce027313561cf14` from the separate final release-metadata commit. Runtime Python/dependencies/templates/migrations are identical across those two commits. Package/import/lock versions agree. Numeric-tag workflows remain unchanged; publication must follow the final exact-SHA remote suite because the wheel workflow has no independent suite wait. Native quota reads/marker semantics, terminal worker settlement and heartbeat generation fence are detailed below and in `docs/release-0.4.17.md`. No new schema/dependency, shared-WIP integration, publication or operational deployment is claimed.
+
+
 
 ## Development status
 
@@ -317,9 +322,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9b73fa42ce261e8496f43a4453b13f848cdfade844d15ae6fa39a9c9d3afcfab",
-  "reviewed_at": "2026-11-04T12:22:22Z",
-  "summary": "0.4.17 isolated native quota admission, keyed overlap and terminal settlement; heartbeat generation fence; preserve 0.4.16 GPU/Sentinel/authority and immutable schema; versioned release metadata and archived OpenSpec."
+  "source_sha256": "0dd39544c7566606f2353c5fa32d509e264500218da763705d259b48b813ca50",
+  "reviewed_at": "2026-11-04T12:23:15Z",
+  "summary": "0.4.17 final release metadata pins immutable implementation adea1ae71bfa9c80f76273054ce027313561cf14; runtime/dependencies/templates/migrations unchanged from implementation; numeric-tag exact-SHA publication and no-deployment boundaries documented."
 }
 ```
 <!-- architecture-review:end -->
