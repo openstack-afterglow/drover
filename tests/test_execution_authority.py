@@ -114,7 +114,7 @@ def test_selection_defends_against_invalid_runtime_configuration(monkeypatch, ro
 def current_principal(monkeypatch):
     enforcer = policy.get_enforcer(policy_file="")
     monkeypatch.setattr(policy, "get_enforcer", lambda **_: enforcer)
-    state = SimpleNamespace(enabled=(True, True), roles={"member": "member-id", "drover-clusters_editor": "editor-id"})
+    state = SimpleNamespace(enabled=(True, True), roles={"member": "member-id", "reader": "reader-id"})
     monkeypatch.setattr(auth, "current_principal_state", lambda *_: state.enabled)
     monkeypatch.setattr(auth, "current_project_role_map", lambda *_: state.roles)
     monkeypatch.setattr(auth, "_is_system_admin", lambda *_: False)
@@ -134,7 +134,7 @@ def test_principal_revalidation_revokes_stale_authority(current_principal, bound
     elif boundary == "lost_role":
         current_principal.roles.pop("member")
     else:
-        current_principal.roles.pop("drover-clusters_editor")
+        current_principal.roles = {"reader": "reader-id"}
     with pytest.raises(execution.AuthorityRevoked):
         delegation.revalidate_principal_sync("operator", "project", delegation.ACTION_SCALE, ["member-id"])
 
@@ -599,3 +599,11 @@ async def test_partial_rollout_records_staged_error_without_retiring_active_gene
     assert "staged" in query.params.values() and 2 in query.params.values()
 
 
+
+
+@pytest.mark.parametrize("role", ["drover_admin", "drover-clusters_editor", "lumen_editor", "waygate_admin"])
+def test_service_role_configuration_never_becomes_provider_delegation(monkeypatch, role):
+    monkeypatch.setattr(delegation, "get_settings", lambda: SimpleNamespace(
+        drover_delegated_required_roles=["member"], drover_delegated_optional_roles=[role]))
+    with pytest.raises(delegation.DelegationDenied):
+        delegation.select_delegated_roles({"member": "member-id", role: "service-id"})

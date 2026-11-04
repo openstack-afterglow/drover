@@ -6,6 +6,8 @@ import pytest
 from sqlalchemy.exc import InterfaceError, OperationalError
 
 from drover import db
+from drover.auth import get_token_info, require_token
+from drover.main import app
 from drover.services import store
 
 
@@ -44,7 +46,9 @@ async def test_cluster_inventory_failure_is_not_cached_as_empty(client):
 
 @pytest.mark.asyncio
 async def test_cluster_inventory_denied_before_native_cache(non_admin_client):
+    denied = {"user_id": "user-test-123", "project_id": "test-project-123", "roles": []}
     with (
+        patch.dict(app.dependency_overrides, {require_token: lambda: denied, get_token_info: lambda: denied}),
         patch("drover.api.clusters.cached_call", AsyncMock(return_value=[])) as cache,
         patch("drover.api.clusters.k3s_cluster.list_clusters", AsyncMock()) as listing,
     ):

@@ -198,10 +198,14 @@ async def test_native_credential_closure_is_transitive_and_cycle_safe(native_cre
     state.catalog.append({"id": "observer-id", "name": "observer"})
     state.edges.extend([
         {"prior_role": {"id": "reader-id"}, "implies": [{"id": "observer-id"}]},
-        {"prior_role": {"id": "observer-id"}, "implies": [{"id": "member-id"}]},
     ])
     state.returned_roles.append({"id": "observer-id", "name": "observer"})
     issued = await _issue(connection)
     assert issued[0].role_names == ["member", "observer", "reader"]
     assert issued[0].role_ids == ["member-id", "observer-id", "reader-id"]
     assert state.deleted == []
+    created = list(state.created)
+    state.edges.append({"prior_role": {"id": "observer-id"}, "implies": [{"id": "member-id"}]})
+    with pytest.raises(ValueError, match="Cyclic"):
+        await _issue(connection)
+    assert state.created == created

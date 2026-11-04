@@ -28,6 +28,10 @@ sentinel_enabled = {{ drover_sentinel_enabled | bool | lower }}
 sentinel_master_name = {{ drover_sentinel_master_name | tojson }}
 sentinel_hosts = {{ drover_sentinel_hosts | tojson }}
 
+[oslo_policy]
+policy_file = {{ drover_oslo_policy_file | tojson }}
+policy_dirs = {{ drover_oslo_policy_dirs | tojson }}
+
 [drover]
 callback_base_url = "{{ drover_callback_base_url }}"
 trusted_proxies = "{{ drover_trusted_proxies }}"

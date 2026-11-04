@@ -13,7 +13,7 @@ from drover.services.credentials import workload_namespace
 @pytest.fixture
 def native_principal(monkeypatch, mock_conn):
     principal = {"token": "current-token", "project_id": "test-project-123", "user_id": "test-user-123",
-                 "roles": ["member", "reader", "drover-inventory_reader", "drover-access_user", "drover-clusters_editor", "drover-workloads_editor"], "expires_at": "2099-01-01T00:00:00Z",
+                 "roles": ["member"], "expires_at": "2099-01-01T00:00:00Z",
                  "is_system_admin": False}
     monkeypatch.setattr("drover.auth.validate_token", lambda *_: dict(principal))
 
@@ -28,8 +28,9 @@ def native_principal(monkeypatch, mock_conn):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("roles", [["member"], ["reader"], ["member", "reader", "drover-access_user"],
-                                   ["member", "reader", "drover-inventory_reader"], ["drover-access_admin"]])
+@pytest.mark.parametrize("roles", [["reader"], ["reader", "drover-access_user"],
+                                   ["reader", "drover-inventory_reader"], ["drover_reader"],
+                                   ["drover_editor"], ["drover_user"], ["lumen_admin"], ["waygate_admin"], ["palimpsest_admin"]])
 @pytest.mark.parametrize(("method", "path", "body"), [
     ("PATCH", "/v1/clusters/c/scale", {"agent_count": 2}),
     ("DELETE", "/v1/clusters/c", None),
@@ -49,7 +50,8 @@ async def test_native_mutations_reject_unentitled_principal(native_principal, mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/v1/clusters/c", "/v1/clusters/c/delete-async", "/v1/clusters/c/rotate-certs"])
-async def test_editor_cannot_delete_or_rotate(native_principal, path):
+async def test_reader_cannot_delete_or_rotate(native_principal, path):
+    native_principal["roles"] = ["reader"]
     method = "DELETE" if path.endswith("/c") else "POST"
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://native") as client:
         response = await client.request(method, path, headers={"X-Auth-Token": "current-token"})
@@ -66,7 +68,13 @@ async def test_tenant_roles_never_get_system_api(native_principal, roles):
     assert response.status_code == 403
 
 
-def test_namespace_authorization_is_principal_bound(native_principal):
+def test_operator_narrowed_workload_authorization_remains_principal_bound(native_principal, monkeypatch, tmp_path):
+    from drover import policy
+    from drover.config import Settings
+
+    path = tmp_path / "policy.yaml"
+    path.write_text('"drover:access:admin": "!"\n')
+    monkeypatch.setattr(policy, "get_settings", lambda: Settings(oslo_policy_policy_file=str(path)))
     from fastapi import HTTPException
 
     own = workload_namespace(native_principal["project_id"], native_principal["user_id"])
@@ -78,7 +86,17 @@ def test_namespace_authorization_is_principal_bound(native_principal):
 
 
 @pytest.mark.asyncio
-async def test_editor_cannot_install_host_ssh_key(native_principal, monkeypatch):
+@pytest.mark.parametrize("override", [False, True])
+async def test_reader_or_operator_narrowed_member_cannot_install_host_ssh_key(native_principal, monkeypatch, tmp_path, override):
+    if not override:
+        native_principal["roles"] = ["reader"]
+    if override:
+        from drover import policy
+        from drover.config import Settings
+
+        path = tmp_path / "policy.yaml"
+        path.write_text('"drover:clusters:create": "@"\n"drover:access:admin": "!"\n')
+        monkeypatch.setattr(policy, "get_settings", lambda: Settings(oslo_policy_policy_file=str(path)))
     lookup = AsyncMock(side_effect=AssertionError("Host-key request reached provisioning"))
     monkeypatch.setattr("drover.services.store.get_cluster", lookup)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://native") as client:
@@ -89,8 +107,9 @@ async def test_editor_cannot_install_host_ssh_key(native_principal, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_editor_cannot_delete_nodegroup(native_principal, monkeypatch):
-    mutation = AsyncMock(side_effect=AssertionError("Editor reached nodegroup deletion"))
+async def test_reader_cannot_delete_nodegroup(native_principal, monkeypatch):
+    native_principal["roles"] = ["reader"]
+    mutation = AsyncMock(side_effect=AssertionError("Reader reached nodegroup deletion"))
     monkeypatch.setattr("drover.services.nodegroup.enqueue_nodegroup_delete", mutation)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://native") as client:
         response = await client.delete("/v1/clusters/c/nodegroups/g", headers={"X-Auth-Token": "current-token"})
@@ -99,7 +118,13 @@ async def test_editor_cannot_delete_nodegroup(native_principal, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_editor_namespace_picker_gets_prepared_private_namespace(native_principal, monkeypatch):
+async def test_operator_narrowed_member_namespace_picker_gets_prepared_private_namespace(native_principal, monkeypatch, tmp_path):
+    from drover import policy
+    from drover.config import Settings
+
+    path = tmp_path / "policy.yaml"
+    path.write_text('"drover:access:admin": "!"\n')
+    monkeypatch.setattr(policy, "get_settings", lambda: Settings(oslo_policy_policy_file=str(path)))
     namespace = workload_namespace(native_principal["project_id"], native_principal["user_id"])
     monkeypatch.setattr("drover.services.store.get_cluster", AsyncMock(return_value={"id": "c", "project_id": native_principal["project_id"]}))
     prepare = AsyncMock(return_value=namespace)
@@ -109,3 +134,38 @@ async def test_editor_namespace_picker_gets_prepared_private_namespace(native_pr
     assert response.status_code == 200
     assert response.json() == [namespace]
     prepare.assert_awaited_once_with("c", native_principal)
+
+
+@pytest.mark.asyncio
+async def test_allow_all_system_action_rule_does_not_elevate_tenant_admin(native_principal, monkeypatch, tmp_path):
+    from drover import policy
+    from drover.config import Settings
+
+    path = tmp_path / "policy.yaml"
+    path.write_text('"drover:admin": "@"\n')
+    monkeypatch.setattr(policy, "get_settings", lambda: Settings(oslo_policy_policy_file=str(path)))
+    native_principal["roles"] = ["admin", "drover_admin"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://native") as client:
+        response = await client.get("/v1/admin/clusters", headers={"X-Auth-Token": "current-token"})
+        assert response.status_code == 403
+        document = (await client.get("/v1/policy/capabilities", headers={"X-Auth-Token": "current-token"})).json()
+        assert "drover:admin" not in document["actions"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("roles", [["member"], ["manager"], ["admin"]])
+@pytest.mark.parametrize(("method", "path", "body"), [
+    ("PATCH", "/v1/clusters/c/scale", {"agent_count": 2}),
+    ("DELETE", "/v1/clusters/c", None),
+    ("POST", "/v1/clusters/c/delete-async", None),
+    ("POST", "/v1/clusters/c/rotate-certs", None),
+    ("PATCH", "/v1/clusters/c/namespaces/default/deployments/app/scale", {"replicas": 2}),
+])
+async def test_core_member_mutations_pass_policy_before_owned_resource_lookup(native_principal, monkeypatch, roles, method, path, body):
+    native_principal["roles"] = roles
+    lookup = AsyncMock(return_value=None)
+    monkeypatch.setattr("drover.services.store.get_cluster", lookup)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://native") as client:
+        response = await client.request(method, path, json=body, headers={"X-Auth-Token": "current-token"})
+    assert response.status_code == 404
+    lookup.assert_awaited()

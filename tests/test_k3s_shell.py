@@ -20,10 +20,7 @@ from drover.services.credentials import workload_namespace
 def _token(roles=None, **changes):
     return {
         "token": "current-token", "user_id": "user-1", "project_id": "test-project-123",
-        "roles": roles if roles is not None else [
-            "member", "reader", "drover-inventory_reader", "drover-access_user",
-            "drover-clusters_editor", "drover-workloads_editor",
-        ],
+        "roles": roles if roles is not None else ["member"],
         "is_system_admin": False, "expires_at": "2099-01-01T00:00:00Z",
     } | changes
 
@@ -48,17 +45,32 @@ async def test_create_shell_ticket_unauthenticated():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("roles", [
-    ["member"], ["reader"], ["member", "reader", "drover-inventory_reader"],
-    ["reader", "drover-workloads_editor"],
-    ["member", "reader", "drover-inventory_reader", "drover-access_user"],
+    ["reader"], ["reader", "drover-inventory_reader"], ["reader", "lumen_editor"],
+    ["drover_user"], ["drover_editor"], ["drover_admin"], ["drover-workloads_editor"],
+    ["drover-access_admin"],
 ])
-async def test_reader_and_user_cannot_create_shell_ticket(client, roles):
+async def test_reader_and_legacy_roles_cannot_create_shell_ticket(client, roles):
     app.dependency_overrides[get_token_info] = lambda: _token(roles)
     app.dependency_overrides[require_token] = lambda: _token(roles)
     with patch.object(shell.k3s_cluster, "get_cluster", new_callable=AsyncMock) as lookup:
         response = await client.post("/v1/clusters/k3s-1/shell-ticket")
     assert response.status_code == 403
     lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reduced_member_cannot_create_shell_ticket(client):
+    token = _token(["member"], credential_restricted=True)
+    app.dependency_overrides[get_token_info] = lambda: token
+    app.dependency_overrides[require_token] = lambda: token
+    with (
+        patch.object(shell.k3s_cluster, "get_cluster", new_callable=AsyncMock) as lookup,
+        patch.object(shell, "_get_redis", new_callable=AsyncMock) as redis,
+    ):
+        response = await client.post("/v1/clusters/k3s-1/shell-ticket")
+    assert response.status_code == 403
+    lookup.assert_not_awaited()
+    redis.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -70,7 +82,10 @@ async def test_create_shell_ticket_checks_cluster(shell_client, record, status):
 
 
 @pytest.mark.asyncio
-async def test_create_shell_ticket_success(shell_client):
+@pytest.mark.parametrize("roles", [["member"], ["manager"], ["admin"]])
+async def test_create_shell_ticket_success(shell_client, roles):
+    app.dependency_overrides[get_token_info] = lambda: _token(roles)
+    app.dependency_overrides[require_token] = lambda: _token(roles)
     redis = AsyncMock()
     with (
         patch.object(shell.k3s_cluster, "get_cluster", AsyncMock(return_value=_cluster())),
@@ -106,7 +121,8 @@ async def test_shell_ticket_consumed_and_cluster_bound(raw):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("current", [
-    _token(["member", "reader", "drover-inventory_reader", "drover-access_user"]), _token(["reader"]),
+    _token(["drover-workloads_editor"]), _token(["reader"]),
+    _token(["member"], credential_restricted=True),
     _token(user_id="other-user"), _token(project_id="other-project"), None,
 ])
 async def test_shell_revalidates_token_and_denies_changed_authority(current):
@@ -146,10 +162,13 @@ async def _ws_params(*args, **kwargs):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("violation", [None, "another-user", "system-namespace"])
-async def test_exec_is_bound_to_current_principal_and_workload_namespace(violation):
+@pytest.mark.parametrize("principal", [
+    _token(["member"]), _token(["manager"]), _token(["admin"]), _token([], is_system_admin=True),
+])
+async def test_exec_is_bound_to_current_principal_and_workload_namespace(violation, principal):
     ws, redis = AsyncMock(), AsyncMock()
     redis.getdel.return_value = _ticket()
-    token = _token()
+    token = principal
     expiry = time.time() + 1000
     annotations = {
         "drover.io/user-id": "another-user" if violation == "another-user" else "user-1",

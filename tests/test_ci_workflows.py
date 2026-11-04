@@ -152,7 +152,7 @@ def test_suite_runs_once_per_event_and_gates_publication():
         f"unexpected docker-build.yml push filters: {sorted(docker_triggers['push'])}"
     )
     assert docker_triggers["push"]["branches"] == ["main", "dev"]
-    assert docker_triggers["push"]["tags"] == ["v*"]
+    assert docker_triggers["push"]["tags"] == ["[0-9]*.[0-9]*.[0-9]*", "v*"]
 
     jobs = docker["jobs"]
     assert jobs["test"]["uses"] == "./.github/workflows/ci.yml"
@@ -406,11 +406,11 @@ def test_release_workflow_structure():
     workflow_source = release_file.read_text(encoding="utf-8")
     release_data = yaml.safe_load(workflow_source)
 
-    # Must trigger on v* tags only
+    # Numeric releases are canonical; historical v-prefixed tags remain supported.
     triggers = release_data.get("on", release_data.get(True, {}))
     assert "push" in triggers, "release workflow must trigger on push"
     push_tags = triggers["push"].get("tags", [])
-    assert any("v*" in tag or "v" in tag for tag in push_tags), "release workflow must trigger on v* tags"
+    assert push_tags == ["[0-9]*.[0-9]*.[0-9]*", "v*"]
     assert "pull_request" not in triggers, "release workflow must not trigger on pull_request"
 
     # Must enforce least privilege permissions
@@ -433,6 +433,12 @@ def test_release_workflow_structure():
         (s for s in steps if "lockstep" in s.get("name", "").lower() or "lockstep" in s.get("run", "").lower()), None
     )
     assert lockstep_step is not None, "Missing tag and version lockstep check step"
+    assert 'TAG_VERSION="${GITHUB_REF_NAME#v}"' in lockstep_step["run"]
+    docker = yaml.safe_load((WORKFLOWS_DIR / "docker-build.yml").read_text())
+    metadata = [step for step in docker["jobs"]["build-and-push"]["steps"]
+                if "docker/metadata-action@" in step.get("uses", "")]
+    assert len(metadata) == 2
+    assert all("type=ref,event=tag" in step["with"]["tags"] for step in metadata)
 
     build_step = next((s for s in steps if s.get("name") == "Build root wheel"), None)
     assert build_step is not None, "Missing root wheel build step"

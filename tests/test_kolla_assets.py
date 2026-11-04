@@ -128,13 +128,14 @@ def test_action_dispatch_and_ordering():
     start_idx = included.index("start.yml")
     assert bootstrap_idx < start_idx, "bootstrap_service.yml must precede start.yml"
 
-    # Check upgrade.yml ordering
+    # Check upgrade.yml ordering: config must render before bootstrap/start so a
+    # direct upgrade binds the current policy file/dirs (upgrade omits precheck).
     upgrade_file = ROLE_DIR / "tasks" / "upgrade.yml"
     upgrade_tasks = yaml.safe_load(upgrade_file.read_text(encoding="utf-8"))
     upgrade_included = [
         t["ansible.builtin.include_tasks"] for t in upgrade_tasks if "ansible.builtin.include_tasks" in t
     ]
-    assert upgrade_included == ["pull.yml", "bootstrap_service.yml", "start.yml"]
+    assert upgrade_included == ["pull.yml", "config.yml", "bootstrap_service.yml", "start.yml"]
 
     # Check destroy.yml task
     destroy_file = ROLE_DIR / "tasks" / "destroy.yml"

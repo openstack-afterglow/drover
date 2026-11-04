@@ -1,0 +1,23 @@
+# Drover operator policy. Generate with oslopolicy-sample-generator --namespace drover.
+# API and worker load /etc/drover/policy.yaml plus configured policy_dirs.
+# Overrides may narrow standard core authority, never uplift reader/legacy-only roles.
+# Project, genuine system-admin, and original reduced-credential ceilings remain hard.
+# Capability labels are internal API names, not assignable Keystone service roles.
+# String expressions only: quoted empty string or '@' allows; '!' denies.
+"context_is_admin": "is_system_admin:True"
+"owner": "project_id:%(project_id)s"
+"drover:clusters:list": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member or role:reader))"
+"drover:clusters:get": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member or role:reader))"
+"drover:operations:get": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member or role:reader))"
+"drover:clusters:create": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
+"drover:clusters:scale": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
+"drover:clusters:delete": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
+"drover:clusters:reauthorize": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
+"drover:clusters:retire_credentials": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
+"drover:access:get": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
+"drover:access:read": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
+"drover:access:admin": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
+"drover:workloads:write": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
+"drover:certificates:rotate": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
+"drover:templates:manage": "rule:context_is_admin"
+"drover:admin": "rule:context_is_admin"

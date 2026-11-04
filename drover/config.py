@@ -79,6 +79,7 @@ def _load_toml() -> dict:
     database = data.get("database", {})
     cache = data.get("cache", {})
     drover = data.get("drover", {})
+    oslo_policy = data.get("oslo_policy", {})
     sentinel_hosts = cache.get("sentinel_hosts") or ""
     if isinstance(sentinel_hosts, list):
         sentinel_hosts = ",".join(str(host) for host in sentinel_hosts)
@@ -181,7 +182,8 @@ def _load_toml() -> dict:
         "drover_callback_allowed_cidrs": drover.get(
             "callback_allowed_cidrs", drover.get("drover_callback_allowed_cidrs", [])
         ),
-        "drover_policy_file": drover.get("policy_file", drover.get("drover_policy_file", "/etc/drover/policy.yaml")),
+        "oslo_policy_policy_file": oslo_policy.get("policy_file", "/etc/drover/policy.yaml"),
+        "oslo_policy_policy_dirs": oslo_policy.get("policy_dirs", []),
         "trusted_proxies": drover.get("trusted_proxies", "127.0.0.1/32,::1/128"),
         "drover_afterglow_admission_url": drover.get(
             "afterglow_admission_url", drover.get("drover_afterglow_admission_url", "")
@@ -238,7 +240,8 @@ class Settings(BaseSettings):
     cache_ttl_auth_token: int = 60
 
     drover_callback_base_url: str = ""
-    drover_policy_file: str = "/etc/drover/policy.yaml"
+    oslo_policy_policy_file: str = "/etc/drover/policy.yaml"
+    oslo_policy_policy_dirs: list[str] = []
     drover_kubeconfig_encryption_key: str = ""
     drover_kubeconfig_encryption_key_file: str = ""
     drover_boot_volume_size_gb: int = 30
@@ -305,8 +308,10 @@ class Settings(BaseSettings):
         else:
             raise ValueError("delegated roles must be a list or comma-separated string")
         roles = [item for item in items if item]
-        if any(role.lower() in {"admin", "manager"} for role in roles):
-            raise ValueError("delegated roles must not include admin or manager")
+        if any(role.lower() in {"admin", "manager"} or role.lower().startswith(
+            ("drover_", "drover-", "lumen_", "lumen-", "waygate_", "waygate-", "palimpsest_", "palimpsest-", "afterglow_", "afterglow-")
+        ) for role in roles):
+            raise ValueError("delegated roles must not include admin or manager or application service roles")
         return list(dict.fromkeys(roles))
 
     @model_validator(mode="after")

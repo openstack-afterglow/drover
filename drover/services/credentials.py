@@ -21,7 +21,7 @@ import httpx
 import yaml
 from fastapi import HTTPException
 
-from drover.policy import authorize, build_credentials
+from drover.policy import authorize
 from drover.services import kube, store
 from drover.services.errors import K3sApiError
 
@@ -185,11 +185,7 @@ async def issue_kubeconfig(cluster_id: str, token_info: dict, *, grade: str) -> 
     principal = _principal(project_id, user_id)
     if grade not in ("user", "editor"):
         raise HTTPException(403, "Only restricted credential grades can be issued")
-    credentials = build_credentials(token_info)
-    required_role = "drover-workloads_editor" if grade == "editor" else "drover-access_user"
-    if not credentials["is_system_admin"] and not ({required_role, "drover-access_admin"} & set(credentials["roles"])):
-        raise HTTPException(403, "Credential grade access denied")
-    authorize("drover:workloads:write" if grade == "editor" else "drover:access:get", {"project_id": project_id}, token_info)
+    authorize("drover:workloads:write" if grade == "editor" else "drover:access:read", {"project_id": project_id}, token_info)
     keystone_expiry = _expiry(token_info.get("expires_at"))
     deadline = min(keystone_expiry, datetime.now(UTC) + timedelta(seconds=TOKEN_TTL_SECONDS))
     if math.floor((deadline - datetime.now(UTC)).total_seconds()) < 600:

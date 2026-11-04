@@ -103,8 +103,10 @@ def select_delegated_roles(role_map: dict[str, str]) -> tuple[list[str], list[st
     settings = get_settings()
     required = list(settings.drover_delegated_required_roles)
     optional = list(settings.drover_delegated_optional_roles)
-    if any(role.lower() in _FORBIDDEN_ROLES for role in [*required, *optional]):
-        raise DelegationDenied("Drover never delegates admin or manager roles")
+    if any(role.lower() in _FORBIDDEN_ROLES or role.lower().startswith(
+        ("drover_", "drover-", "lumen_", "lumen-", "waygate_", "waygate-", "palimpsest_", "palimpsest-", "afterglow_", "afterglow-")
+    ) for role in [*required, *optional]):
+        raise DelegationDenied("Drover never delegates admin, manager or application service roles")
     missing = [role for role in required if role not in role_map]
     if missing:
         raise DelegationDenied("The requester lacks a project role required for delegated execution")

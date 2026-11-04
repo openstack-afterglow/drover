@@ -23,7 +23,7 @@ TRUSTOR = "operator-id"
 TRUSTEE = "drover-service-id"
 PROJECT = "tenant-project"
 SERVICE_PASSWORD = "service-secret"
-ROLES = {"member-id": "member", "editor-id": "drover-clusters_editor", "reader-id": "reader"}
+ROLES = {"member-id": "member", "reader-id": "reader"}
 
 
 class _Keystone:
@@ -129,8 +129,13 @@ def keystone(monkeypatch):
     monkeypatch.setattr(auth, "_is_system_admin", lambda user: False)
     monkeypatch.setattr(
         auth, "current_project_role_map",
-        lambda user, project: {"member": "member-id", "drover-clusters_editor": "editor-id"},
+        lambda user, project: {"member": "member-id"},
     )
+    monkeypatch.setattr(auth, "current_project_authority", lambda user, project: {
+        "enabled": auth.current_principal_state(user, project),
+        "role_map": auth.current_project_role_map(user, project),
+        "is_system_admin": auth._is_system_admin(user),
+    })
     yield state
     server.shutdown()
 
@@ -173,9 +178,9 @@ def test_native_trust_revoked_role_is_terminal(keystone, monkeypatch):
         delegation._connect_sync(_snapshot(admitted))
     assert delegation._delete_trust_with_trust_token_sync(admitted.trust_id, TRUSTEE) == "inert"
 
-    monkeypatch.setattr(auth, "current_project_role_map", lambda user, project: {"member": "member-id"})
+    monkeypatch.setattr(auth, "current_project_role_map", lambda user, project: {"reader": "reader-id"})
     keystone.revoked = False
-    with pytest.raises(execution.AuthorityRevoked, match="capability"):
+    with pytest.raises(execution.AuthorityRevoked, match="delegated role"):
         delegation._connect_sync(_snapshot(admitted))
 
 

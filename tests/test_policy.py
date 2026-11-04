@@ -1,10 +1,10 @@
 """Tests for oslo.policy enforcement, action matrix, overrides, and router checks."""
 
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from drover.main import app
@@ -12,6 +12,7 @@ from drover.models.orm import DroverOperation, DroverOperationEvent
 from drover.policy import (
     authorize,
     build_credentials,
+    capabilities,
     reset_enforcer,
 )
 
@@ -48,30 +49,37 @@ def test_build_credentials():
     assert admin_creds["is_system_admin"] is True
 
 
-@pytest.mark.parametrize("role", ["member", "reader", "project_member", "project_admin", "project_owner", "admin", "manager"])
-def test_plain_project_roles_have_no_service_entitlement(role):
+@pytest.mark.parametrize("role", ["project_member", "project_admin", "project_owner", "project_manager"])
+def test_project_alias_names_without_native_graph_have_no_service_entitlement(role):
     token = {"user_id": "u", "project_id": "p", "roles": [role], "is_system_admin": False}
     assert not build_credentials(token)["is_system_admin"]
-    for action in ("get", "create", "scale", "delete"):
+    for action in ("list", "get", "create", "scale", "delete"):
         assert not authorize(f"drover:clusters:{action}", {"project_id": "p"}, token, do_raise=False)
     assert not authorize("drover:admin", None, token, do_raise=False)
 
 
 @pytest.mark.parametrize(("role", "allowed"), [
+    ("reader", {"list", "get"}),
+    ("member", {"list", "get", "access", "create", "scale", "delete", "full", "workloads", "rotate"}),
+    ("manager", {"list", "get", "access", "create", "scale", "delete", "full", "workloads", "rotate"}),
+    ("admin", {"list", "get", "access", "create", "scale", "delete", "full", "workloads", "rotate"}),
     ("drover_reader", set()),
     ("drover_user", set()),
     ("drover_editor", set()),
     ("drover_admin", set()),
-    ("drover-inventory_reader", {"get"}),
-    ("drover-access_user", {"access"}),
-    ("drover-clusters_editor", {"create", "scale"}),
-    ("drover-workloads_editor", {"access", "workloads"}),
-    ("drover-access_admin", {"access", "full", "workloads"}),
-    ("drover-clusters_admin", {"delete", "rotate"}),
+    ("drover-inventory_reader", set()),
+    ("drover-access_user", set()),
+    ("drover-clusters_editor", set()),
+    ("drover-workloads_editor", set()),
+    ("drover-access_admin", set()),
+    ("drover-clusters_admin", set()),
+    ("lumen_admin", set()),
+    ("waygate_admin", set()),
+    ("palimpsest_admin", set()),
 ])
-def test_service_grade_and_leaf_matrix(role, allowed):
-    token = {"user_id": "u", "project_id": "p", "roles": ["reader", "member", role]}
-    actions = {**{a: f"drover:clusters:{a}" for a in ("get", "create", "scale", "delete")},
+def test_standard_project_role_and_legacy_role_matrix(role, allowed):
+    token = {"user_id": "u", "project_id": "p", "roles": [role]}
+    actions = {**{a: f"drover:clusters:{a}" for a in ("list", "get", "create", "scale", "delete")},
                "access": "drover:access:get", "full": "drover:access:admin",
                "workloads": "drover:workloads:write", "rotate": "drover:certificates:rotate"}
     for action, rule in actions.items():
@@ -81,61 +89,156 @@ def test_service_grade_and_leaf_matrix(role, allowed):
         assert not authorize(rule, None, token, do_raise=False)
 
 
-def test_service_roles_require_baseline_and_reject_raw_admin():
-    for roles in (["drover-access_user"], ["reader", "drover-access_user"], ["member", "reader", "admin", "drover-access_admin"], ["member", "manager", "drover-workloads_editor"]):
+def test_project_management_roles_do_not_become_system_authority():
+    for roles in (["member"], ["manager"], ["admin"], ["member", "drover-access_admin"]):
         token = {"project_id": "p", "roles": roles}
-        assert not authorize("drover:access:get", None, token, do_raise=False)
+        assert authorize("drover:access:get", None, token)
+        assert not authorize("drover:admin", None, token, do_raise=False)
     verified = {"project_id": "p", "roles": ["admin"], "is_system_admin": True}
     assert authorize("drover:admin", None, verified)
 
 
-def test_policy_file_override():
-    member_info = {
-        "user_id": "usr-1",
-        "project_id": "proj-1",
-        "roles": ["template_manager"],
-        "is_system_admin": False,
+@pytest.mark.parametrize("roles", [[], ["reader"], ["drover_admin"]])
+def test_personal_provenance_cannot_bypass_standard_project_roles(roles):
+    token = {"user_id": "u", "project_id": "p", "roles": roles,
+             "personal_project_owner": True}
+    for action in ("drover:clusters:delete", "drover:access:admin", "drover:workloads:write"):
+        assert not authorize(action, {"project_id": "p"}, token, do_raise=False)
+    assert "personal_project_owner" not in build_credentials(token)
+
+
+def test_project_admin_policy_override_is_not_system_authority(tmp_path):
+    path = tmp_path / "policy.yaml"
+    path.write_text('"drover:clusters:create": "role:admin"\n'
+                    '"drover:templates:manage": "@"\n"drover:admin": "@"\n')
+    token = {"user_id": "u", "project_id": "p", "roles": ["admin"]}
+    assert authorize("drover:clusters:create", None, token)
+    assert authorize("drover:clusters:create", None, token, policy_file=str(path))
+    assert not authorize("drover:clusters:create", {"project_id": "other"}, token,
+                         do_raise=False, policy_file=str(path))
+    for action in ("drover:templates:manage", "drover:admin"):
+        assert not authorize(action, None, token, do_raise=False, policy_file=str(path))
+
+
+def test_unknown_action_denied_even_with_policy_override(tmp_path):
+    path = tmp_path / "policy.yaml"
+    path.write_text('"drover:unregistered": "@"\n')
+    assert not authorize("drover:unregistered", None, {"project_id": "p", "is_system_admin": True},
+                         do_raise=False, policy_file=str(path))
+
+
+def test_packaged_sample_matches_registered_defaults():
+    import yaml
+
+    from drover.policy import list_rules
+
+    sample = Path(__file__).parents[1] / "drover" / "policy.yaml.sample"
+    assert yaml.safe_load(sample.read_text()) == {rule.name: rule.check_str for rule in list_rules()}
+
+
+def test_reduced_credentials_advertise_metadata_only():
+    document = capabilities({"project_id": "p", "roles": ["member"], "credential_restricted": True})
+    assert set(document["actions"]) == {
+        "drover:clusters:list", "drover:clusters:get", "drover:operations:get",
     }
-    plain_member = {
-        "user_id": "usr-2",
-        "project_id": "proj-1",
-        "roles": ["member"],
-        "is_system_admin": False,
-    }
 
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-        f.write('"drover:templates:manage": "role:template_manager or is_system_admin:True"\n')
-        override_file = f.name
 
-    try:
-        # Default policy denies member managing templates
-        assert authorize("drover:templates:manage", None, member_info, do_raise=False) is False
+@pytest.mark.parametrize("restricted", [False, True])
+def test_allow_all_cannot_cross_project_or_credential_ceiling(tmp_path, restricted):
+    from drover.policy import list_rules
 
-        # Override policy allows member with template_manager role
-        assert (
-            authorize(
-                "drover:templates:manage",
-                None,
-                member_info,
-                do_raise=False,
-                policy_file=override_file,
-            )
-            is True
-        )
+    path = tmp_path / "policy.yaml"
+    path.write_text("".join(f'"{rule.name}": "@"\n' for rule in list_rules()))
+    token = {"user_id": "u", "project_id": "p", "roles": ["member"], "credential_restricted": restricted}
+    for action in ("drover:clusters:list", "drover:clusters:get", "drover:operations:get"):
+        assert authorize(action, None, token, policy_file=str(path))
+        assert not authorize(action, {"project_id": "other"}, token, do_raise=False, policy_file=str(path))
+    for action in ("drover:access:get", "drover:access:read", "drover:access:admin",
+                   "drover:workloads:write", "drover:certificates:rotate",
+                   "drover:clusters:create", "drover:clusters:scale", "drover:clusters:delete",
+                   "drover:clusters:reauthorize", "drover:clusters:retire_credentials"):
+        assert authorize(action, None, token, do_raise=False, policy_file=str(path)) is not restricted
+        assert not authorize(action, {"project_id": "other"}, token, do_raise=False, policy_file=str(path))
+    for action in ("drover:admin", "drover:templates:manage"):
+        assert not authorize(action, None, token, do_raise=False, policy_file=str(path))
 
-        # Override policy denies plain member without template_manager role
-        assert (
-            authorize(
-                "drover:templates:manage",
-                None,
-                plain_member,
-                do_raise=False,
-                policy_file=override_file,
-            )
-            is False
-        )
-    finally:
-        Path(override_file).unlink(missing_ok=True)
+
+@pytest.mark.parametrize("roles", [
+    [], ["reader"], ["drover_admin"], ["drover-access_admin"], ["deployment_operator"],
+])
+def test_allow_all_cannot_bypass_native_core_role_floor(tmp_path, roles):
+    from drover.policy import list_rules
+
+    path = tmp_path / "policy.yaml"
+    path.write_text("".join(f'"{rule.name}": "@"\n' for rule in list_rules()))
+    token = {"user_id": "u", "project_id": "p", "roles": roles,
+             "personal_project_owner": True}
+    metadata = {"drover:clusters:list", "drover:clusters:get", "drover:operations:get"}
+    for rule in list_rules():
+        if not rule.name.startswith("drover:"):
+            continue
+        assert authorize(rule.name, {"project_id": "p"}, token, do_raise=False,
+                         policy_file=str(path)) is (roles == ["reader"] and rule.name in metadata)
+
+
+@pytest.mark.asyncio
+async def test_policy_reload_changes_native_api_and_capabilities(tmp_path, monkeypatch):
+    import os
+    from unittest.mock import AsyncMock
+
+    from drover import policy
+    from drover.config import Settings
+
+    path = tmp_path / "policy.yaml"
+    path.write_text('"drover:clusters:list": "!"\n')
+    monkeypatch.setattr(policy, "get_settings", lambda: Settings(oslo_policy_policy_file=str(path)))
+    token = {"user_id": "u", "project_id": "p", "roles": ["reader"]}
+    monkeypatch.setattr("drover.auth.validate_token", lambda *_: token)
+    monkeypatch.setattr("drover.api.clusters.k3s_cluster.list_clusters", AsyncMock(return_value=[]))
+    monkeypatch.setattr("drover.api.clusters.is_db_configured", lambda: False)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                           headers={"X-Auth-Token": "test-token"}) as client:
+        assert (await client.get("/v1/clusters?no_cache=true")).status_code == 403
+        before = (await client.get("/v1/policy/capabilities")).json()
+        assert "drover:clusters:list" not in before["actions"]
+        assert "drover:clusters:get" in before["actions"]
+        path.write_text('"drover:clusters:list": "role:reader"\n')
+        os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 2))
+        assert (await client.get("/v1/clusters?no_cache=true")).status_code == 200
+        after = (await client.get("/v1/policy/capabilities")).json()
+        assert after["service"] == "drover"
+        assert "drover:clusters:list" in after["actions"]
+        assert after["actions"] == sorted(after["actions"])
+        assert after["capabilities"] == sorted(after["capabilities"])
+        path.write_text('"drover:clusters:list": "!"\n')
+        os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 4))
+        assert (await client.get("/v1/clusters?no_cache=true")).status_code == 403
+        assert "drover:clusters:list" not in (await client.get("/v1/policy/capabilities")).json()["actions"]
+
+
+@pytest.mark.asyncio
+async def test_capability_discovery_requires_auth_not_project_entitlement(monkeypatch):
+    token = {"user_id": "u", "project_id": "p", "roles": []}
+    monkeypatch.setattr("drover.auth.validate_token", lambda *_: token)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.get("/v1/policy/capabilities")).status_code == 401
+        response = await client.get("/v1/policy/capabilities", headers={"X-Auth-Token": "test-token"})
+        assert response.status_code == 200
+        assert response.json() == {"service": "drover", "capabilities": [], "actions": []}
+
+
+@pytest.mark.parametrize("bad", ['[invalid yaml', '[]', '"drover:clusters:create": null\n',
+                                  '"drover:clusters:create": false\n', '"drover:clusters:create": []\n',
+                                  '"drover:clusters:create": "rule:missing"\n',
+                                  '"drover:clusters:create": "rule:loop"\n"loop": "rule:loop"\n'])
+def test_bad_policy_update_never_falls_back_to_defaults(tmp_path, bad):
+    path = tmp_path / "policy.yaml"
+    path.write_text(bad)
+    for _ in range(2):
+        with pytest.raises(HTTPException) as error:
+            authorize("drover:clusters:create", None, {"project_id": "p", "roles": ["member"]},
+                      policy_file=str(path))
+        assert error.value.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -170,9 +273,9 @@ async def test_operation_access_security(monkeypatch):
 
     def mock_validate(token, project_id=""):
         if token == "tok-owner":
-            return {"user_id": "u1", "project_id": "proj-owner", "roles": ["reader", "drover-inventory_reader"], "is_system_admin": False}
+            return {"user_id": "u1", "project_id": "proj-owner", "roles": ["reader"], "is_system_admin": False}
         if token == "tok-other":
-            return {"user_id": "u2", "project_id": "proj-other", "roles": ["reader", "drover-inventory_reader"], "is_system_admin": False}
+            return {"user_id": "u2", "project_id": "proj-other", "roles": ["reader"], "is_system_admin": False}
         if token == "tok-admin":
             return {"user_id": "admin", "project_id": "proj-admin", "roles": ["admin"], "is_system_admin": True}
         raise Exception("Invalid token")
@@ -227,3 +330,152 @@ def test_no_remaining_direct_router_admin_checks():
         assert "require_policy" in names or "_policy_dependency" in names or any("policy" in str(d) for d in dep_funcs), (
             f"Route {route.path} lacks policy dependency: {names}"
         )
+
+
+@pytest.mark.parametrize("action", ["get", "create", "scale", "delete", "reauthorize"])
+def test_verified_system_admin_needs_no_project_service_leaves(action):
+    token = {"user_id": "operator", "project_id": "target", "connection_project_id": "home",
+             "roles": [], "is_system_admin": True}
+    assert authorize(f"drover:clusters:{action}", {"project_id": "target"}, token)
+    assert build_credentials(token)["project_id"] == "home"
+    token["is_system_admin"] = False
+    assert not authorize(f"drover:clusters:{action}", {"project_id": "target"}, token, do_raise=False)
+
+
+def test_logical_target_cannot_relabel_native_project_roles():
+    token = {"user_id": "member", "project_id": "target", "connection_project_id": "home",
+             "roles": ["member"], "is_system_admin": False}
+    assert not authorize("drover:clusters:create", {"project_id": "target"}, token, do_raise=False)
+
+
+def test_policy_directory_override_is_used_by_actions_and_projection(tmp_path, monkeypatch):
+    import os
+
+    from drover import policy
+    from drover.config import Settings
+
+    path = tmp_path / "policy.yaml"
+    path.write_text("{}\n")
+    directory = tmp_path / "policy.d"
+    directory.mkdir()
+    override = directory / "10-local.yaml"
+    override.write_text('"drover:clusters:create": "role:deployment_operator"\n')
+    monkeypatch.setattr(policy, "get_settings", lambda: Settings(
+        oslo_policy_policy_file=str(path), oslo_policy_policy_dirs=[str(directory)]))
+    token = {"project_id": "p", "roles": ["member", "deployment_operator"]}
+    assert authorize("drover:clusters:create", None, token)
+    assert "drover:clusters:create" in capabilities(token)["actions"]
+    override.write_text('"drover:clusters:create": "!"\n')
+    os.utime(override, (override.stat().st_atime, override.stat().st_mtime + 2))
+    assert not authorize("drover:clusters:create", None, token, do_raise=False)
+    assert "drover:clusters:create" not in capabilities(token)["actions"]
+
+
+def test_workload_policy_override_does_not_remove_principal_namespace_boundary(tmp_path, monkeypatch):
+    from drover import policy
+    from drover.config import Settings
+    from drover.services.credentials import workload_namespace
+
+    path = tmp_path / "policy.yaml"
+    path.write_text('"drover:workloads:write": "@"\n"drover:access:admin": "!"\n')
+    monkeypatch.setattr(policy, "get_settings", lambda: Settings(oslo_policy_policy_file=str(path)))
+    token = {"project_id": "p", "user_id": "u", "roles": ["member"]}
+    policy.authorize_workload_namespace(workload_namespace("p", "u"), token)
+    with pytest.raises(HTTPException) as error:
+        policy.authorize_workload_namespace(workload_namespace("p", "other-user"), token)
+    assert error.value.status_code == 403
+
+
+def test_missing_custom_policy_file_never_uses_permissive_defaults(tmp_path):
+    with pytest.raises(HTTPException) as error:
+        authorize("drover:clusters:create", None, {"project_id": "p", "roles": ["member"]},
+                  policy_file=str(tmp_path / "missing-operator.yaml"))
+    assert error.value.status_code == 503
+
+
+@pytest.mark.parametrize("expression", ["not malformed", "@ or malformed", "role:member or broken",
+                                        "role:member and (", "not (broken)"])
+@pytest.mark.parametrize("in_directory", [False, True])
+def test_native_parser_failure_rejects_entire_load_and_second_request(tmp_path, monkeypatch, expression, in_directory):
+    import logging
+
+    from drover import policy
+    from drover.config import Settings
+
+    path = tmp_path / "policy.yaml"
+    directory = tmp_path / "policy.d"
+    directory.mkdir()
+    path.write_text("{}\n")
+    configured = directory / "10-local.yaml" if in_directory else path
+    import yaml
+
+    configured.write_text(yaml.safe_dump({"drover:clusters:create": expression}))
+    monkeypatch.setattr(policy, "get_settings", lambda: Settings(
+        oslo_policy_policy_file=str(path), oslo_policy_policy_dirs=[str(directory)]))
+    original_logger = policy._parser.LOG
+    previous_disable = logging.root.manager.disable
+    try:
+        logging.disable(logging.CRITICAL)  # Syntax rejection must not depend on logging configuration.
+        for _ in range(2):
+            with pytest.raises(HTTPException) as error:
+                authorize("drover:clusters:create", None, {"project_id": "p", "roles": ["member"]})
+            assert error.value.status_code == 503
+            assert policy._parser.LOG is original_logger
+    finally:
+        logging.disable(previous_disable)
+    configured.write_text('"drover:clusters:create": "role:member"\n')
+    assert authorize("drover:clusters:create", None, {"project_id": "p", "roles": ["member"]})
+
+
+@pytest.mark.parametrize("expression", ["", "@", "not !", "! or role:member",
+                                        "role:member and (not role:blocked)"])
+def test_valid_native_oslo_expression_forms_remain_supported(tmp_path, expression):
+    import yaml
+
+    path = tmp_path / "policy.yaml"
+    path.write_text(yaml.safe_dump({"drover:clusters:create": expression}))
+    assert authorize("drover:clusters:create", None, {"project_id": "p", "roles": ["member"]},
+                     policy_file=str(path))
+
+
+def test_enforcer_never_parses_operator_toml_as_oslo_ini(tmp_path, monkeypatch):
+    from drover import policy
+    from drover.config import Settings
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "drover.conf").write_text('[drover]\ndelegated_required_roles = [\n "member",\n]\n')
+    path = tmp_path / "policy.yaml"
+    path.write_text("{}\n")
+    monkeypatch.setattr(policy, "get_settings", lambda: Settings(oslo_policy_policy_file=str(path)))
+    assert authorize("drover:clusters:create", None, {"project_id": "p", "roles": ["member"]})
+    assert policy.get_enforcer().conf.config_file == []
+
+
+def test_explicit_missing_policy_directory_is_unavailable(tmp_path, monkeypatch):
+    from drover import policy
+    from drover.config import Settings
+
+    missing = tmp_path / "not-mounted"
+    monkeypatch.setattr(policy, "get_settings", lambda: Settings(
+        oslo_policy_policy_dirs=[str(missing)]))
+    with pytest.raises(HTTPException) as error:
+        authorize("drover:clusters:create", None, {"project_id": "p", "roles": ["member"]})
+    assert error.value.status_code == 503
+
+
+@pytest.mark.parametrize("expression", [
+    '"drover:clusters:delete": "not rule:missing"\n',
+    '"drover:clusters:delete": "not rule:cycle"\n"cycle": "not rule:drover:clusters:delete"\n',
+    '"drover:clusters:delete": "role:member and not (rule:missing or role:reader)"\n',
+])
+def test_negated_missing_or_cyclic_reference_fails_closed(tmp_path, monkeypatch, expression):
+    from drover import policy
+    from drover.config import Settings
+
+    path = tmp_path / "policy.yaml"
+    path.write_text(expression)
+    monkeypatch.setattr(policy, "get_settings", lambda: Settings(oslo_policy_policy_file=str(path)))
+    with pytest.raises(HTTPException) as error:
+        authorize("drover:clusters:delete", None, {"project_id": "p", "roles": ["member"]})
+    assert error.value.status_code == 503

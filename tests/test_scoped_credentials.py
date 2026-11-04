@@ -27,9 +27,9 @@ from drover.main import app
 from drover.services import credentials, kube, store
 from drover.services.errors import K3sApiError
 
-USER_ROLES = ["member", "drover-access_user"]
-EDITOR_ROLES = ["member", "drover-workloads_editor"]
-ADMIN_ROLES = ["member", "drover-access_admin"]
+MEMBER_ROLES = ["member"]
+MANAGER_ROLES = ["manager"]
+ADMIN_ROLES = ["admin"]
 
 
 def _encode(value):
@@ -147,7 +147,7 @@ async def native_boundary(monkeypatch):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     boundary.server = f"http://127.0.0.1:{server.server_port}"
-    principal = {"project_id": "project-one", "user_id": "user-one", "roles": USER_ROLES,
+    principal = {"project_id": "project-one", "user_id": "user-one", "roles": MEMBER_ROLES,
                  "expires_at": (datetime.now(UTC) + timedelta(seconds=800)).isoformat(), "is_system_admin": False}
     stored = yaml.safe_dump({"apiVersion": "v1", "clusters": [{"name": "admin", "cluster": {
         "server": boundary.server, "certificate-authority-data": "synthetic-ca"}}],
@@ -176,16 +176,31 @@ async def native_boundary(monkeypatch):
         return list(principal["roles"])
 
     monkeypatch.setattr("drover.auth._current_project_roles", current_roles)
+    monkeypatch.setattr("drover.auth.current_project_role_map",
+                        lambda user, project, **_: {name: name for name in current_roles(user, project)})
+
+    def current_state(user_id, project_id):
+        assert user_id == principal["user_id"] and project_id == principal["project_id"]
+        return True, True
+
+    monkeypatch.setattr("drover.auth.current_principal_state", current_state)
+    monkeypatch.setattr("drover.auth.current_project_authority", lambda user, project: {
+        "enabled": current_state(user, project), "role_map": {name: name for name in current_roles(user, project)},
+        "is_system_admin": principal["is_system_admin"],
+    })
 
     def keystone_request(session, url, method, **kwargs):
         assert method == "GET"
         assert url == "http://synthetic-keystone/v3/auth/tokens"
         assert kwargs["headers"]["X-Subject-Token"] == "synthetic-keystone-token"
-        token = {"methods": ["token"], "expires_at": principal["expires_at"],
+        token = {"methods": ["application_credential"] if principal.get("credential_restricted") else ["password"],
+                 "expires_at": principal["expires_at"],
                  "issued_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
                  "user": {"id": principal["user_id"], "name": "smoke", "domain": {"id": "default"}},
                  "project": {"id": principal["project_id"], "name": "smoke", "domain": {"id": "default"}},
                  "roles": [{"id": role, "name": role} for role in principal["roles"]]}
+        if principal.get("credential_restricted"):
+            token["application_credential"] = {"id": "restricted-credential"}
         response = Response()
         response.status_code = 200
         response._content = json.dumps({"token": token}).encode()
@@ -216,7 +231,7 @@ def _token(response):
 
 
 @pytest.mark.asyncio
-async def test_smoke_native_user_download_issues_real_http_and_readonly_rbac(native_boundary):
+async def test_smoke_native_member_download_issues_real_http_and_readonly_rbac(native_boundary):
     smoke = native_boundary
     first, second = await _download(smoke), await _download(smoke)
     assert first.status_code == second.status_code == 200
@@ -245,7 +260,7 @@ async def test_head_authorizes_selected_grade_without_issuing_a_credential(nativ
     assert response.content == b""
     assert response.headers["cache-control"] == "no-store"
     assert smoke.k8s.requests == []
-    smoke.principal["roles"] = ["member", "drover-inventory_reader"]
+    smoke.principal["roles"] = ["reader"]
     denied = await smoke.route.head("/v1/clusters/cluster-one/kubeconfig")
     assert denied.status_code == 403
     assert smoke.k8s.requests == []
@@ -254,7 +269,7 @@ async def test_head_authorizes_selected_grade_without_issuing_a_credential(nativ
 @pytest.mark.asyncio
 async def test_editor_private_namespace_no_global_or_escalation_rights(native_boundary):
     smoke = native_boundary
-    smoke.principal["roles"] = EDITOR_ROLES
+    smoke.principal["roles"] = MEMBER_ROLES
     response = await _download(smoke, "editor")
     assert response.status_code == 200
     namespace = credentials.workload_namespace("project-one", "user-one")
@@ -279,19 +294,22 @@ async def test_editor_private_namespace_no_global_or_escalation_rights(native_bo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("roles,verified,status,admin", [
-    (["reader", "drover-inventory_reader"], False, 403, False), (["member", "drover-clusters_editor"], False, 403, False),
-    (["member", "drover-clusters_admin"], False, 403, False), (["admin", "drover-access_admin"], False, 403, False),
-    (USER_ROLES, False, 200, False), (ADMIN_ROLES, False, 200, True),
-    (["member", "drover_admin"], False, 403, False), ([], True, 200, True),
+@pytest.mark.parametrize("grade", ["user", "editor", "admin"])
+@pytest.mark.parametrize("roles,verified,status", [
+    (["reader"], False, 403), (["reader", "drover-access_admin"], False, 403),
+    (["drover_user"], False, 403), (["drover_editor"], False, 403),
+    (["drover_admin"], False, 403), (["drover-access_user"], False, 403),
+    (["drover-workloads_editor"], False, 403), (["drover-access_admin"], False, 403),
+    (MEMBER_ROLES, False, 200), (MANAGER_ROLES, False, 200),
+    (ADMIN_ROLES, False, 200), ([], True, 200),
 ])
-async def test_leaf_credential_privileges(native_boundary, roles, verified, status, admin):
+async def test_native_role_credential_privileges(native_boundary, roles, verified, status, grade):
     smoke = native_boundary
     smoke.principal.update(roles=roles, is_system_admin=verified)
-    response = await _download(smoke, "admin" if admin else "user")
+    response = await _download(smoke, grade)
     assert response.status_code == status
     if status == 200:
-        if admin:
+        if grade == "admin":
             assert response.text == smoke.stored
             assert not smoke.k8s.requests
         else:
@@ -302,11 +320,11 @@ async def test_leaf_credential_privileges(native_boundary, roles, verified, stat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("roles", [USER_ROLES, EDITOR_ROLES, ADMIN_ROLES])
-async def test_head_never_issues_reads_or_audits(native_boundary, roles):
+@pytest.mark.parametrize("grade", ["user", "editor", "admin"])
+@pytest.mark.parametrize("roles", [MEMBER_ROLES, MANAGER_ROLES, ADMIN_ROLES])
+async def test_head_never_issues_reads_or_audits(native_boundary, roles, grade):
     smoke = native_boundary
     smoke.principal["roles"] = roles
-    grade = "editor" if roles == EDITOR_ROLES else "admin" if roles == ADMIN_ROLES else "user"
     response = await smoke.route.head("/v1/clusters/cluster-one/kubeconfig", params={"grade": grade})
     assert response.status_code == 200
     assert not response.content
@@ -317,11 +335,11 @@ async def test_head_never_issues_reads_or_audits(native_boundary, roles):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("roles", [USER_ROLES, EDITOR_ROLES, ADMIN_ROLES])
-async def test_wrong_project_fails_before_issuance(native_boundary, roles):
+@pytest.mark.parametrize("grade", ["user", "editor", "admin"])
+@pytest.mark.parametrize("roles", [MEMBER_ROLES, MANAGER_ROLES, ADMIN_ROLES])
+async def test_wrong_project_fails_before_issuance(native_boundary, roles, grade):
     smoke = native_boundary
     smoke.principal.update(project_id="wrong-project", roles=roles)
-    grade = "editor" if roles == EDITOR_ROLES else "admin" if roles == ADMIN_ROLES else "user"
     assert (await _download(smoke, grade)).status_code == 404
     assert (await smoke.route.head("/v1/clusters/cluster-one/kubeconfig", params={"grade": grade})).status_code == 404
     assert not smoke.k8s.requests
@@ -341,7 +359,7 @@ async def test_provider_errors_never_return_admin_config(native_boundary, failur
 @pytest.mark.asyncio
 async def test_editor_missing_admission_provider_fails_closed(native_boundary):
     smoke = native_boundary
-    smoke.principal["roles"] = EDITOR_ROLES
+    smoke.principal["roles"] = MEMBER_ROLES
     smoke.k8s.failure = "admissionregistration"
     assert (await _download(smoke, "editor")).status_code == 502
     assert not smoke.k8s.tokens
@@ -350,7 +368,7 @@ async def test_editor_missing_admission_provider_fails_closed(native_boundary):
 @pytest.mark.asyncio
 async def test_editor_unready_admission_fails_closed(native_boundary):
     smoke = native_boundary
-    smoke.principal["roles"] = EDITOR_ROLES
+    smoke.principal["roles"] = MEMBER_ROLES
     smoke.k8s.admission_unready = credentials.ADMISSION_PROBE_ATTEMPTS
     assert (await _download(smoke, "editor")).status_code == 502
     assert not smoke.k8s.tokens
@@ -362,7 +380,7 @@ async def test_editor_unready_admission_fails_closed(native_boundary):
 async def test_editor_waits_for_new_admission_binding_to_enforce(native_boundary):
     # Real apiservers admit dry-run pods briefly after a policy/binding is first applied.
     smoke = native_boundary
-    smoke.principal["roles"] = EDITOR_ROLES
+    smoke.principal["roles"] = MEMBER_ROLES
     smoke.k8s.admission_unready = 2
     assert (await _download(smoke, "editor")).status_code == 200
     assert len(smoke.k8s.tokens) == 1
@@ -457,7 +475,7 @@ async def test_invalid_stored_ca_prevents_token_issuance(native_boundary, monkey
 
 
 @pytest.mark.asyncio
-async def test_default_download_is_readonly_even_for_access_admin(native_boundary):
+async def test_default_download_is_readonly_even_for_project_admin(native_boundary):
     native_boundary.principal["roles"] = ADMIN_ROLES
     response = await native_boundary.route.get("/v1/clusters/cluster-one/kubeconfig")
     assert response.status_code == 200
@@ -467,12 +485,25 @@ async def test_default_download_is_readonly_even_for_access_admin(native_boundar
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("grade", ["editor", "admin"])
-async def test_user_cannot_select_elevated_grade(native_boundary, grade):
+@pytest.mark.parametrize("grade", ["user", "editor", "admin"])
+async def test_reader_cannot_select_any_credential_grade(native_boundary, grade):
+    native_boundary.principal["roles"] = ["reader"]
     for method in ("GET", "HEAD"):
         response = await native_boundary.route.request(method, "/v1/clusters/cluster-one/kubeconfig", params={"grade": grade})
         assert response.status_code == 403
     assert not native_boundary.k8s.requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grade", ["user", "editor", "admin"])
+async def test_reduced_member_cannot_download_any_credential_grade(native_boundary, grade):
+    native_boundary.principal["credential_restricted"] = True
+    for method in ("GET", "HEAD"):
+        response = await native_boundary.route.request(
+            method, "/v1/clusters/cluster-one/kubeconfig", params={"grade": grade})
+        assert response.status_code == 403
+    assert not native_boundary.k8s.requests
+    store.get_kubeconfig.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -484,9 +515,24 @@ async def test_invalid_grade_is_rejected_without_issuance(native_boundary):
 
 @pytest.mark.asyncio
 async def test_editor_namespace_preparation_has_no_discarded_token(native_boundary):
-    native_boundary.principal["roles"] = EDITOR_ROLES
+    native_boundary.principal["roles"] = MEMBER_ROLES
     namespace = await credentials.ensure_workload_namespace("cluster-one", native_boundary.principal)
     assert namespace == credentials.workload_namespace("project-one", "user-one")
     assert not native_boundary.k8s.tokens
     assert not any(path.endswith("/token") for _, path in native_boundary.k8s.requests)
     assert any(obj["kind"] == "ValidatingAdmissionPolicyBinding" for obj in native_boundary.k8s.objects.values())
+
+
+@pytest.mark.asyncio
+async def test_user_issuer_uses_exact_read_action_not_log_content(native_boundary, monkeypatch, tmp_path):
+    from drover import policy
+    from drover.config import Settings
+
+    path = tmp_path / "policy.yaml"
+    path.write_text('"drover:access:get": "!"\n"drover:access:read": "role:member"\n')
+    monkeypatch.setattr(policy, "get_settings", lambda: Settings(oslo_policy_policy_file=str(path)))
+    response = await _download(native_boundary, "user")
+    assert response.status_code == 200
+    assert native_boundary.k8s.tokens
+    assert "drover:access:read" in policy.capabilities(native_boundary.principal)["actions"]
+    assert "drover:access:get" not in policy.capabilities(native_boundary.principal)["actions"]

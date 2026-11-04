@@ -116,7 +116,7 @@ async def list_k3s_clusters(
     cm: CacheMode = Depends(cache_mode),
 ):
     project_id = token_info["project_id"]
-    authorize("drover:clusters:get", {"project_id": project_id}, token_info)
+    authorize("drover:clusters:list", {"project_id": project_id}, token_info)
     # An open SQL breaker is authoritative even when a previous list is cached.
     if is_db_configured() and not is_db_available():
         raise HTTPException(status_code=503, detail="Cluster inventory unavailable")

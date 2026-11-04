@@ -20,10 +20,7 @@ from drover.services.errors import K3sApiError
 def _token(roles=None, **changes):
     return {
         "token": "validated-token", "project_id": "project-1", "user_id": "user-1",
-        "roles": roles if roles is not None else [
-            "member", "reader", "drover-inventory_reader", "drover-access_user",
-            "drover-clusters_editor", "drover-workloads_editor",
-        ],
+        "roles": roles if roles is not None else ["member"],
         "is_system_admin": False,
         "expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
     } | changes
@@ -72,12 +69,11 @@ def test_user_hash_and_versioned_names():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("roles", [
-    ["member"], ["reader"],
-    ["reader", "drover-workloads_editor"],
-    ["member", "reader", "drover-inventory_reader", "drover-access_user"],
-    ["member", "reader", "drover-inventory_reader"],
+    ["reader"], ["reader", "lumen_editor"], ["reader", "drover-access_user"],
+    ["drover_user"], ["drover_editor"], ["drover_admin"], ["drover-workloads_editor"],
+    ["drover-access_admin"],
 ])
-async def test_plain_reader_and_user_denied_before_provisioning(lifecycle, roles):
+async def test_reader_and_legacy_roles_denied_before_provisioning(lifecycle, roles):
     with pytest.raises(HTTPException) as error:
         await shell.ensure_session("c", _token(roles), project_id="project-1")
     assert error.value.status_code == 403
@@ -103,10 +99,7 @@ def test_session_requires_valid_token_expiration(expiry):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("token", [
-    _token(), _token([
-        "member", "reader", "drover-inventory_reader", "drover-access_user",
-        "drover-clusters_editor", "drover-workloads_editor", "drover-clusters_admin", "drover-access_admin",
-    ]), _token([], is_system_admin=True),
+    _token(), _token(["manager"]), _token(["admin"]), _token([], is_system_admin=True),
 ])
 async def test_shell_always_mounts_restricted_issued_token(lifecycle, token):
     name = await shell.ensure_session("c", token, project_id="project-1")

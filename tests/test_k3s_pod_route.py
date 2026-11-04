@@ -223,10 +223,10 @@ def _pod_authority(roles: list[str], *, system_admin: bool = False) -> dict:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("roles", [
-    ["member"], ["reader"], ["reader", "member", "drover-access_user"],
-    ["reader", "drover-workloads_editor"],
+    ["reader"], ["reader", "drover-access_user"], ["reader", "lumen_editor"],
+    ["drover_editor"], ["drover_admin"], ["drover-workloads_editor"], ["drover-access_admin"],
 ])
-async def test_pod_mutations_require_service_workload_editor(client, roles):
+async def test_reader_and_legacy_roles_cannot_mutate_pods(client, roles):
     app.dependency_overrides[require_token] = lambda: _pod_authority(roles)
     app.dependency_overrides[get_token_info] = lambda: _pod_authority(roles)
     namespace = workload_namespace("test-project-123", "pod-user")
@@ -237,9 +237,13 @@ async def test_pod_mutations_require_service_workload_editor(client, roles):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("namespace", ["kube-system", "default", "afterglow-shell", workload_namespace("test-project-123", "another-user")])
-async def test_editor_cannot_mutate_system_or_other_principal_namespace(client, namespace):
-    token = _pod_authority(["member", "reader", "drover-workloads_editor"])
+@pytest.mark.parametrize("namespace", [
+    "kube-system", "default", "afterglow-shell",
+    workload_namespace("test-project-123", "pod-user"),
+    workload_namespace("test-project-123", "another-user"),
+])
+async def test_reduced_member_cannot_mutate_any_namespace(client, namespace):
+    token = {**_pod_authority(["member"]), "credential_restricted": True}
     app.dependency_overrides[require_token] = lambda: token
     app.dependency_overrides[get_token_info] = lambda: token
     with patch("drover.api.pods.k3s_kube.delete_pod", new_callable=AsyncMock) as delete:
@@ -250,8 +254,12 @@ async def test_editor_cannot_mutate_system_or_other_principal_namespace(client, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("roles", "system_admin", "namespace"), [
-    (["reader", "member", "drover-workloads_editor"], False, workload_namespace("test-project-123", "pod-user")),
-    (["reader", "member", "drover-workloads_editor", "drover-access_admin"], False, "kube-system"),
+    (["member"], False, workload_namespace("test-project-123", "pod-user")),
+    (["member"], False, "kube-system"),
+    (["member"], False, "default"),
+    (["member"], False, workload_namespace("test-project-123", "another-user")),
+    (["manager"], False, "kube-system"),
+    (["admin"], False, "kube-system"),
     ([], True, "kube-system"),
 ])
 async def test_authorized_pod_mutation_stays_project_scoped(client, roles, system_admin, namespace):
@@ -271,7 +279,7 @@ async def test_authorized_pod_mutation_stays_project_scoped(client, roles, syste
 
 @pytest.mark.asyncio
 async def test_reader_inventory_does_not_grant_mutation(client):
-    token = _pod_authority(["reader", "drover-inventory_reader"])
+    token = _pod_authority(["reader"])
     app.dependency_overrides[require_token] = lambda: token
     app.dependency_overrides[get_token_info] = lambda: token
     with (
@@ -284,8 +292,8 @@ async def test_reader_inventory_does_not_grant_mutation(client):
 
 
 @pytest.mark.asyncio
-async def test_workload_editor_cannot_mutate_other_project_cluster(client):
-    token = _pod_authority(["reader", "member", "drover-workloads_editor"])
+async def test_member_cannot_mutate_other_project_cluster(client):
+    token = _pod_authority(["member"])
     app.dependency_overrides[require_token] = lambda: token
     app.dependency_overrides[get_token_info] = lambda: token
     namespace = workload_namespace("test-project-123", "pod-user")
@@ -300,10 +308,10 @@ async def test_workload_editor_cannot_mutate_other_project_cluster(client):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("roles", [
-    ["member"], ["reader"], ["reader", "drover-inventory_reader"],
-    ["reader", "drover-access_user"],
+    ["reader"], ["reader", "drover-inventory_reader"], ["reader", "lumen_user"],
+    ["drover_user"], ["drover_admin"], ["drover-access_user"], ["drover-access_admin"],
 ])
-async def test_inventory_reader_cannot_read_pod_log_content(client, roles):
+async def test_reader_and_legacy_roles_cannot_read_pod_log_content(client, roles):
     token = _pod_authority(roles)
     app.dependency_overrides[require_token] = lambda: token
     app.dependency_overrides[get_token_info] = lambda: token
@@ -315,12 +323,12 @@ async def test_inventory_reader_cannot_read_pod_log_content(client, roles):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("roles", "system_admin"), [
-    (["member", "reader", "drover-access_user"], False),
-    (["member", "reader", "drover-inventory_reader", "drover-access_user"], False),
-    (["member", "reader", "drover-access_admin"], False),
+    (["member"], False),
+    (["manager"], False),
+    (["admin"], False),
     ([], True),
 ])
-async def test_pod_log_requires_access_capability_not_inventory_capability(client, roles, system_admin):
+async def test_project_management_roles_can_read_pod_logs(client, roles, system_admin):
     token = _pod_authority(roles, system_admin=system_admin)
     app.dependency_overrides[require_token] = lambda: token
     app.dependency_overrides[get_token_info] = lambda: token
@@ -336,8 +344,8 @@ async def test_pod_log_requires_access_capability_not_inventory_capability(clien
 
 
 @pytest.mark.asyncio
-async def test_access_user_cannot_read_other_project_pod_logs(client):
-    token = _pod_authority(["member", "reader", "drover-access_user"])
+async def test_member_cannot_read_other_project_pod_logs(client):
+    token = _pod_authority(["member"])
     app.dependency_overrides[require_token] = lambda: token
     app.dependency_overrides[get_token_info] = lambda: token
     with (

@@ -72,6 +72,29 @@ def _statements(path: Path) -> list[str]:
     return [statement.strip() for statement in sql.split(";") if statement.strip()]
 
 
+async def check_runtime_compatibility(connection) -> None:
+    """Recognize the full ledger and reject unpublished executor-owned authority."""
+    expected = {migration.logical_id: migration for migration in load_manifest()}
+    rows = (await connection.execute(text("SELECT logical_id, relative_path, sha256 FROM schema_migrations"))).all()
+    for row in rows:
+        migration = expected.get(row.logical_id)
+        if migration is None:
+            raise MigrationLedgerError(f"unknown applied migration: {row.logical_id}")
+        if row.relative_path != migration.relative_path or row.sha256 != migration.sha256:
+            raise MigrationLedgerError(f"applied migration identity drift: {row.logical_id}")
+    if {row.logical_id for row in rows} != set(expected):
+        raise MigrationLedgerError("pending Drover migrations")
+    for table in ("drover_delegations", "drover_cluster_credentials"):
+        count = (await connection.execute(text(
+            f"SELECT COUNT(*) FROM {table} WHERE requester_user_id IS NOT NULL"
+        ))).scalar_one()
+        if count:
+            raise MigrationLedgerError("executor-owned authority requires matching executor-capable API and workers")
+    count = (await connection.execute(text("SELECT COUNT(*) FROM drover_credential_cleanup"))).scalar_one()
+    if count:
+        raise MigrationLedgerError("credential cleanup references require matching cleanup-capable API and workers")
+
+
 async def migrate(database_url: str, *, apply: bool) -> list[str]:
     if not database_url:
         raise MigrationLedgerError("database URL is required")
@@ -90,6 +113,10 @@ async def migrate(database_url: str, *, apply: bool) -> list[str]:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            rows = (await connection.execute(text("SELECT logical_id FROM schema_migrations"))).all()
+            unknown = {row.logical_id for row in rows} - {migration.logical_id for migration in migrations}
+            if unknown:
+                raise MigrationLedgerError(f"unknown applied migrations: {', '.join(sorted(unknown))}")
         for migration in migrations:
             async with engine.begin() as connection:
                 row = (
@@ -118,6 +145,9 @@ async def migrate(database_url: str, *, apply: bool) -> list[str]:
                         "sha256": migration.sha256,
                     },
                 )
+        if not pending or apply:
+            async with engine.connect() as connection:
+                await check_runtime_compatibility(connection)
         return pending
     finally:
         await engine.dispose()

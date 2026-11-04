@@ -7,7 +7,7 @@ import logging
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -33,6 +33,7 @@ from drover.api import (
     templates,
     workloads,
 )
+from drover.auth import require_token
 from drover.config import get_settings, validate_config
 from drover.db import check_db, close_db, get_session_factory, init_db
 from drover.logging import configure_logging
@@ -43,8 +44,9 @@ from drover.models.schemas import (
     RootDiscoveryResponse,
     VersionDiscoveryResponse,
 )
+from drover.policy import capabilities
 from drover.rate_limit import limiter
-from drover.scripts.migrate import load_manifest
+from drover.scripts.migrate import check_runtime_compatibility, load_manifest
 from drover.services import cache, keystone
 from drover.services.errors import K3sApiError
 
@@ -65,6 +67,7 @@ async def _check_migration_ledger() -> bool:
         manifest = load_manifest()
         async with session_factory() as session:
             rows = (await session.execute(text("SELECT logical_id, sha256 FROM schema_migrations"))).all()
+            await check_runtime_compatibility(session)
     except Exception:
         _logger.warning("Drover migration ledger readiness check failed", exc_info=True)
         return False
@@ -107,6 +110,8 @@ async def lifespan(_app: FastAPI):
         pool_timeout=settings.database_pool_timeout,
     )
     try:
+        async with get_session_factory()() as session:
+            await check_runtime_compatibility(session)
         yield
     finally:
         await cache.get_backend().close()
@@ -146,6 +151,12 @@ app.include_router(operations.router, prefix="/v1/operations", tags=["operations
 app.include_router(admin.router, prefix="/v1/admin", tags=["admin"])
 app.include_router(resource_policies.router, prefix="/v1/admin", tags=["admin"])
 app.include_router(stats.router, prefix="/v1/stats", tags=["stats"])
+
+
+@app.get("/v1/policy/capabilities", tags=["policy"])
+async def policy_capabilities(token_info: dict = Depends(require_token)):
+    """Project capabilities from the native action engine; never an IAM grant."""
+    return capabilities(token_info)
 
 
 def _version_document(request: Request) -> dict:

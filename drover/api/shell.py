@@ -122,6 +122,9 @@ async def shell_ws(
         if annotations.get("drover.io/user-id") != user_id or annotations.get("drover.io/project-id") != project_id:
             raise HTTPException(403, "Shell pod principal mismatch")
         session_owned = True
+        # Full project access does not widen the credential mounted by this shell.
+        if annotations.get("drover.io/workload-namespace") != workload_namespace(project_id, user_id):
+            raise HTTPException(403, "Shell pod workload namespace mismatch")
         authorize_workload_namespace(annotations.get("drover.io/workload-namespace", ""), token_info)
         expires_at = float(annotations["drover.io/credential-expiry"])
         async with k3s_kube._kube_ws_params(cluster_id, project_id=project_id) as (ssl_ctx, ws_url):

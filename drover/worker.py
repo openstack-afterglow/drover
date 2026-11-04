@@ -263,6 +263,11 @@ async def _main_async():
     jobs_task = None
     waiters = []
     try:
+        from drover.db import get_session_factory
+        from drover.scripts.migrate import check_runtime_compatibility
+
+        async with get_session_factory()() as session:
+            await check_runtime_compatibility(session)
         await runtime.start()
         jobs_task = asyncio.create_task(_jobs_worker_loop(), name="drover-sql-jobs")
         waiters = [asyncio.create_task(stop_event.wait()), asyncio.create_task(runtime.failed.wait())]

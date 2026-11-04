@@ -3,25 +3,16 @@
 from __future__ import annotations
 
 import json
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi import HTTPException
-from keystoneauth1 import session as ks_session
-from keystoneauth1 import token_endpoint
-from keystoneauth1.exceptions.http import BadRequest, Unauthorized
-from keystoneclient.v3.role_assignments import RoleAssignmentManager
-from keystoneclient.v3.roles import RoleManager
-from requests import ConnectionError as RequestsConnectionError
+from keystoneauth1.exceptions.http import Unauthorized
 from requests import Response
-from requests import Session as RequestsSession
 from starlette.requests import Request
 
-from drover.auth import _get_admin_ks_client, _is_system_admin, get_os_conn, require_token, validate_token
+from drover.auth import _get_admin_ks_client, get_os_conn, require_token, validate_token
 
 pytestmark = pytest.mark.asyncio
 
@@ -34,8 +25,17 @@ def clear_internal_keystone_endpoint_cache():
 
 @pytest.fixture(autouse=True)
 def synthetic_project_role_directory():
-    # Token transport tests bypass the project-role graph, never the system-admin directory.
-    with patch("drover.auth._current_project_roles", return_value=["member"]):
+    # This module tests token transport; current role graph behavior has its own tests.
+    from drover import auth
+
+    def current_authority(user, project):
+        return {"enabled": auth.current_principal_state(user, project),
+                "role_map": {name: name for name in auth._current_project_roles(user, project)},
+                "is_system_admin": auth._is_system_admin(user)}
+
+    with (patch("drover.auth._current_project_roles", return_value=["member"]),
+          patch("drover.auth.current_principal_state", return_value=(True, True)),
+          patch("drover.auth.current_project_authority", side_effect=current_authority)):
         yield
 
 
@@ -78,7 +78,7 @@ async def test_get_os_conn_fails_closed_when_scoped_connection_fails():
 def _keystone_response(project_id):
     body = {
         "token": {
-            "methods": ["token"],
+            "methods": ["password"],
             "expires_at": "2099-01-01T00:00:00Z",
             "issued_at": "2026-01-01T00:00:00Z",
             "user": {"id": "user-1", "name": "member", "domain": {"id": "default"}},
@@ -96,6 +96,52 @@ def _keystone_response(project_id):
     response._content = json.dumps(body).encode()
     response.headers["X-Subject-Token"] = "validated-token"
     return response
+
+
+@pytest.mark.parametrize("methods", [["openid"], ["openid", "token"], ["mapped", "token"], ["saml2", "token"]])
+async def test_federated_human_uses_fresh_native_project_and_system_authority(methods):
+    from drover.policy import authorize
+
+    response = _keystone_response("project-1")
+    body = response.json()
+    body["token"]["methods"] = methods
+    body["token"]["roles"] = [{"id": "stale-reader", "name": "reader"}]
+    response._content = json.dumps(body).encode()
+    with (
+        patch("drover.auth._resolve_internal_keystone_endpoint", return_value="http://127.0.0.1/v3"),
+        patch("drover.auth.ks_session.Session.request", return_value=response),
+        patch("drover.auth._current_project_roles", return_value=["member"]),
+        patch("drover.auth._is_system_admin", return_value=True),
+    ):
+        info = validate_token("federated-human")
+    assert info["is_human"] is True and info["credential_restricted"] is False
+    assert info["roles"] == ["member"] and info["is_system_admin"] is True
+    assert authorize("drover:clusters:create", None, info)
+    assert authorize("drover:admin", None, info)
+
+
+@pytest.mark.parametrize("methods", [["openid", "unknown"], ["unknown"], ["token"]])
+async def test_unknown_or_token_only_methods_cannot_expand_issued_reader_to_current_member(methods):
+    from drover.policy import authorize
+
+    response = _keystone_response("project-1")
+    body = response.json()
+    body["token"]["methods"] = methods
+    body["token"]["roles"] = [{"id": "reader-id", "name": "reader"}]
+    response._content = json.dumps(body).encode()
+    with (
+        patch("drover.auth._resolve_internal_keystone_endpoint", return_value="http://127.0.0.1/v3"),
+        patch("drover.auth.ks_session.Session.request", return_value=response),
+        patch("drover.auth.current_project_role_map", return_value={"reader": "reader-id", "member": "member-id"}),
+        patch("drover.auth._is_system_admin", return_value=True) as system,
+    ):
+        info = validate_token("reduced-reader")
+    assert info["roles"] == ["reader"] and info["credential_restricted"] is True
+    assert info["is_system_admin"] is False
+    assert authorize("drover:clusters:get", None, info)
+    for action in ("drover:clusters:create", "drover:workloads:write", "drover:access:get", "drover:access:admin"):
+        assert not authorize(action, None, info, do_raise=False)
+    system.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -202,8 +248,10 @@ async def test_validate_token_uses_internal_identity_endpoint(catalog_endpoint):
 
 async def test_explicit_project_rescope_uses_internal_identity_endpoint():
     def keystone_request(session, url, method, **kwargs):
-        assert method.upper() == "POST"
         assert url == "https://keystone.internal.example/v3/auth/tokens"
+        if method.upper() == "GET":
+            return _keystone_response("project-1")
+        assert method.upper() == "POST"
         scope = kwargs["json"]["auth"]["scope"]["project"]
         assert scope == {"id": "project-2"}
         return _keystone_response("project-2")
@@ -259,216 +307,293 @@ async def test_admin_keystone_client_uses_internal_identity_endpoint(catalog_end
     )
 
 
-_SYSTEM_USER = "verified-system-user"
-_ADMIN_ROLE = {"id": "real-admin-id", "name": "admin", "domain_id": None}
-_DIRECT_SYSTEM_QUERY = {
-    "user.id": [_SYSTEM_USER], "role.id": [_ADMIN_ROLE["id"]], "scope.system": ["all"],
-}
-
-
-def _direct_system_assignment(**changes):
-    return {
-        "user": {"id": _SYSTEM_USER}, "role": {"id": _ADMIN_ROLE["id"]},
-        "scope": {"system": {"all": True}},
-    } | changes
-
-
 @pytest.fixture
-def native_system_directory(monkeypatch):
-    """Installed managers/adapter/session over real HTTP; only Keystone is synthetic."""
-    state = SimpleNamespace(
-        catalog={"roles": [dict(_ADMIN_ROLE)]},
-        assignments={"role_assignments": [_direct_system_assignment()]},
-        calls=[], failure_path=None, failure_status=500,
-    )
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_args):
-            return
-
-        def do_GET(self):
-            url = urlsplit(self.path)
-            query = parse_qs(url.query)
-            state.calls.append((url.path, query))
-            status, body = 200, None
-            if self.headers.get("X-Auth-Token") != "synthetic-directory-token":
-                status = 401
-            elif url.path == state.failure_path:
-                status = state.failure_status
-            elif url.path == "/v3/roles" and query == {"name": ["admin"]}:
-                body = state.catalog
-            elif url.path == "/v3/role_assignments" and query == _DIRECT_SYSTEM_QUERY:
-                body = state.assignments
-            else:
-                # Reproduce the effective-system rejection at the HTTP boundary,
-                # not an invented unsupported system kwarg in the native manager.
-                status = 400
-            if body is None:
-                body = {"error": {"code": status, "message": "Synthetic Keystone rejection"}}
-            payload = json.dumps(body).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-    endpoint = f"http://127.0.0.1:{server.server_address[1]}/v3"
-    transport = RequestsSession()
-    transport.trust_env = False
-    session = ks_session.Session(
-        auth=token_endpoint.Token(endpoint, "synthetic-directory-token"), session=transport, timeout=2,
-    )
-    monkeypatch.setattr("drover.auth._get_admin_ks_session", lambda: session)
-    monkeypatch.setattr("drover.auth._resolve_internal_keystone_endpoint", lambda session=None: endpoint)
-    thread.start()
-    try:
-        yield state
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
-        transport.close()
-
-
-async def test_system_admin_requires_direct_native_system_assignment(native_system_directory):
-    client = _get_admin_ks_client()
-    assert isinstance(client.role_assignments, RoleAssignmentManager)
-    assert isinstance(client.roles, RoleManager)
-    # The installed manager accepts system='all' and actually sends effective=True.
-    with pytest.raises(BadRequest):
-        client.role_assignments.list(user=_SYSTEM_USER, role=_ADMIN_ROLE["id"], system="all", effective=True)
-    assert native_system_directory.calls == [
-        ("/v3/role_assignments", _DIRECT_SYSTEM_QUERY | {"effective": ["True"]}),
+def system_directory(monkeypatch):
+    client = MagicMock()
+    client.roles.list.return_value = [SimpleNamespace(id=rid, name=name, domain_id=None)
+                                      for rid, name in (("admin-id", "admin"), ("parent-id", "operator"))]
+    client.inference_rules.list_inference_roles.return_value = [
+        {"prior_role": {"id": "parent-id"}, "implies": [{"id": "admin-id"}]},
     ]
-    native_system_directory.calls.clear()
+    client.groups.list.return_value = []
+    client.role_assignments.list.return_value = []
+    monkeypatch.setattr("drover.auth._get_admin_ks_client", lambda: client)
+    def get(path):
+        from urllib.parse import parse_qs, urlsplit
 
-    assert _is_system_admin(_SYSTEM_USER) is True
-    assert native_system_directory.calls == [
-        ("/v3/roles", {"name": ["admin"]}), ("/v3/role_assignments", _DIRECT_SYSTEM_QUERY),
-    ]
-
-
-@pytest.mark.parametrize("user_id", [None, "", 123])
-async def test_system_admin_missing_user_never_queries_directory(native_system_directory, user_id):
-    assert _is_system_admin(user_id) is False
-    assert native_system_directory.calls == []
-
-
-@pytest.mark.parametrize("assignments", [
-    [],
-    [{}],
-    [_direct_system_assignment(user={})],
-    [_direct_system_assignment(user=None)],
-    [_direct_system_assignment(role={})],
-    [_direct_system_assignment(role=None)],
-    [_direct_system_assignment(user={"id": "other-user"})],
-    [_direct_system_assignment(role={"id": "domain-admin-id"})],
-    [_direct_system_assignment(scope={"project": {"id": "tenant"}})],
-    [_direct_system_assignment(scope={"domain": {"id": "default"}})],
-    [_direct_system_assignment(user={}, group={"id": "admins"})],
-    [_direct_system_assignment(group={"id": "admins"})],
-    [_direct_system_assignment(scope={})],
-    [_direct_system_assignment(scope={"system": {"all": False}})],
-    [_direct_system_assignment(scope={"system": {"all": "all"}})],
-    [_direct_system_assignment(scope={"system": {"all": 1}})],
-    [_direct_system_assignment(scope={"system": {"id": "all"}})],
-    [_direct_system_assignment(scope={"system": {"all": True}, "project": {"id": "tenant"}})],
-    [_direct_system_assignment(scope={"system": {"all": True}, "domain": {"id": "default"}})],
-    [_direct_system_assignment(scope={"system": {"all": True}, "OS-INHERIT:inherited_to": "projects"})],
-    [_direct_system_assignment(), _direct_system_assignment()],
-    [_direct_system_assignment(), _direct_system_assignment(user={"id": "other-user"})],
-    [{"role": {"id": _ADMIN_ROLE["id"]}, "scope": {"system": {"all": True}}}],
-    [{"user": {"id": _SYSTEM_USER}, "scope": {"system": {"all": True}}}],
-    [{"user": {"id": _SYSTEM_USER}, "role": {"id": _ADMIN_ROLE["id"]}}],
-    [_direct_system_assignment(user={"id": ""})],
-    [_direct_system_assignment(role={"id": ""})],
-    [{"group": {"id": "admins"}, "role": {"id": _ADMIN_ROLE["id"]}, "scope": {"system": {"all": True}}}],
-    [_direct_system_assignment(scope={"system": {"all": True, "id": "other-system"}})],
-], ids=[
-    "empty", "empty-row", "missing-user-id", "null-user", "missing-role-id", "null-role", "wrong-user",
-    "wrong-role", "project", "domain", "group", "user-and-group", "missing-scope", "wrong-system",
-    "nonboolean-system", "integer-system", "system-id-not-all", "mixed-project", "mixed-domain",
-    "inherited", "duplicate", "mixed-subjects",
-    "missing-user", "missing-role", "absent-scope", "empty-user-id", "empty-role-id", "group-only",
-    "extra-system-selector",
-])
-async def test_native_system_assignment_rejects_wrong_or_ambiguous_rows(native_system_directory, assignments):
-    native_system_directory.assignments = {"role_assignments": assignments}
-    assert _is_system_admin(_SYSTEM_USER) is False
-    assert native_system_directory.calls[-1] == ("/v3/role_assignments", _DIRECT_SYSTEM_QUERY)
+        parsed = urlsplit(path)
+        if parsed.path == "/roles":
+            key, rows = "roles", client.roles.list()
+        elif parsed.path == "/role_inferences":
+            key, rows = "role_inferences", client.inference_rules.list_inference_roles()
+        elif parsed.path.startswith("/users/"):
+            key, rows = "groups", client.groups.list(user=parsed.path.split("/")[2])
+        else:
+            query = parse_qs(parsed.query)
+            kwargs = {key.removesuffix(".id"): values[0] for key, values in query.items() if key in {"user.id", "group.id"}}
+            key, rows = "role_assignments", client.role_assignments.list(**kwargs, system="all", effective=False)
+        if isinstance(rows, list):
+            rows = [vars(row) if isinstance(row, SimpleNamespace) else row for row in rows]
+        return None, {key: rows, "links": {"next": None}}
+    client.get.side_effect = get
+    return client
 
 
-@pytest.mark.parametrize("catalog", [
-    [],
-    [{"name": "admin"}],
-    [_ADMIN_ROLE | {"id": ""}],
-    [_ADMIN_ROLE | {"id": None}],
-    [_ADMIN_ROLE | {"id": 123}],
-    [_ADMIN_ROLE | {"name": "manager"}],
-    [_ADMIN_ROLE | {"domain_id": "default"}],
-    [_ADMIN_ROLE | {"domain": {"id": "default"}}],
-    [_ADMIN_ROLE, _ADMIN_ROLE | {"id": "other-admin-id"}],
-    [_ADMIN_ROLE, _ADMIN_ROLE],
-], ids=[
-    "empty", "missing-id", "empty-id", "null-id", "nonstring-id", "wrong-name", "domain-only",
-    "domain-object", "ambiguous", "duplicate",
-])
-async def test_native_admin_role_catalog_fails_closed(native_system_directory, catalog):
-    native_system_directory.catalog = {"roles": catalog}
-    assert _is_system_admin(_SYSTEM_USER) is False
-    assert native_system_directory.calls == [("/v3/roles", {"name": ["admin"]})]
+@pytest.mark.parametrize("kind", ["direct", "implied", "group", "group-implied"])
+async def test_raw_system_admin_ignores_empty_effective_system_expansion(system_directory, kind):
+    from drover.auth import _is_system_admin
 
-
-async def test_native_admin_role_catalog_uses_unique_global_not_domain_alias(native_system_directory):
-    native_system_directory.catalog = {"roles": [
-        _ADMIN_ROLE | {"id": "domain-admin-id", "domain_id": "default"}, _ADMIN_ROLE,
-    ]}
-    assert _is_system_admin(_SYSTEM_USER) is True
-    assert native_system_directory.calls[-1] == ("/v3/role_assignments", _DIRECT_SYSTEM_QUERY)
-
-
-@pytest.mark.parametrize("path", ["/v3/roles", "/v3/role_assignments"])
-@pytest.mark.parametrize("status", [400, 401, 403, 500])
-async def test_native_system_directory_http_failures_are_denied(native_system_directory, path, status):
-    native_system_directory.failure_path = path
-    native_system_directory.failure_status = status
-    assert _is_system_admin(_SYSTEM_USER) is False
-    assert native_system_directory.calls[-1][0] == path
-
-
-@pytest.mark.parametrize("path", ["/v3/roles", "/v3/role_assignments"])
-async def test_native_system_directory_malformed_response_is_denied(native_system_directory, path):
-    # HTTP succeeds, but native manager decoding raises for its missing collection key.
-    if path == "/v3/roles":
-        native_system_directory.catalog = {}
+    group = kind.startswith("group")
+    subject, identity = ("group", "operators") if group else ("user", "operator")
+    role_id = "parent-id" if "implied" in kind else "admin-id"
+    system_directory.groups.list.return_value = [{"id": "operators"}] if group else []
+    def assignments(**kwargs):
+        if kwargs.get("effective") is True:
+            return []  # Faithful Keystone behavior: never expand effective system assignments.
+        assert kwargs["system"] == "all" and "role" not in kwargs
+        if kwargs.get(subject) == identity:
+            return [{subject: {"id": identity}, "role": {"id": role_id}, "scope": {"system": {"all": True}}}]
+        return []
+    system_directory.role_assignments.list.side_effect = assignments
+    assert _is_system_admin("operator") is True
+    system_directory.roles.list.assert_called_once_with()
+    system_directory.groups.list.assert_called_once_with(user="operator")
+    assert all(call.kwargs["effective"] is False for call in system_directory.role_assignments.list.call_args_list)
+    if "implied" in kind:
+        system_directory.inference_rules.list_inference_roles.return_value = []
+    elif group:
+        system_directory.groups.list.return_value = []
     else:
-        native_system_directory.assignments = {}
-    assert _is_system_admin(_SYSTEM_USER) is False
-    assert native_system_directory.calls[-1][0] == path
+        system_directory.role_assignments.list.side_effect = None
+        system_directory.role_assignments.list.return_value = []
+    assert _is_system_admin("operator") is False
 
 
-@pytest.mark.parametrize("path", ["/v3/roles", "/v3/role_assignments"])
-async def test_native_system_directory_transport_exception_is_denied(native_system_directory, monkeypatch, path):
-    original_send = RequestsSession.send
-    attempted = []
+@pytest.mark.parametrize("boundary", ["catalog", "inferences", "groups", "assignments", "ambiguous", "cycle",
+                                        "partial_role", "partial_inference", "partial_group", "unknown_role",
+                                        "foreign_user", "foreign_group", "project_scope", "mixed_scope", "partial_scope"])
+async def test_raw_system_authority_unavailable_is_not_confirmed_revocation(system_directory, boundary):
+    from keystoneauth1 import exceptions as ks_exc
 
-    def failing_send(session, request, **kwargs):
-        if urlsplit(request.url).path == path:
-            attempted.append(path)
-            raise RequestsConnectionError("Synthetic directory connection failure")
-        return original_send(session, request, **kwargs)
+    from drover.auth import _is_system_admin
+    from drover.services.execution import ExecutionAuthorityUnavailable
 
-    monkeypatch.setattr(RequestsSession, "send", failing_send)
-    assert _is_system_admin(_SYSTEM_USER) is False
-    assert attempted == [path]
+    row = {"user": {"id": "operator"}, "role": {"id": "admin-id"}, "scope": {"system": {"all": True}}}
+    system_directory.role_assignments.list.return_value = [row]
+    lookups = {"catalog": system_directory.roles.list,
+               "inferences": system_directory.inference_rules.list_inference_roles,
+               "groups": system_directory.groups.list, "assignments": system_directory.role_assignments.list}
+    if boundary in lookups:
+        lookups[boundary].side_effect = ks_exc.ConnectFailure("synthetic directory outage")
+    elif boundary == "ambiguous":
+        system_directory.roles.list.return_value.append(SimpleNamespace(id="duplicate", name="admin", domain_id=None))
+    elif boundary == "cycle":
+        system_directory.inference_rules.list_inference_roles.return_value.append(
+            {"prior_role": {"id": "admin-id"}, "implies": [{"id": "parent-id"}]})
+    elif boundary == "partial_role":
+        system_directory.roles.list.return_value[0] = {"id": "admin-id"}
+    elif boundary == "partial_inference":
+        system_directory.inference_rules.list_inference_roles.return_value[0].pop("implies")
+    elif boundary == "partial_group":
+        system_directory.groups.list.return_value = [{}]
+    elif boundary == "unknown_role":
+        row["role"]["id"] = "missing-id"
+    elif boundary == "foreign_user":
+        row["user"]["id"] = "foreign"
+    elif boundary == "foreign_group":
+        row.pop("user")
+        row["group"] = {"id": "foreign"}
+    elif boundary == "project_scope":
+        row["scope"] = {"project": {"id": "target"}}
+    elif boundary == "mixed_scope":
+        row["scope"]["project"] = {"id": "target"}
+    else:
+        row["scope"] = {"system": {}}
+    with pytest.raises(ExecutionAuthorityUnavailable):
+        _is_system_admin("operator")
 
 
-async def test_system_admin_client_construction_exception_is_denied(native_system_directory, monkeypatch):
-    def unavailable(session=None):
-        raise RuntimeError("Synthetic internal endpoint unavailable")
+async def test_native_http_unavailable_system_authority_returns_503(system_directory):
+    from drover.services.execution import ExecutionAuthorityUnavailable
 
-    monkeypatch.setattr("drover.auth._resolve_internal_keystone_endpoint", unavailable)
-    assert _is_system_admin(_SYSTEM_USER) is False
-    assert native_system_directory.calls == []
+    with patch("drover.auth.validate_token", side_effect=ExecutionAuthorityUnavailable("unavailable")):
+        with pytest.raises(HTTPException) as error:
+            await require_token(Request({"type": "http", "headers": []}), "human-token", None)
+    assert error.value.status_code == 503
+
+
+@pytest.mark.parametrize("kind", ["application_credential", "trust", "token_only"])
+async def test_admin_owned_reduced_token_keeps_original_scope_and_role_id_ceiling(kind):
+    from drover.policy import authorize
+
+    response = _keystone_response("project-1")
+    body = response.json()
+    if kind == "application_credential":
+        body["token"]["methods"] = ["application_credential"]
+        body["token"]["application_credential"] = {"id": "reduced-id", "restricted": True}
+    elif kind == "trust":
+        body["token"]["OS-TRUST:trust"] = {
+            "id": "trust-id", "impersonation": True,
+            "trustor_user": {"id": "user-1"}, "trustee_user": {"id": "other"},
+        }
+    else:
+        body["token"]["methods"] = ["token"]
+    response._content = json.dumps(body).encode()
+    with (
+        patch("drover.auth._resolve_internal_keystone_endpoint", return_value="http://127.0.0.1/v3"),
+        patch("drover.auth.ks_session.Session.request", return_value=response) as request,
+        patch("drover.auth.current_project_role_map", return_value={"member": "role-member", "admin": "extra-id"}),
+        patch("drover.auth._is_system_admin", return_value=True) as system,
+    ):
+        info = validate_token("reduced-token", "project-1")
+        assert info["roles"] == ["member"]
+        assert info["credential_restricted"] is True and info["is_system_admin"] is False
+        assert info["token"] == "reduced-token" and info["project_id"] == "project-1"
+        assert not authorize("drover:admin", None, info, do_raise=False)
+        assert not authorize("drover:access:admin", None, info, do_raise=False)
+        assert request.call_args.args[1].upper() == "GET"
+        system.assert_not_called()
+        with pytest.raises(PermissionError, match="issued project scope"):
+            validate_token("reduced-token", "foreign")
+        assert all(call.args[1].upper() == "GET" for call in request.call_args_list)
+
+
+async def test_original_access_rule_credentials_are_rejected_before_native_authority_expansion():
+    response = _keystone_response("project-1")
+    body = response.json()
+    body["token"]["methods"] = ["application_credential"]
+    body["token"]["application_credential"] = {"id": "reduced", "access_rules": [{"method": "GET", "path": "/servers"}]}
+    response._content = json.dumps(body).encode()
+    with (
+        patch("drover.auth._resolve_internal_keystone_endpoint", return_value="http://127.0.0.1/v3"),
+        patch("drover.auth.ks_session.Session.request", return_value=response),
+        patch("drover.auth.current_project_role_map") as roles,
+        patch("drover.auth._is_system_admin") as system,
+        pytest.raises(PermissionError, match="access-rule"),
+    ):
+        validate_token("access-rule-token")
+    roles.assert_not_called()
+    system.assert_not_called()
+
+
+async def test_reduced_credential_cannot_publish_stored_admin_credential_even_with_issued_member():
+    from drover.policy import authorize
+
+    info = {"project_id": "project", "roles": ["member"],
+            "is_system_admin": True, "credential_restricted": True}
+    assert not authorize("drover:access:admin", None, info, do_raise=False)
+
+
+
+
+@pytest.mark.parametrize("body", [
+    {"role_assignments": [], "links": {"next": "http://127.0.0.1/next"}},
+    {"groups": [], "truncated": True},
+    {"roles": [{}]},
+    {"role_inferences": None},
+    {"groups": [], "links": None},
+])
+async def test_sdk_collection_guard_rejects_partial_metadata_before_materialization(body):
+    from drover.auth import _identity_collection
+
+    client = MagicMock()
+    client.get.return_value = (None, body)
+    key = next(iter(body))
+    with pytest.raises(ValueError, match="Keystone authority"):
+        _identity_collection(client, f"/{key}", key)
+    client.get.assert_called_once_with(f"/{key}")
+
+
+@pytest.mark.parametrize("kind", ["absent", "domain-local"])
+async def test_confirmed_non_system_principal_cannot_assert_global_admin(system_directory, kind):
+    from drover.auth import _is_system_admin
+
+    if kind == "domain-local":
+        system_directory.roles.list.return_value.append(
+            SimpleNamespace(id="domain-admin", name="admin", domain_id="other-domain"))
+        system_directory.role_assignments.list.return_value = [
+            {"user": {"id": "operator"}, "role": {"id": "domain-admin"}, "scope": {"system": {"all": True}}}]
+    assert _is_system_admin("operator") is False
+
+
+async def test_human_raw_admin_alternative_needs_no_target_project_grants(system_directory):
+    from drover.policy import authorize
+
+    system_directory.role_assignments.list.return_value = [
+        {"user": {"id": "user-1"}, "role": {"id": "admin-id"}, "scope": {"system": {"all": True}}}]
+    with (
+        patch("drover.auth._resolve_internal_keystone_endpoint", return_value="http://127.0.0.1/v3"),
+        patch("drover.auth.ks_session.Session.request", return_value=_keystone_response("project-1")),
+        patch("drover.auth.current_principal_state", return_value=(True, True)),
+        patch("drover.auth._current_project_roles", return_value=[]),
+    ):
+        info = await require_token(Request({"type": "http", "headers": []}), "human-token", None)
+    assert info["project_id"] == "project-1"
+    assert info["roles"] == [] and info["is_system_admin"] is True
+    assert authorize("drover:clusters:create", {"project_id": "target-project"}, info)
+
+
+@pytest.mark.parametrize("lookup", ["project", "system"])
+async def test_human_directory_unavailability_stays_503_through_native_auth(system_directory, lookup):
+    with (
+        patch("drover.auth._resolve_internal_keystone_endpoint", return_value="http://127.0.0.1/v3"),
+        patch("drover.auth.ks_session.Session.request", return_value=_keystone_response("project-1")),
+        patch("drover.auth.current_principal_state", return_value=(True, True)),
+        patch("drover.auth._current_project_roles", side_effect=ValueError("partial catalog") if lookup == "project" else None,
+              return_value=[]),
+    ):
+        if lookup == "system":
+            system_directory.inference_rules.list_inference_roles.return_value = None
+        with pytest.raises(HTTPException) as error:
+            await require_token(Request({"type": "http", "headers": []}), "human-token", None)
+    assert error.value.status_code == 503
+
+
+@pytest.mark.parametrize("collection", ["roles", "role_inferences", "groups", "role_assignments"])
+async def test_native_auth_collection_404_is_503_not_invalid_token(system_directory, collection):
+    from keystoneauth1 import exceptions as ks_exc
+
+    original_get = system_directory.get.side_effect
+    def get(path):
+        if path.split("?", 1)[0].rsplit("/", 1)[-1] == collection:
+            raise ks_exc.NotFound("synthetic collection endpoint unavailable")
+        return original_get(path)
+    system_directory.get.side_effect = get
+    with (
+        patch("drover.auth._resolve_internal_keystone_endpoint", return_value="http://127.0.0.1/v3"),
+        patch("drover.auth.ks_session.Session.request", return_value=_keystone_response("project-1")),
+        patch("drover.auth.current_principal_state", return_value=(True, True)),
+        pytest.raises(HTTPException) as error,
+    ):
+        await require_token(Request({"type": "http", "headers": []}), "human-token", None)
+    assert error.value.status_code == 503
+
+
+@pytest.mark.parametrize("marker", [False, 0, 0.0, "", [], {}])
+async def test_collection_next_rejects_all_non_null_falsy_markers(marker):
+    from drover.auth import _identity_collection
+
+    client = MagicMock()
+    client.get.return_value = (None, {"roles": [], "links": {"next": marker}})
+    with pytest.raises(ValueError, match="Incomplete Keystone authority"):
+        _identity_collection(client, "/roles", "roles")
+
+
+@pytest.mark.parametrize("marker", [0, 0.0, "", [], {}])
+async def test_collection_truncated_rejects_falsy_non_boolean_markers(marker):
+    from drover.auth import _identity_collection
+
+    client = MagicMock()
+    client.get.return_value = (None, {"roles": [], "links": {"next": None}, "truncated": marker})
+    with pytest.raises(ValueError, match="Incomplete Keystone authority"):
+        _identity_collection(client, "/roles", "roles")
+
+
+@pytest.mark.parametrize("metadata", [{}, {"links": {}}, {"links": {"next": None}},
+                                      {"truncated": None}, {"truncated": False}])
+async def test_complete_collection_allows_only_absent_null_or_false_markers(metadata):
+    from drover.auth import _identity_collection
+
+    client = MagicMock()
+    client.get.return_value = (None, {"roles": [], **metadata})
+    assert _identity_collection(client, "/roles", "roles") == []
