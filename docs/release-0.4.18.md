@@ -22,9 +22,22 @@ This patch changes the Drover Kolla role's project lookup only. It reuses Kolla'
 
 The wheel contains the Kolla role as shared data. An operator must install the 0.4.18 wheel for the task fix to reach Kolla; upgrading only the API/Worker containers leaves an installed 0.4.17 role unchanged. Registry mode selects numeric image tag `0.4.18`. Source-build mode uses a final metadata commit that pins the implementation commit's immutable full SHA; the release tag identifies that metadata commit, never a commit that tries to embed its own SHA.
 
-## Qualification status
+## Qualification and publication receipts
 
-Local Python 3.12.13 qualification passed: `uv lock --check`; `uv run --frozen --all-extras pytest tests` (**1807 passed, 3 skipped**); root Ruff; SDK pytest (**114 passed**) and Ruff; `uv build --wheel`; and `python3 scripts/check_architecture.py`. This was the implementation/version candidate before the separate source-pin metadata commit. Final exact-SHA CI, final wheel/image artifacts, publication and deployment remain pending. The release workflow builds the wheel on the numeric tag but does not independently wait for the reusable CI suite; publish only after the final metadata commit's full CI suite passes.
+- Implementation commit `a31b9fa` and source-pin metadata commit `5f7e9679cb23bbd731564d5f68ad9d4ca8928caf` (tag `0.4.18`, annotated object `aefe52c`). Exact-SHA dev CI for `5f7e967` succeeded: service, SDK, MariaDB smoke, wheel, Docker scan, and Build & Push.
+- Tag workflows succeeded on `0.4.18`: Release uploaded `drover-0.4.18-py3-none-any.whl`; Docker published `drover-api` digest `sha256:974c237366f5a3492bd68e9d42de804b8ac028976933f761101ca0041cdc8ad3` and `drover-worker` digest `sha256:436cf1c3fe8b58f60762e4671424a5dbb5d090bf3634d3ec23fba1333e71084a`. Both report revision `5f7e9679cb23bbd731564d5f68ad9d4ca8928caf`, `x86_64`, and version `0.4.18`.
+- Local Python 3.12 gates on the implementation: `uv run --frozen --all-extras pytest tests` (1807 passed, 3 skipped), SDK pytest (114 passed), Ruff, wheel build, and architecture check.
+
+## DMS Lab Drover-only rollout (2026-11-11)
+
+- Operator `/etc/kolla/pyproject.toml` moved drover from `0.4.17` to `tag = "0.4.18"`; `uv lock --upgrade-package drover` changed only the drover entry. Pre-change files were backed up under `/etc/kolla/.afterglow-drover-0418-backup-20261111T103652Z`. The installed role contains the Kolla `openstack_auth_cloud` selector.
+- Drover-only `genconfig --tags drover` exited 0 with `changed=0` on controllers 1–3.
+- Digest pins in `globals.d/zzz-authority-three-20261104.yml` moved from the 0.4.17 images to the 0.4.18 digests above. Rolling `reconfigure --tags drover --skip-tags haproxy --limit <host>` ran for controller3, controller2, then controller1; each exited 0 with `failed=0`.
+- Post-rollout gates: on every controller, `drover_api` runs the 0.4.18 digest, `/v1/health/ready` returned 200, and `drover_worker` is Up on the 0.4.18 digest.
+- Container identity comparison against the pre-rollout baseline changed exactly the six `drover_api`/`drover_worker` containers; all other containers (627 total in the snapshot, including HAProxy, ProxySQL and keepalived) kept their IDs.
+
+Not claimed: Palimpsest's Kolla precondition has the same missing-`cloud` pattern and was not changed by this release; Lumen/Waygate/Palimpsest reconfigure and the full five-service control play were not run; authenticated end-to-end cluster operations and guest acceptance were not exercised.
+
 
 ## Deployment boundary
 
