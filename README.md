@@ -54,7 +54,11 @@ Upgrade in order: **apply 004 → drain pre-upgrade mutation/callback jobs with 
 
 ## 0.4.18 Kolla 2026.1 authentication fix
 
-The Kolla Drover role now selects `openstack_auth_cloud` for its `openstack.cloud.project_info` service-project lookup. This fixes Kolla Ansible 2026.1 toolbox authentication, which requires an explicit cloud selector alongside the auth mapping. No Drover runtime, dependency, or database migration changes.
+The Kolla Drover role now selects `openstack_auth_cloud` for its `openstack.cloud.project_info` service-project lookup, required by Kolla Ansible 2026.1 toolbox authentication. Release notes: [0.4.18](docs/release-0.4.18.md). No Drover runtime, dependency, or database migration changes.
+
+## 0.4.17 quota admission and worker revocation fence
+
+Prepared **2026-11-04 Asia/Seoul (UTC+09:00)**; not published or deployed. Cluster creation now checks actual project security-group/rule quota before credentials/queueing and again before worker writes. Structured shortages support localized guidance without raising existing quotas. Only unkeyed preflight refusals assert no operation was admitted; keyed overlaps retain receipt-readback semantics. Quota failures terminalize without replay, and stale heartbeat renewal cannot restore revoked worker ownership. No dependency or schema migration is introduced. Deprecated/removed features: **None / 없음**. See [release notes](docs/release-0.4.17.md) and [changelog](CHANGELOG.md) for qualification and rollout boundaries.
 
 ## Native scoped access and credential smoke
 
