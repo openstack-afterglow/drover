@@ -326,9 +326,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "686ed9a1bf112b524b56adef1f426bf809508fef1f759372aff06e7be8e5c325",
-  "reviewed_at": "2026-11-11T10:26:21Z",
-  "summary": "0.4.18: explicitly select Kolla 2026.1 openstack_auth_cloud for Drover service-project lookup; no service runtime, dependency or schema change."
+  "source_sha256": "d5a2021cbb69ec32da057633f068627737b78b580e59ff4f9c2bcddc08c5160c",
+  "reviewed_at": "2026-11-11T10:33:13Z",
+  "summary": "0.4.18 source-build metadata: pin release source to implementation a31b9fa; Kolla auth-cloud selector unchanged; no runtime, dependency or schema change."
 }
 ```
 <!-- architecture-review:end -->
