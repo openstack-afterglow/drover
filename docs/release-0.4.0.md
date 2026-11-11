@@ -633,3 +633,6 @@ Extend actual image execution to settings/authority/native endpoint and drain ac
 
 The authorized canonical Kolla rollout, coordinated whole-cohort stop, immutable publication, controller parity and production readiness are complete as recorded in the [production receipt](#tagged-0415-publication-and-dms-lab-production-rollout--2026-10-14). The pre-cutover read-only baseline was 0.4.14 (`f7daeec`), with all four migration ledger entries matching the integrated manifest by path and SHA-256; 0.4.15 retained that ledger without migration. For future rollouts, use reviewed inventory, inspected peer/proxy addresses and the deployment venv PATH; preserve shared services/data/volumes and existing fixtures. Authenticated native workload/guest acceptance and Sentinel failover remain distinct from the observed rollout and readiness, not pending CI/publication/production cutover.
 
+## 0.4.18 Kolla auth fix
+
+The source change and release/rollout boundaries are tracked in [Drover 0.4.18 release notes](release-0.4.18.md). It adds the explicit Kolla cloud selector to the service-project lookup; no runtime or schema behavior changes.

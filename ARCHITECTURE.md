@@ -12,6 +12,10 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker들이 SQL lease를 얻어 OpenStack 작업을 실행한다. Redis server-time membership은 Worker의 discovery/recovery/reconciliation/delegation 역할과 health/Stampede target 소유권을 분배한다. DB job consumer는 Redis leader 아래로 이동하지 않는다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 credential 없는 임시 ownership·callback token·짧은 상태/헬스 캐시·stampede 이벤트 같은 보조 저장소다.
 
+### Kolla 2026.1 auth-cloud selector candidate 0.4.18
+
+Drover's Kolla `config.yml` resolves the service project with `openstack.cloud.project_info`. Kolla Ansible 2026.1 requires `openstack_auth_cloud` alongside `openstack_auth`; omitting the explicit cloud selector fails with missing `auth_url` before config rendering. The role now supplies the selected Kolla cloud. This is a Kolla task/package compatibility fix only: no Drover runtime, dependency, migration, database or service-authority change. Exact-SHA tests and release/rollout evidence are tracked in `docs/release-0.4.18.md`.
+
 ### Standard project-role candidate 0.4.16
 
 Candidate source starts at remote `dev` `ea0bc07`, separate from the extensive stale shared-checkout work. `auth.py` validates original credentials before rescope, fresh exact enabled principal/project/domain, complete global catalog and actual role-ID DAG, native effective project assignments and raw user/group system grants. `current_project_role_state` remains the provider credential-inference interface. Domain-local aliases never assert global core names.
@@ -230,7 +234,7 @@ FastAPI `>=0.132`의 기본 strict content-type 검사에 따라 JSON body를 �
 - `drover-worker` (`drover.worker:main`): jobs lease executor, callback recovery, reconciliation, health, Stampede loop. API process와 독립적으로 실행해야 한다.
 - `drover-migrate` (`drover.scripts.migrate:main`): `manifest.txt` checksum ledger를 적용·검사하며 API/Worker보다 schema를 먼저 준비한다.
 - `drover-sdk`: `sdk/`의 독립 Python package이며 API/Worker process에 import되어야 하는 내부 module이 아니다.
-- `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다.
+- `deploy/kolla/`: API, Worker, migrate container와 Keystone catalog registration/config를 Kolla-Ansible 자산으로 제공한다. Keystone service-project lookup은 `openstack_auth_cloud` 선택자를 명시해 Kolla 2026.1 toolbox가 `openstack_auth`의 암호만으로 인증하지 않게 한다.
 - 루트 `drover` wheel은 `deploy/kolla/ansible/roles/drover`를 `share/kolla-ansible/ansible/roles/drover` shared data로 설치한다. 기본 wheel은 Kolla-Ansible이나 서비스 runtime dependency를 설치하지 않으며 API/Worker/migration 실행에는 `drover[service]`가 필요하다.
 - Historical 0.4.13 registry default `v0.4.13`, source pin `c6ecd6dd84b83d520765d9e02e6ebcbb2df9a95d` and exact immutable revision `2201253` are distinct; these are not the current candidate defaults. [0.4.13 native receipt](docs/release-0.4.0.md#tagged-0413-publication-and-canonical-rollout) records operator wheel/20role files/lock, three-controller rollout, six-container version/revision/schema hash, Stampede gate, direct/VIP/public200 and non-Drover container ID/image preservation. That historical rollout did not overwrite Afterglow/other globals. Published amd64+attestation and local amd64/arm64 evidence are distinct; Ready is not a substitute for actual CSI/LB/TLS/auth/KMS/CPU/GPU consumer-path acceptance.
 - `drover_run_preconditions`의 기본값은 `true`다. `tasks/deploy.yml`은 이 flag로 DB·Keystone resource 생성만 조건부 실행하며 `bootstrap_service.yml` migration과 `start.yml`은 계속 실행한다. 기존 DB·catalog를 확인한 2026-10-06 DMSLab 재배포는 ProxySQL의 기존 `kolla_root` 생성 권한 거부 때문에 operator override를 `false`로 두었다. 신규 설치는 기본값을 유지해야 한다. API에만 Docker healthcheck가 있으므로 Worker 실행 여부와 durable job 성공은 별도로 검증한다. 실제 v0.4.3 digest·세 controller·외부 endpoint 검증은 아래 릴리스 기록을 따른다.
@@ -322,9 +326,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "0dd39544c7566606f2353c5fa32d509e264500218da763705d259b48b813ca50",
-  "reviewed_at": "2026-11-04T12:23:15Z",
-  "summary": "0.4.17 final release metadata pins immutable implementation adea1ae71bfa9c80f76273054ce027313561cf14; runtime/dependencies/templates/migrations unchanged from implementation; numeric-tag exact-SHA publication and no-deployment boundaries documented."
+  "source_sha256": "686ed9a1bf112b524b56adef1f426bf809508fef1f759372aff06e7be8e5c325",
+  "reviewed_at": "2026-11-11T10:26:21Z",
+  "summary": "0.4.18: explicitly select Kolla 2026.1 openstack_auth_cloud for Drover service-project lookup; no service runtime, dependency or schema change."
 }
 ```
 <!-- architecture-review:end -->

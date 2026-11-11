@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.18 — local release candidate
+
+### 한국어
+
+- 버전: **0.4.18**.
+- 릴리스 일자: **미발행**; 준비일 **2026-11-11 Asia/Seoul (UTC+09:00)**.
+- 배포 일자: **미배포**; 발행과 운영 배포를 구분합니다.
+- 변경/수정: Kolla Ansible 2026.1에서 Drover service-project lookup이 `auth_url` 누락으로 실패하지 않도록 `openstack.cloud.project_info`에 `openstack_auth_cloud`를 명시합니다. 기존 Kolla 인증 설정을 사용하며 Drover runtime 동작은 변경하지 않습니다.
+- 폐기/제거: **없음**. 의존성, DB schema/migration, 서비스 authority 변경이 없습니다.
+
+### English
+
+- Version: **0.4.18**.
+- Release date: **Not published**; prepared **2026-11-11 Asia/Seoul (UTC+09:00)**.
+- Deployment date: **Not deployed**; publication and production rollout are separate.
+- Changes/fixes: explicitly select `openstack_auth_cloud` for Drover's `openstack.cloud.project_info` service-project lookup, fixing Kolla Ansible 2026.1 toolbox authentication when an auth mapping alone lacks `auth_url`. Reuses existing Kolla auth configuration; Drover runtime behavior is unchanged.
+- Deprecated/removed: **None**. No dependency, schema/migration, or service-authority changes.
+
+See [0.4.18 release notes](docs/release-0.4.18.md) for exact-SHA qualification and deployment boundaries.
+
 ## 0.4.17 — local release candidate
 
 ### 한국어

@@ -5,6 +5,7 @@
     module_name: openstack.cloud.project_info
     module_args:
       auth: "{{ openstack_auth }}"
+      cloud: "{{ openstack_auth_cloud }}"
       name: "{{ drover_service_project_name }}"
   register: drover_service_project_lookup
   changed_when: false

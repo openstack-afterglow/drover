@@ -204,7 +204,8 @@ def test_config_resolution_and_rendering():
     config_file = ROLE_DIR / "tasks" / "config.yml"
     tasks = yaml.safe_load(config_file.read_text(encoding="utf-8"))
 
-    assert any("openstack.cloud.project_info" in t.get("module_name", "") or "project_info" in str(t) for t in tasks)
+    project_lookup = next(t for t in tasks if t.get("kolla_toolbox", {}).get("module_name") == "openstack.cloud.project_info")
+    assert project_lookup["kolla_toolbox"]["module_args"]["cloud"] == "{{ openstack_auth_cloud }}"
     assert any("ansible.builtin.assert" in t for t in tasks)
 
     tpl_task = next(t for t in tasks if t.get("ansible.builtin.template", {}).get("src") == "drover.conf.j2")
