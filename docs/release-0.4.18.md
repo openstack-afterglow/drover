@@ -34,10 +34,10 @@ The wheel contains the Kolla role as shared data. An operator must install the 0
 - Drover-only `genconfig --tags drover` exited 0 with `changed=0` on controllers 1–3.
 - Digest pins in `globals.d/zzz-authority-three-20261104.yml` moved from the 0.4.17 images to the 0.4.18 digests above. Rolling `reconfigure --tags drover --skip-tags haproxy --limit <host>` ran for controller3, controller2, then controller1; each exited 0 with `failed=0`.
 - Post-rollout gates: on every controller, `drover_api` runs the 0.4.18 digest, `/v1/health/ready` returned 200, and `drover_worker` is Up on the 0.4.18 digest.
-- Container identity comparison against the pre-rollout baseline changed exactly the six `drover_api`/`drover_worker` containers; all other containers (627 total in the snapshot, including HAProxy, ProxySQL and keepalived) kept their IDs.
 
 Not claimed: Palimpsest's Kolla precondition has the same missing-`cloud` pattern and was not changed by this release; Lumen/Waygate/Palimpsest reconfigure and the full five-service control play were not run; authenticated end-to-end cluster operations and guest acceptance were not exercised.
-
+- Container identity comparison against the pre-rollout baseline (627 containers in the snapshot) changed exactly the six `drover_api`/`drover_worker` containers; the other 621 kept their IDs, including HAProxy, ProxySQL and keepalived.
+- Worker and durable-job gate (read-only, 2026-11-11 ~10:52Z): all three `drover_worker` containers were Up with 0 restarts after cutover. Each log contains no Traceback. Controller3 logged one `reconcile` job completion with `outcome=error` at 10:46:53Z (job `6c6087df…`, `last_error` "Keystone no longer honors the cluster application credential"). That exact error recurs about 12 times per hour since at least 2026-11-10 00:00Z, so it predates this rollout. Three reconcile jobs failed in the 10:40–10:55Z window; only the one above was checked individually. `drover_jobs` and `drover_operations` had zero non-terminal rows at the probe time, so no queued or running work was left stranded.
 
 ## Deployment boundary
 
