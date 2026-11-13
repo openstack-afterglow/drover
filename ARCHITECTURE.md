@@ -330,9 +330,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "478a7d3010dc216b01112dfe08b695dc718c3b79b2478a00a022e40336d28134",
-  "reviewed_at": "2026-11-13T07:53:07Z",
-  "summary": "0.4.19: route existing tenant delete-async through atomic durable job admission and persisted SSE event replay; API path/progress schema retained, no DB migration."
+  "source_sha256": "fb2a4f4fb6becb115b6e8ca2246e26e995f9ba746e16b033268a46cb47e34953",
+  "reviewed_at": "2026-11-13T07:55:49Z",
+  "summary": "0.4.19 release metadata pins the durable delete SSE implementation SHA; schema and dependencies unchanged."
 }
 ```
 <!-- architecture-review:end -->

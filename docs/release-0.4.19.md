@@ -24,7 +24,7 @@ The worker remains the sole owner of cloud cleanup. Existing safe-delete and fai
 
 ## Qualification status
 
-Local Python 3.12.13 qualification passed: `uv lock --check`; `uv run pytest tests/test_k3s_clusters.py -q` (**58 passed**); full `uv run --frozen --all-extras pytest tests` (**1807 passed, 3 skipped**); root Ruff; SDK pytest (**114 passed**) and Ruff; `uv build --wheel`; architecture check/stamp. Both Docker targets built with `--no-cache --platform linux/amd64`; each imported version `0.4.19`. Final source-pin metadata SHA, remote CI, tag publication and deployment remain pending. The wheel Release workflow does not independently wait for the reusable CI suite, so tag only after final exact-SHA CI passes.
+Local Python 3.12.13 qualification passed: `uv lock --check`; `uv run pytest tests/test_k3s_clusters.py -q` (**58 passed**); full `uv run --frozen --all-extras pytest tests` (**1807 passed, 3 skipped**); root Ruff; SDK pytest (**114 passed**) and Ruff; `uv build --wheel`; architecture check/stamp. Both Docker targets built with `--no-cache --platform linux/amd64`; each imported version `0.4.19`. Source-build mode pins implementation `762fac3dd896e49e22e86c94a1b55ae77f293e47`; exact-SHA CI, tag publication and deployment remain pending. The wheel Release workflow does not independently wait for the reusable CI suite, so tag only after final exact-SHA CI passes.
 
 ## Deployment and recovery boundary
 

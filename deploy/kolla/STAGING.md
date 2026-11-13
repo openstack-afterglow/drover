@@ -39,7 +39,7 @@ Kolla registry metadata is v0.4.15; source-build mode asserts source `314c7a6ab7
 
 ## 0.4.19 durable tenant deletion candidate
 
-Prepared 2026-11-13; not yet published or deployed. Tenant `POST /v1/clusters/{id}/delete-async` now enqueues/reuses the requester-trusted durable delete job and streams persisted operation events. A disconnected client no longer cancels cleanup, and reconnecting replays progress. The Kolla role/image version is `0.4.19`; no schema or dependency change is intended.
+Prepared 2026-11-13; not yet published or deployed. Tenant `POST /v1/clusters/{id}/delete-async` now atomically enqueues/reuses a requester-trusted durable delete job and streams persisted operation events. A disconnected client no longer cancels cleanup; reconnecting replays progress. Registry mode uses `0.4.19`; source-build mode pins implementation `762fac3dd896e49e22e86c94a1b55ae77f293e47` from the separate release-metadata commit. No schema or dependency change is intended.
 
 ## 0.4.18 Kolla 2026.1 auth-cloud selector — published and deployed
 
