@@ -23,6 +23,7 @@ from fastapi.responses import Response, StreamingResponse
 from openstack.exceptions import ResourceNotFound
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from sqlalchemy import select
 from sqlalchemy.exc import InterfaceError, OperationalError
 from starlette.requests import Request
 
@@ -48,7 +49,6 @@ from drover.services.activity import rec
 from drover.services.cache import cached_call, invalidate, ttl_normal
 from drover.services.cache import invalidation as cache_invalidation
 from drover.services.cache import keys as cache_keys
-from drover.services.deletion import delete_cluster_progress as _delete_cluster_progress
 from drover.services.store import ClusterInventoryUnavailable
 from drover.utils.ssh_keys import normalize_ssh_public_key
 
@@ -260,6 +260,204 @@ def _map_phase_to_step(phase: str) -> K3sProgressStep:
             return K3sProgressStep.FAILED
         return K3sProgressStep.SERVER_CREATING
 
+_DELETE_PROGRESS_BY_STEP = {
+    K3sProgressStep.DELETE_INIT: 5,
+    K3sProgressStep.DELETE_K8S_NODES: 15,
+    K3sProgressStep.DELETE_AGENT_VMS: 35,
+    K3sProgressStep.DELETE_LB_CLEANUP: 50,
+    K3sProgressStep.DELETE_SERVER_VM: 70,
+    K3sProgressStep.DELETE_SECURITY_GROUP: 85,
+    K3sProgressStep.DELETE_APP_CREDENTIAL: 95,
+    K3sProgressStep.DELETE_RECORD: 98,
+    K3sProgressStep.COMPLETED: 100,
+}
+
+
+async def _enqueue_cluster_delete(
+    request: Request,
+    cluster_id: str,
+    project_id: str,
+    token_info: dict,
+    conn: openstack.connection.Connection,
+) -> str | None:
+    """Atomically persist a delete job and DELETING state; return its operation ID."""
+    from drover.api.delegated import admitted_operation
+    from drover.db import get_session_factory
+    from drover.models.orm import K3sCluster
+    from drover.services import cluster_authority, delegation
+
+    factory = get_session_factory()
+    if factory is None:
+        raise HTTPException(status_code=503, detail="Durable job storage is unavailable")
+    operation_id: str | None = None
+
+    async def locked_cluster(session):
+        stmt = select(K3sCluster).where(
+            K3sCluster.id == cluster_id,
+            K3sCluster.project_id == project_id,
+        ).with_for_update()
+        return (await session.execute(stmt)).scalar_one_or_none()
+
+    # Repeated UI requests attach to the existing durable operation instead of
+    # creating another delete job.
+    async with factory() as session, session.begin():
+        cluster = await locked_cluster(session)
+        if cluster is None:
+            raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
+        if cluster.deleted_at is not None:
+            return None
+        active = await operations.get_active_operation(session, cluster_id, kind="delete")
+        if active is not None:
+            operation_id = active.id
+            if cluster.status != "DELETING":
+                cluster.status = "DELETING"
+                cluster.updated_at = datetime.now(UTC)
+
+    if operation_id is None:
+        request_id = getattr(request.state, "correlation_id", None) or request.headers.get("x-openstack-request-id")
+        async with (
+            admitted_operation(
+                token_info, project_id=project_id, cluster_id=cluster_id, action=delegation.ACTION_DELETE
+            ) as admitted,
+            factory() as session,
+            session.begin(),
+        ):
+            cluster = await locked_cluster(session)
+            if cluster is None:
+                raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
+            if cluster.deleted_at is not None:
+                return None
+            active = await operations.get_active_operation(session, cluster_id, kind="delete")
+            if active is not None:
+                operation_id = active.id
+                if cluster.status != "DELETING":
+                    cluster.status = "DELETING"
+                    cluster.updated_at = datetime.now(UTC)
+            else:
+                await _jobs.enqueue_job(
+                    cluster_id=cluster_id,
+                    project_id=project_id,
+                    kind="delete",
+                    payload={
+                        "user_id": token_info.get("user_id"),
+                        "username": token_info.get("username"),
+                    },
+                    user_id=token_info.get("user_id"),
+                    username=token_info.get("username"),
+                    request_id=request_id,
+                    session=session,
+                    delegation=admitted,
+                )
+                active = await operations.get_active_operation(session, cluster_id, kind="delete")
+                if active is None:
+                    raise RuntimeError("Durable delete job has no operation")
+                operation_id = active.id
+                cluster.status = "DELETING"
+                cluster.updated_at = datetime.now(UTC)
+
+    try:
+        await cluster_authority.retire_owned(
+            conn,
+            cluster_id=cluster_id,
+            owner_user_id=token_info.get("user_id") or "",
+            states=("staged", "active", "retiring"),
+        )
+    except Exception:
+        _logger.warning("k3s cluster %s: caller-owned credential revocation deferred to owner", cluster_id)
+    return operation_id
+
+
+async def _delete_operation_progress(operation_id: str, cluster_id: str) -> AsyncGenerator[str, None]:
+    """Replay persisted deletion operation events; disconnecting never cancels the worker job."""
+    started = time.monotonic()
+    last_sequence = 0
+    last_step = K3sProgressStep.DELETE_INIT
+    last_progress = 5
+    terminal_event_seen = False
+    yield ": " + " " * 2048 + "\n\n"
+
+    while True:
+        events = await operations.get_operation_events(None, operation_id, since_sequence=last_sequence)
+        for event in events:
+            last_sequence = max(last_sequence, event.sequence)
+            payload = event.payload_json if isinstance(event.payload_json, dict) else {}
+            error = payload.get("error")
+            if event.phase == "job_failed":
+                step = K3sProgressStep.FAILED
+                progress = 0
+                terminal_event_seen = True
+            elif event.phase == "job_completed":
+                step = K3sProgressStep.COMPLETED
+                progress = 100
+                terminal_event_seen = True
+            elif event.phase == "job_attempt_failed":
+                step = last_step
+                progress = last_progress
+            elif event.phase == "job_enqueued":
+                step = K3sProgressStep.DELETE_INIT
+                progress = _DELETE_PROGRESS_BY_STEP[step]
+            else:
+                step = _map_phase_to_step(event.phase)
+                if step not in _DELETE_PROGRESS_BY_STEP and step != K3sProgressStep.FAILED:
+                    continue
+                progress = int(payload.get("progress", _DELETE_PROGRESS_BY_STEP.get(step, last_progress)))
+                if step in {K3sProgressStep.COMPLETED, K3sProgressStep.FAILED}:
+                    terminal_event_seen = True
+            last_step, last_progress = step, progress
+            message = event.message or ""
+            if event.phase == "job_enqueued":
+                message = "클러스터 삭제 작업이 대기열에 등록되었습니다"
+            msg = K3sProgressMessage(
+                step=step,
+                progress=progress,
+                message=message,
+                cluster_id=cluster_id,
+                operation_id=operation_id,
+                sequence=event.sequence,
+                error=error,
+                elapsed_seconds=round(time.monotonic() - started, 1),
+            )
+            yield f"data: {msg.model_dump_json()}\n\n"
+
+        operation = await operations.get_operation(None, operation_id)
+        if operation is None:
+            final_step = K3sProgressStep.FAILED
+            final_progress = 0
+            final_message = "삭제 작업 상태를 조회할 수 없습니다"
+            final_error = final_message
+            terminal = True
+        elif operation.status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+            terminal = True
+            if not terminal_event_seen:
+                final_step = (
+                    K3sProgressStep.COMPLETED
+                    if operation.status == "SUCCEEDED"
+                    else K3sProgressStep.FAILED
+                )
+                final_progress = 100 if operation.status == "SUCCEEDED" else 0
+                final_message = (
+                    "클러스터 삭제 완료"
+                    if operation.status == "SUCCEEDED"
+                    else operation.error or "클러스터 삭제 작업이 실패했습니다"
+                )
+                final_error = None if operation.status == "SUCCEEDED" else operation.error
+        else:
+            terminal = False
+
+        if terminal:
+            if not terminal_event_seen or operation is None:
+                msg = K3sProgressMessage(
+                    step=final_step,
+                    progress=final_progress,
+                    message=final_message,
+                    cluster_id=cluster_id,
+                    operation_id=operation_id,
+                    error=final_error,
+                    elapsed_seconds=round(time.monotonic() - started, 1),
+                )
+                yield f"data: {msg.model_dump_json()}\n\n"
+            break
+        await asyncio.sleep(0.1)
 
 @router.post("/async")
 @limiter.limit("5/minute")
@@ -687,7 +885,6 @@ async def delete_k3s_cluster(
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
     if not cluster:
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
-
     if cluster.get("deleted_at"):
         return
 
@@ -697,35 +894,7 @@ async def delete_k3s_cluster(
     except Exception:
         pass
 
-    from drover.api.delegated import admitted_operation
-    from drover.services import cluster_authority, delegation
-
-    # Deletion runs under the current actor's own trust; the creator's grant is never needed.
-    async with admitted_operation(
-        token_info, project_id=project_id, cluster_id=cluster_id, action=delegation.ACTION_DELETE
-    ) as admitted:
-        await _jobs.enqueue_job(
-            cluster_id=cluster_id,
-            project_id=project_id,
-            kind="delete",
-            payload={
-                "user_id": token_info.get("user_id"),
-                "username": token_info.get("username"),
-            },
-            user_id=token_info.get("user_id"),
-            username=token_info.get("username"),
-            delegation=admitted,
-        )
-    await k3s_cluster.update_cluster_status(project_id, cluster_id, "DELETING")
-    # Keystone forbids delegated tokens from deleting application credentials, so the actor's own credentials
-    # are revoked now with the actor's token; others are erased and reported by the delete job.
-    try:
-        await cluster_authority.retire_owned(
-            conn, cluster_id=cluster_id, owner_user_id=token_info.get("user_id") or "",
-            states=("staged", "active", "retiring"),
-        )
-    except Exception:
-        _logger.warning("k3s cluster %s: caller-owned credential revocation deferred to owner", cluster_id)
+    await _enqueue_cluster_delete(request, cluster_id, project_id, token_info, conn)
 
 
 @router.post("/{cluster_id}/delete-async")
@@ -736,7 +905,7 @@ async def delete_k3s_cluster_async(
     conn: openstack.connection.Connection = Depends(get_os_conn),
     token_info: dict = Depends(get_token_info),
 ):
-    """k3s 클러스터 삭제 — SSE 스트리밍 진행률 반환."""
+    """Queue durable deletion and stream persisted operation progress."""
     project_id = conn._afterglow_project_id
     authorize("drover:clusters:delete", {"project_id": project_id}, token_info)
     cluster = await k3s_cluster.get_cluster(project_id, cluster_id)
@@ -749,36 +918,26 @@ async def delete_k3s_cluster_async(
     except Exception:
         pass
 
-    async def gen() -> AsyncGenerator[str, None]:
-        yield ": " + " " * 2048 + "\n\n"
-        start = time.monotonic()
-        if cluster.get("deleted_at"):
+    operation_id = await _enqueue_cluster_delete(request, cluster_id, project_id, token_info, conn)
+    if operation_id is None:
+        async def already_deleted() -> AsyncGenerator[str, None]:
+            yield ": " + " " * 2048 + "\n\n"
             msg = K3sProgressMessage(
                 step=K3sProgressStep.COMPLETED,
                 progress=100,
                 message="이미 삭제된 클러스터입니다",
+                cluster_id=cluster_id,
                 elapsed_seconds=0.0,
             )
             yield f"data: {msg.model_dump_json()}\n\n"
-            return
-        try:
-            async for msg in _delete_cluster_progress(
-                conn, project_id, cluster, token_info, credential_owner_user_id=token_info.get("user_id") or None
-            ):
-                msg.elapsed_seconds = round(time.monotonic() - start, 1)
-                yield f"data: {msg.model_dump_json()}\n\n"
-        except Exception as e:
-            _logger.error("k3s cluster %s async delete failed: %s", cluster_id, e, exc_info=True)
-            fail = K3sProgressMessage(
-                step=K3sProgressStep.FAILED,
-                progress=0,
-                message=f"삭제 실패: {e}",
-                error=str(e),
-                elapsed_seconds=round(time.monotonic() - start, 1),
-            )
-            yield f"data: {fail.model_dump_json()}\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
+        return StreamingResponse(already_deleted(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    return StreamingResponse(
+        _delete_operation_progress(operation_id, cluster_id),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
 
 
 # ---------------------------------------------------------------------------

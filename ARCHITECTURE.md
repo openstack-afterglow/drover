@@ -6,11 +6,15 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: 발행·DMS Lab 배포한 `drover==0.4.14` (`f7daeec`, source pin `7f9f439`)은 기존 0.4.13의 Stampede 기본 활성화·명시적 false opt-out·GPU 타입 label을 유지하며, flavor metadata 실패를 전파하고 초기 agent를 control-plane 자원 생성 전에 preflight하며 GPU NoSchedule용 CSI node toleration을 좁게 추가한다. Service1430/3skip·SDK114, 실제 local API/Worker amd64/arm64와 발행 amd64 실행, controller3대 source/digest/readiness, 새 fixture의 GPU0→1·RTX3060 실행·Cinder ext4 RWO/Manila NFSv4 RWX I/O·자연1→0 SUCCEEDED 및 VM/Node/volume404·정리/보존을 확인했다. 기존 guest/Node 자동 retrofit, 권한·schema·SDK 버전 변경은 없다. [0.4.14 live receipts](docs/release-0.4.0.md#live-0414-gpu-csi-and-natural-scale-in-acceptance)는 native provider NIC 전제조건과 동시 OpenSearch 작업으로 중단된 c2 LB census, c3 `--skip-tags haproxy` 재개 경계를 구분한다.
+- 패키지: 현재 발행·DMS Lab 배포 버전은 `drover==0.4.18`이다. Kolla 2026.1 toolbox의 service-project lookup에 명시 `openstack_auth_cloud`를 전달한다; 배포 receipt는 [`docs/release-0.4.18.md`](docs/release-0.4.18.md) 참조.
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
-**Current published/deployed release — 0.4.15 (2026-10-14):** preserved public WIP integrated into latest fetched dev; source `314c7a6ab743e7ee766ade41e11ddcb0040e3797` is pinned by release-metadata commit `977a1cad411cc0eafb5a92090bdced272de0611a`. Exact-SHA CI and tag `v0.4.15` Release/Docker workflows succeeded; published amd64 images carry OCI revision `977a1cad`. Local service **1,560 passed / 3 skipped**, SDK **114**, both Ruff checks, amd64/arm64 API/Worker execution, arm64 ownership smoke exit0 and wheel receipts remain separate evidence. DMS Lab stopped all 3 APIs and 3 workers with exit0, verified cold restore **16 tables / 75,225 rows**, needed **no migration (4/4)** and no generated-config change. All **6 replicas** ran pinned digests/revision with **0 restarts**, APIs healthy, readiness **200×3 + public**, and no error log lines after start. Drover's REDIS_URL points at the dms-controller1 read-only Valkey replica (Sentinel master on dms-controller3); no Drover error was observed after cutover, not proof of write availability/failover. The 0.4.14 guest receipt above is historical, not new guest acceptance. See [0.4.15 qualification and production receipts](docs/release-0.4.0.md#0415-patch--latest-dev-wip-integration-and-distributed-worker-cutover).
+**Current published/deployed release — 0.4.18 (2026-11-11):** tag Release/Docker workflows and the root wheel succeeded. The Kolla 2026.1 auth-cloud fix was installed on all three DMS Lab controllers through Drover-only reconfigure; every API readiness check returned 200. Exactly six Drover API/Worker containers changed; the other 621 of 627 IDs, including HAProxy, ProxySQL and keepalived, remained unchanged. Worker/database evidence and limits are in [`docs/release-0.4.18.md`](docs/release-0.4.18.md). The 0.4.19 candidate makes tenant `delete-async` durable; publication and rollout are pending.
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker들이 SQL lease를 얻어 OpenStack 작업을 실행한다. Redis server-time membership은 Worker의 discovery/recovery/reconciliation/delegation 역할과 health/Stampede target 소유권을 분배한다. DB job consumer는 Redis leader 아래로 이동하지 않는다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 credential 없는 임시 ownership·callback token·짧은 상태/헬스 캐시·stampede 이벤트 같은 보조 저장소다.
+
+### Durable tenant delete SSE candidate 0.4.19
+
+Afterglow's existing tenant delete buttons call `POST /v1/clusters/{id}/delete-async`. This route now atomically enqueues/reuses the requester-trusted durable delete job and sets `DELETING`, then streams persisted operation events. Disconnect/reconnect no longer owns or cancels cleanup; the worker continues and the same route replays event history. The caller-owned credential retirement remains an admission-side attempt. No API path, guest/runtime behavior, or schema changes.
 
 ### Kolla 2026.1 auth-cloud selector candidate 0.4.18
 
@@ -139,7 +143,7 @@ HA joiner(server 2·3)는 `cloud_conf=None`으로 OCCM/CSI manifest용 cloud.con
 - SSE 재연결은 `GET /v1/operations/{operation_id}`와 `GET /v1/operations/{operation_id}/events?since_sequence=N`으로 DB event sequence를 replay한다. SDK `Proxy`는 operation 상태를 조회할 수 있지만 서버 작업을 HTTP 연결 수명에 묶지 않는다.
 - Durable event `message`는 ORM/producer부터 nullable이며 API의 `DroverOperationEventInfo`도 필수 key에 `str | None`을 허용한다. payload-only readiness 이벤트를 빈 문자열로 바꾸거나 DB를 수정하지 않고 phase/sequence/payload와 그대로 반환한다. `since_sequence` replay·project ownership과 SDK의 JSON retrieval은 유지한다(`api/operations.py:_event_to_info`, `models/schemas.py`, `services/operations.py:append_operation_event`, `tests/test_operations_api.py`).
 - `PATCH /v1/clusters/{cluster_id}/scale`, nodegroup 조정 및 일반 delete는 durable job으로 enqueue된다. 현재 이 경로에는 create와 같은 외부 idempotency key 재사용/operation ID 응답 계약이 없다. 호출자는 자동 재시도 대신 correlation ID와 cluster 상태를 확인해야 한다.
-- 예외: 현재 tenant `POST /v1/clusters/{id}/delete-async`는 `_delete_cluster_progress`에 caller connection을 직접 전달하는 SSE 경로다. durable job/trust admission 또는 disconnect 이후 계속 실행되는 계약이 없으며 caller 소유 credential도 이 connection으로 회수한다. durable tenant DELETE와 admin delete의 operation-trust 경로와 구분한다.
+- Tenant `DELETE /v1/clusters/{cluster_id}` and `POST .../delete-async` share durable delete-job admission. The SSE adapter replays persisted operation events while the worker owns cleanup; a dropped stream cannot strand the cluster. HTTP `DELETE` returns 204 after enqueue and does not prove cloud cleanup; `delete-async` retains `K3sProgressMessage` events.
 
 ### Execution authority와 재인가 (로컬 suite·native loopback 검증; 제한된 live 증거는 release receipt 참조)
 
@@ -326,9 +330,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "d5a2021cbb69ec32da057633f068627737b78b580e59ff4f9c2bcddc08c5160c",
-  "reviewed_at": "2026-11-11T10:33:13Z",
-  "summary": "0.4.18 source-build metadata: pin release source to implementation a31b9fa; Kolla auth-cloud selector unchanged; no runtime, dependency or schema change."
+  "source_sha256": "478a7d3010dc216b01112dfe08b695dc718c3b79b2478a00a022e40336d28134",
+  "reviewed_at": "2026-11-13T07:53:07Z",
+  "summary": "0.4.19: route existing tenant delete-async through atomic durable job admission and persisted SSE event replay; API path/progress schema retained, no DB migration."
 }
 ```
 <!-- architecture-review:end -->

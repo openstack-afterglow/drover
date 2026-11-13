@@ -180,7 +180,7 @@ if __name__ == "__main__":
 - 스케일·삭제·노드그룹 변경은 내구성 Job으로 큐잉되지만 현재 응답에는 재사용 가능한 외부 멱동성 계약이나 operation ID가 없습니다. Afterglow는 이 요청들을 자동 재시도하지 말고, 요청 단위 상관관계 ID와 후속 클러스터 상태 조회로 처리해야 합니다.
 
 ### 5.3 SSE 스트리밍 연결 해제 및 폴링 복구 (SSE Reconnection)
-- create 등 내구성 Job 기반 SSE의 연결이 끊겨도 작업은 Worker에서 계속됩니다. 현재 tenant `delete-async`는 caller connection을 사용하는 직접 SSE 삭제 경로이므로 동일한 내구성/disconnect 계약을 적용하지 않습니다.
+- create와 tenant `delete-async`는 durable job/operation event를 SSE로 스트리밍합니다. 연결이 끊겨도 Worker가 계속 실행합니다. 같은 delete-async를 다시 호출하면 진행 중 operation을 재사용하고 저장된 이벤트를 replay합니다. 외부 idempotency key는 생성만 지원합니다.
 - Afterglow 서비스는 연결 해제 시 다음 API로 오퍼레이션 상태 및 이벤트를 즉시 폴링하여 상태를 복구할 수 있습니다:
   - `GET /v1/operations/{operation_id}`: 작업의 최종 status (`QUEUED`, `RUNNING`, `WAITING_CALLBACK`, `SUCCEEDED`, `FAILED`, `CANCELLED`) 확인
   - `GET /v1/operations/{operation_id}/events?since_sequence=N`: 해당 작업의 시퀀스별 상세 진행 로그 복구 수집
@@ -220,7 +220,7 @@ Afterglow 대시보드 및 BFF에서 테넌트 클러스터의 오토스케일�
 5. **Afterglow 재인가 UI/BFF**: `conn.drover.cluster_authorization(id)`는 secret 없는 credential states/backlog를 조회합니다. `conn.drover.reauthorize_cluster(id)`는 `POST /v1/clusters/{id}/authorization`(body 없음)으로 `ACTIVE`이며 다른 mutation이 없는 cluster에 staged generation을 만들고 202와 job/operation ID를 반환합니다. UI는 operation을 poll하고 active generation을 확인해야 합니다; 202나 `authorized=true` row 존재는 current Keystone/live rollout 검증이 아닙니다.
 6. **Guest rollout**: worker는 current reauthorize capability와 staged token 검증 후 `kube-system/cloud-config`, `manila-cloud-secret` Secret 및 Octavia Ingress `octavia-ingress-controller-config` ConfigMap의 credential keys만 교체합니다. 참조하는 Deployment/DaemonSet/StatefulSet restart와 rollout wait를 수행합니다. KMS required/legacy detect에서는 control-plane host별 privileged hostPID Job이 Secret env + `nsenter`로 `/etc/kubernetes/cloud.conf`(있으면), `/etc/kubernetes/barbican-cloud.conf`를 rewrite하고 `barbican-kms.service` restart/active/socket을 확인합니다. 마지막 Secret-write probe 성공 뒤에만 atomic activation합니다.
 7. **Retirement/UI 상태**: activation은 이전 active/다른 staged를 retiring으로 만들고 secret을 지웁니다. 부분 실패는 staged `last_error`와 이전 active를 유지하며 guest 객체 자동 원복은 보장하지 않습니다. `conn.drover.retire_cluster_credentials(id)` / `POST .../authorization/retire`는 caller token으로 caller 소유 retiring credential만 삭제합니다. UI는 남은 `owner_revocation_required`를 표시해야 하고 legacy owner 없는 항목은 operator 회수 대상입니다.
-8. **삭제는 creator와 독립**: durable DELETE/admin delete는 현재 delete actor의 trust를 씁니다. tenant DELETE는 admission에서 caller 소유 credential을 caller token으로 동기 회수 시도하며 완료 시 다른 owner/legacy secret을 지우고 revocation backlog를 남깁니다. 현재 tenant `delete-async`는 caller connection으로 직접 실행하는 SSE 경로이며 durable job/trust continuation은 아닙니다; disconnect 뒤 계속된다고 보장하지 않습니다. 어느 경로도 creator account 복구나 tenant manager fallback을 요구하지 않습니다.
+8. **삭제는 creator와 독립**: tenant `DELETE`와 `delete-async`는 현재 delete actor의 trust로 durable delete job을 enqueue/reuse합니다. SSE는 operation event를 stream/replay하고 연결 해제는 Worker cleanup을 중단하지 않습니다. tenant DELETE는 admission에서 caller 소유 credential을 caller token으로 회수 시도하고 완료 시 다른 owner/legacy secret을 지워 revocation backlog를 남깁니다. 어느 경로도 creator account 복구나 tenant manager fallback을 요구하지 않습니다.
 
 설정은 TOML `[drover]`의 `operation_trust_ttl_seconds=14400`(900–86400), `operation_trust_min_remaining_seconds=300`(60–3600, TTL보다 작음), `delegated_required_roles=["member"]`(nonempty), `delegated_optional_roles=["load-balancer_member"]`, `guest_rollout_timeout_seconds=600`(60–3600)입니다. Settings/Kolla는 `drover_` prefix를 사용합니다. Barbican 기본 member/Octavia optional member-role의 실제 policy 충족은 **[INFERENCE]**이며 live 검증이 아닙니다.
 

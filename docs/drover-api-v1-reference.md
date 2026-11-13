@@ -181,8 +181,8 @@ Requests carrying `Idempotency-Key` retain structured reason/message/quota but *
 - **응답 (204 No Content)**
 
 ### `POST /v1/clusters/{cluster_id}/delete-async`
-- **설명**: 현재 caller connection으로 `delete_cluster_progress`를 직접 실행하는 SSE 삭제 경로입니다. creator credential은 필요 없고 caller 소유 credential을 이 connection으로 회수합니다. durable delete job/trust admission 경로가 아니므로 disconnect 후 계속 실행된다는 계약은 없습니다. tenant `DELETE` 및 admin deletion과 구분합니다. (Rate limit: 5/min)
-- **응답 (200 OK)**: `text/event-stream` (SSE 스트림)
+- **설명**: 내구성 delete job을 enqueue하거나 진행 중인 operation에 연결하고, 저장된 operation event를 SSE로 재생합니다. Worker가 요청 연결과 독립적으로 cleanup을 수행하므로 연결이 끊겨도 작업은 계속됩니다. 재연결하면 진행 이벤트를 다시 받습니다. caller 소유 credential은 admission에서 caller token으로 회수 시도하고 다른 owner/legacy credential은 backlog에 남을 수 있습니다. (Rate limit: 5/min)
+- **응답 (200 OK)**: `text/event-stream`; 각 `K3sProgressMessage`에 operation ID와 event sequence가 포함됩니다.
 
 ### `GET /v1/clusters/{cluster_id}/authorization`
 - **Policy**: `drover:clusters:get`; 다른 프로젝트/없는 cluster는 404.
@@ -487,7 +487,7 @@ Drover API는 K3s 클러스터 내부 Control Plane과 통신하여 테넌트용
 - **Status**: `QUEUED`, `RUNNING`, `WAITING_CALLBACK`, `SUCCEEDED`, `FAILED`, `CANCELLED`
 - **Kinds**: `create`, `scale`, `nodegroup_reconcile`, `delete`, `rotate_certificates`, `reconcile`, `reauthorize`
 
-> 생성은 외부 멱동성 키와 operation ID를 반환하는 SSE 계약을 제공합니다. durable 스케일·DELETE·노드그룹 변경의 현재 HTTP 응답은 operation ID를 반환하지 않으므로 후속 상태로 완료를 확인합니다. 재인가는 202에 operation ID를 반환합니다. 현재 tenant delete-async는 직접 caller-connection SSE이며 durable operation 계약의 예외입니다.
+> 생성과 tenant `delete-async`는 durable operation event를 SSE로 스트리밍합니다. 연결 해제 후 같은 delete-async를 다시 호출하면 진행 중 operation을 재사용하고 저장 이벤트를 replay합니다. `GET /v1/operations/{operation_id}` 및 `/events?since_sequence=N`으로도 상태를 확인할 수 있습니다. HTTP scale/DELETE/nodegroup 요청은 operation ID를 직접 반환하지 않으며, reauthorize는 202에 반환합니다.
 
 ### `GET /v1/operations/{operation_id}/events`
 - **설명**: 오퍼레이션의 시퀀스별 상세 이벤트 로그 조회.

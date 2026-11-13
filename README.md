@@ -43,7 +43,7 @@ Create admission separately issues caller-owned restricted (`unrestricted=False`
 - `conn.drover.cluster_authorization(id)` → secret-free generation/state/owner-revocation backlog.
 - `conn.drover.reauthorize_cluster(id)` → POST `/v1/clusters/{id}/authorization`, 202 with operation/job ID; only ACTIVE clusters with no competing mutation. Poll completion, not merely admission.
 - Guest rollout replaces cloud-config/Manila Secret and Octavia Ingress ConfigMap credential keys, restarts referencing kube-system workloads and waits for rollout. KMS/legacy detection runs control-plane host Jobs with `nsenter` to rewrite `/etc/kubernetes/barbican-cloud.conf` and existing `cloud.conf`, restart `barbican-kms.service` and check its socket. A final Secret-write probe precedes atomic activation. Partial failure keeps the old active generation and staged error; already changed guest objects are not guaranteed to roll back.
-- `conn.drover.retire_cluster_credentials(id)` → owner-token deletion of caller-owned retiring credentials. Activation erases superseded secrets, but other-owner/legacy remote revocation remains reported. Durable deletion uses the current authorized delete actor, independently of the creator; current tenant delete-async instead uses the caller connection directly and is not a durable trust job.
+- `conn.drover.retire_cluster_credentials(id)` → owner-token deletion of caller-owned retiring credentials. Activation erases superseded secrets, but other-owner/legacy remote revocation remains reported. Both tenant `DELETE` and `delete-async` use requester-trusted durable deletion jobs; SSE progress replays from persisted operation events after reconnect.
 
 Afterglow provisioning intents are removed. Drover creates native GPU workers itself and re-checks configured GPU admission before every new create; admission counts live usage, not reserved capacity. Remove Settings/Kolla `drover_afterglow_provisioning_url`, `drover_afterglow_provisioning_token`, `drover_afterglow_provisioning_token_file` and `DROVER_AFTERGLOW_PROVISIONING_TOKEN_FILE`. Kolla removes the `afterglow_k3s_provisioning_token` file; GPU admission configuration/files remain.
 
@@ -52,9 +52,13 @@ New `[drover]` settings (Settings/Kolla use `drover_` prefix): `operation_trust_
 Upgrade in order: **apply 004 → drain pre-upgrade mutation/callback jobs with the old worker → cut over API/Worker → reauthorize legacy clusters and complete guest rollout → remove `afterglow-cluster-mgr-*` users/old credentials out of band**. See the [migration runbook](drover/migrations/README.md#execution-authority-upgrade-004), [API reference](docs/drover-api-v1-reference.md), and [architecture authority/Keystone limits](ARCHITECTURE.md#execution-authority와-재인가-source-reviewed-live-verified-아님). Keystone master's [trusts.py](https://github.com/openstack/keystone/blob/master/keystone/api/trusts.py) `_check_delegated_token` does not block ordinary trust-scoped tokens; `identity:delete_trust` allows the trustor represented by an impersonating token, which Drover uses for trust cleanup. [Users.py](https://github.com/openstack/keystone/blob/master/keystone/api/users.py) still blocks trust/OAuth/EC2 app-credential management and restricted app credentials from managing additional credentials, so resource-credential retirement requires the owner's non-delegated token. `tests/test_native_trust_loopback.py` defines real keystoneauth1/keystoneclient HTTP create/project-less OS-TRUST authentication/delete and revoked-role denial against a synthetic provider: **test-defined**, not live-cloud evidence or a test run by this documentation slice.
 
 
+## 0.4.19 durable cluster deletion
+
+The existing tenant `POST /v1/clusters/{id}/delete-async` now enqueues or reuses a requester-trusted durable delete job and streams persisted operation events. Client disconnects no longer stop cleanup; reconnecting to the same route replays progress. Release notes: [0.4.19](docs/release-0.4.19.md).
+
 ## 0.4.18 Kolla 2026.1 authentication fix
 
-The Kolla Drover role now selects `openstack_auth_cloud` for its `openstack.cloud.project_info` service-project lookup, required by Kolla Ansible 2026.1 toolbox authentication. Release notes: [0.4.18](docs/release-0.4.18.md). No Drover runtime, dependency, or database migration changes.
+The Kolla Drover role selects `openstack_auth_cloud` for its `openstack.cloud.project_info` service-project lookup, required by Kolla Ansible 2026.1 toolbox authentication. Release notes: [0.4.18](docs/release-0.4.18.md). No Drover runtime, dependency, or database migration changes.
 
 ## 0.4.17 quota admission and worker revocation fence
 

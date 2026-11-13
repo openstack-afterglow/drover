@@ -1,6 +1,7 @@
 """k3s/clusters.py 엔드포인트 단위 테스트 (6개, k3s 서비스 필요)."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -32,6 +33,15 @@ def _make_cluster_record():
         "created_at": "2024-01-01T00:00:00Z",
         "updated_at": "2024-01-01T00:00:00Z",
     }
+
+
+async def _run_delete_progress(cluster):
+    from drover.services.deletion import delete_cluster_progress
+
+    return [
+        message
+        async for message in delete_cluster_progress(MagicMock(), cluster["project_id"], cluster, token_info=None)
+    ]
 
 
 @pytest.mark.asyncio
@@ -178,247 +188,255 @@ async def test_delete_drover_cluster_not_found(client):
     assert resp.status_code == 404
 
 @pytest.mark.asyncio
-async def test_delete_drover_cluster_enqueues_durable_job(client):
+async def test_delete_drover_cluster_uses_durable_enqueue_helper(client):
     cluster = _make_cluster_record()
-    enqueue = AsyncMock(return_value="job-1")
     with (
         patch("drover.api.clusters.k3s_cluster") as mock_db,
-        patch("drover.api.clusters._jobs.enqueue_job", new=enqueue),
+        patch("drover.api.clusters._enqueue_cluster_delete", new=AsyncMock(return_value="operation-1")) as enqueue,
     ):
         mock_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.update_cluster_status = AsyncMock()
         resp = await client.delete("/v1/clusters/k3s-1")
     assert resp.status_code == 204
-    enqueue.assert_awaited_once_with(
-        cluster_id="k3s-1",
-        project_id="test-project-123",
-        kind="delete",
-        payload={"user_id": "test-user-123", "username": "testuser"},
-        user_id="test-user-123",
-        username="testuser",
-        delegation=ANY,
-    )
-    mock_db.update_cluster_status.assert_awaited_once_with(
-        "test-project-123",
-        "k3s-1",
-        "DELETING",
-    )
+    enqueue.assert_awaited_once()
+    assert enqueue.await_args.args[1:3] == ("k3s-1", "test-project-123")
+    assert enqueue.await_args.args[3]["user_id"] == "test-user-123"
+    assert enqueue.await_args.args[4] is not None
 
 
 @pytest.mark.asyncio
-async def test_delete_drover_cluster_cleans_occm_lbs(client):
-    """recorded inventory에 있는 Octavia LB를 정리해야 한다."""
+async def test_enqueue_delete_job_and_deleting_state_share_transaction(monkeypatch):
+    from drover.api.clusters import _enqueue_cluster_delete
+
+    cluster = SimpleNamespace(
+        id="k3s-1",
+        project_id="test-project-123",
+        status="ACTIVE",
+        deleted_at=None,
+        updated_at=None,
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return cluster
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def begin(self):
+            return Transaction()
+
+        async def execute(self, _statement):
+            return Result()
+
+    monkeypatch.setattr("drover.db.get_session_factory", lambda: Session)
+    active = SimpleNamespace(id="delete-operation")
+    active_lookup = AsyncMock(side_effect=[None, None, active])
+    monkeypatch.setattr("drover.api.clusters.operations.get_active_operation", active_lookup)
+    enqueue = AsyncMock(return_value="delete-job")
+    monkeypatch.setattr("drover.api.clusters._jobs.enqueue_job", enqueue)
+    request = SimpleNamespace(
+        state=SimpleNamespace(correlation_id="request-1"),
+        headers={"x-openstack-request-id": "request-1"},
+    )
+
+    operation_id = await _enqueue_cluster_delete(
+        request, "k3s-1", "test-project-123",
+        {"user_id": "test-user-123", "username": "testuser", "project_id": "test-project-123"},
+        MagicMock(),
+    )
+
+    assert operation_id == "delete-operation"
+    assert cluster.status == "DELETING"
+    enqueue.assert_awaited_once()
+    assert enqueue.await_args.kwargs["kind"] == "delete"
+    assert enqueue.await_args.kwargs["request_id"] == "request-1"
+    assert enqueue.await_args.kwargs["session"] is not None
+
+
+@pytest.mark.asyncio
+async def test_enqueue_delete_reuses_active_operation_without_duplicate_job(monkeypatch):
+    from drover.api.clusters import _enqueue_cluster_delete
+
+    cluster = SimpleNamespace(
+        id="k3s-1",
+        project_id="test-project-123",
+        status="DELETING",
+        deleted_at=None,
+        updated_at=None,
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return cluster
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def begin(self):
+            return Transaction()
+
+        async def execute(self, _statement):
+            return Result()
+
+    monkeypatch.setattr("drover.db.get_session_factory", lambda: Session)
+    monkeypatch.setattr(
+        "drover.api.clusters.operations.get_active_operation",
+        AsyncMock(return_value=SimpleNamespace(id="existing-delete-operation")),
+    )
+    enqueue = AsyncMock()
+    monkeypatch.setattr("drover.api.clusters._jobs.enqueue_job", enqueue)
+
+    operation_id = await _enqueue_cluster_delete(
+        SimpleNamespace(state=SimpleNamespace(correlation_id=None), headers={}),
+        "k3s-1",
+        "test-project-123",
+        {"user_id": "test-user-123", "username": "testuser", "project_id": "test-project-123"},
+        MagicMock(),
+    )
+
+    assert operation_id == "existing-delete-operation"
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_progress_cleans_recorded_octavia_lbs():
     cluster = _make_cluster_record()
     cluster["occm_enabled"] = True
-    mock_managed = [
+    resources = [
         ManagedOpenStackResource(service="octavia", resource_type="load_balancer", resource_id="lb-1"),
         ManagedOpenStackResource(service="octavia", resource_type="load_balancer", resource_id="lb-2"),
     ]
-
     with (
-        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
-        patch("drover.services.deletion.k3s_cluster") as mock_db,
-        patch("drover.services.deletion.inventory.list_managed_resources", AsyncMock(return_value=mock_managed)),
-        patch("drover.services.deletion.nova") as mock_nova,
-        patch("drover.services.deletion.neutron") as mock_neutron,
-        patch("drover.services.deletion.octavia") as mock_octavia,
-        patch("drover.services.deletion.k3s_kube") as mock_kube,
-    ):
-        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.update_cluster_status = AsyncMock()
-        mock_db.delete_cluster_record = AsyncMock()
-        mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        mock_nova.delete_server_safe = MagicMock()
-        mock_neutron.delete_security_group_safe = MagicMock()
-        mock_octavia.delete_load_balancer_safe = MagicMock()
-        mock_kube.delete_k8s_nodes = AsyncMock()
-
-        resp = await client.post("/v1/clusters/k3s-1/delete-async")
-
-    assert resp.status_code == 200
-    assert mock_octavia.delete_load_balancer_safe.call_count == 2
-    deleted_ids = {call.args[1] for call in mock_octavia.delete_load_balancer_safe.call_args_list}
-    assert deleted_ids == {"lb-1", "lb-2"}
-
-
-@pytest.mark.asyncio
-async def test_delete_drover_cluster_lb_cleanup_failure_continues(client):
-    """LB 정리 실패해도 클러스터 삭제는 계속 진행되어야 한다."""
-    cluster = _make_cluster_record()
-    cluster["occm_enabled"] = True
-    mock_managed = [
-        ManagedOpenStackResource(service="octavia", resource_type="load_balancer", resource_id="lb-1"),
-    ]
-
-    with (
-        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
-        patch("drover.services.deletion.k3s_cluster") as mock_db,
-        patch("drover.services.deletion.inventory.list_managed_resources", AsyncMock(return_value=mock_managed)),
+        patch("drover.services.deletion.inventory.list_managed_resources", AsyncMock(return_value=resources)),
         patch("drover.services.deletion.nova"),
         patch("drover.services.deletion.neutron"),
-        patch("drover.services.deletion.octavia") as mock_octavia,
-        patch("drover.services.deletion.k3s_kube") as mock_kube,
+        patch("drover.services.deletion.octavia") as octavia,
+        patch("drover.services.deletion.k3s_kube"),
+        patch("drover.services.deletion.k3s_cluster") as store,
     ):
-        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.update_cluster_status = AsyncMock()
-        mock_db.delete_cluster_record = AsyncMock()
-        mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        mock_octavia.delete_load_balancer_safe = MagicMock(side_effect=Exception("Octavia unavailable"))
-        mock_kube.delete_k8s_nodes = AsyncMock()
-
-        resp = await client.post("/v1/clusters/k3s-1/delete-async")
-
-    assert resp.status_code == 200
-    mock_db.delete_cluster_record.assert_called_once()
+        octavia.list_occm_service_load_balancers = MagicMock(return_value=[])
+        octavia.delete_load_balancer_safe = MagicMock()
+        store.update_cluster_status = AsyncMock()
+        store.delete_cluster_record = AsyncMock()
+        store.get_agent_vm_names = AsyncMock(return_value={})
+        messages = await _run_delete_progress(cluster)
+    assert {call.args[1] for call in octavia.delete_load_balancer_safe.call_args_list} == {"lb-1", "lb-2"}
+    assert messages[-1].step.value == "completed"
+    store.delete_cluster_record.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_delete_drover_cluster_no_occm_skips_lb_cleanup(client):
-    """기록된 LB가 없는 클러스터는 LB 정리를 스킵해야 한다."""
+async def test_delete_progress_continues_after_lb_cleanup_failure():
+    cluster = _make_cluster_record()
+    cluster["occm_enabled"] = True
+    resources = [ManagedOpenStackResource(service="octavia", resource_type="load_balancer", resource_id="lb-1")]
+    with (
+        patch("drover.services.deletion.inventory.list_managed_resources", AsyncMock(return_value=resources)),
+        patch("drover.services.deletion.nova"),
+        patch("drover.services.deletion.neutron"),
+        patch("drover.services.deletion.octavia") as octavia,
+        patch("drover.services.deletion.k3s_kube"),
+        patch("drover.services.deletion.k3s_cluster") as store,
+    ):
+        octavia.list_occm_service_load_balancers = MagicMock(return_value=[])
+        octavia.delete_load_balancer_safe = MagicMock(side_effect=Exception("Octavia unavailable"))
+        store.update_cluster_status = AsyncMock()
+        store.delete_cluster_record = AsyncMock()
+        store.get_agent_vm_names = AsyncMock(return_value={})
+        messages = await _run_delete_progress(cluster)
+    assert messages[-1].step.value == "completed"
+    store.delete_cluster_record.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_progress_skips_occm_lb_cleanup_when_disabled():
     cluster = _make_cluster_record()
     cluster["occm_enabled"] = False
-
     with (
-        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
-        patch("drover.services.deletion.k3s_cluster") as mock_db,
         patch("drover.services.deletion.inventory.list_managed_resources", AsyncMock(return_value=[])),
         patch("drover.services.deletion.nova"),
         patch("drover.services.deletion.neutron"),
-        patch("drover.services.deletion.octavia") as mock_octavia,
-        patch("drover.services.deletion.k3s_kube") as mock_kube,
+        patch("drover.services.deletion.octavia") as octavia,
+        patch("drover.services.deletion.k3s_kube"),
+        patch("drover.services.deletion.k3s_cluster") as store,
     ):
-        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.update_cluster_status = AsyncMock()
-        mock_db.delete_cluster_record = AsyncMock()
-        mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        mock_octavia.delete_load_balancer_safe = MagicMock()
-        mock_kube.delete_k8s_nodes = AsyncMock()
-
-        resp = await client.post("/v1/clusters/k3s-1/delete-async")
-
-    assert resp.status_code == 200
-    mock_octavia.delete_load_balancer_safe.assert_not_called()
+        octavia.list_occm_service_load_balancers = MagicMock(return_value=[])
+        octavia.delete_load_balancer_safe = MagicMock()
+        store.update_cluster_status = AsyncMock()
+        store.delete_cluster_record = AsyncMock()
+        store.get_agent_vm_names = AsyncMock(return_value={})
+        messages = await _run_delete_progress(cluster)
+    octavia.delete_load_balancer_safe.assert_not_called()
+    assert messages[-1].step.value == "completed"
 
 
 @pytest.mark.asyncio
-async def test_delete_drover_cluster_deletes_k8s_nodes(client):
-    """클러스터 삭제 시 agent 노드와 server 노드를 K8s API로 삭제해야 한다."""
+async def test_delete_progress_removes_recorded_k8s_nodes_and_continues_on_failure():
     cluster = _make_cluster_record()
-    cluster["occm_enabled"] = False
     cluster["agent_vm_ids"] = ["vm-agent-1", "vm-agent-2"]
-
     with (
-        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
-        patch("drover.services.deletion.k3s_cluster") as mock_db,
+        patch("drover.services.deletion.inventory.list_managed_resources", AsyncMock(return_value=[])),
         patch("drover.services.deletion.nova"),
         patch("drover.services.deletion.neutron"),
         patch("drover.services.deletion.octavia"),
-        patch("drover.services.deletion.k3s_kube") as mock_kube,
+        patch("drover.services.deletion.k3s_kube") as kube,
+        patch("drover.services.deletion.k3s_cluster") as store,
     ):
-        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.update_cluster_status = AsyncMock()
-        mock_db.delete_cluster_record = AsyncMock()
-        mock_db.get_agent_vm_names = AsyncMock(
-            return_value={
-                "vm-agent-1": "mycluster-agent-1",
-                "vm-agent-2": "mycluster-agent-2",
-            }
-        )
-        mock_kube.delete_k8s_nodes = AsyncMock()
-
-        resp = await client.post("/v1/clusters/k3s-1/delete-async")
-
-    assert resp.status_code == 200
-    mock_kube.delete_k8s_nodes.assert_called_once()
-    node_names = mock_kube.delete_k8s_nodes.call_args.args[1]
-    assert "mycluster-agent-1" in node_names
-    assert "mycluster-agent-2" in node_names
-    assert "mycluster-server" in node_names
+        store.update_cluster_status = AsyncMock()
+        store.delete_cluster_record = AsyncMock()
+        store.get_agent_vm_names = AsyncMock(return_value={
+            "vm-agent-1": "mycluster-agent-1",
+            "vm-agent-2": "mycluster-agent-2",
+        })
+        kube.delete_k8s_nodes = AsyncMock(side_effect=Exception("K8s API unreachable"))
+        messages = await _run_delete_progress(cluster)
+    kube.delete_k8s_nodes.assert_awaited_once()
+    node_names = kube.delete_k8s_nodes.call_args.args[1]
+    assert {"mycluster-server", "mycluster-agent-1", "mycluster-agent-2"} <= set(node_names)
+    assert messages[-1].step.value == "completed"
+    store.delete_cluster_record.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_delete_drover_cluster_continues_if_k8s_node_delete_fails(client):
-    """K8s 노드 삭제 실패해도 VM 삭제와 soft-delete는 계속 진행되어야 한다."""
+async def test_delete_progress_finishes_when_server_is_already_gone():
     cluster = _make_cluster_record()
-    cluster["occm_enabled"] = False
-
     with (
-        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
-        patch("drover.services.deletion.k3s_cluster") as mock_db,
-        patch("drover.services.deletion.nova"),
+        patch("drover.services.deletion.inventory.list_managed_resources", AsyncMock(return_value=[])),
+        patch("drover.services.deletion.nova") as nova,
         patch("drover.services.deletion.neutron"),
         patch("drover.services.deletion.octavia"),
-        patch("drover.services.deletion.k3s_kube") as mock_kube,
+        patch("drover.services.deletion.k3s_kube"),
+        patch("drover.services.deletion.k3s_cluster") as store,
     ):
-        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.update_cluster_status = AsyncMock()
-        mock_db.delete_cluster_record = AsyncMock()
-        mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        mock_kube.delete_k8s_nodes = AsyncMock(side_effect=Exception("K8s API unreachable"))
-
-        resp = await client.post("/v1/clusters/k3s-1/delete-async")
-
-    assert resp.status_code == 200
-    mock_db.delete_cluster_record.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_delete_drover_cluster_vm_already_deleted(client):
-    """VM이 이미 삭제된 상태(delete_server 404)여도 soft-delete까지 정상 완료해야 한다."""
-    cluster = _make_cluster_record()
-    cluster["id"] = "k3s-vm-already-del"
-    cluster["occm_enabled"] = False
-
-    with (
-        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
-        patch("drover.services.deletion.k3s_cluster") as mock_db,
-        patch("drover.services.deletion.nova") as mock_nova,
-        patch("drover.services.deletion.neutron"),
-        patch("drover.services.deletion.octavia"),
-        patch("drover.services.deletion.k3s_kube") as mock_kube,
-    ):
-        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.update_cluster_status = AsyncMock()
-        mock_db.delete_cluster_record = AsyncMock()
-        mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        mock_nova.delete_server_safe = MagicMock()
-        mock_kube.delete_k8s_nodes = AsyncMock()
-
-        resp = await client.post("/v1/clusters/k3s-vm-already-del/delete-async")
-
-    assert resp.status_code == 200
-    mock_db.delete_cluster_record.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_delete_drover_cluster_vm_wait_timeout(client):
-    """VM 삭제 대기 타임아웃이 발생해도 SG 삭제와 soft-delete는 계속 진행해야 한다."""
-    cluster = _make_cluster_record()
-    cluster["id"] = "k3s-vm-wait-timeout"
-    cluster["occm_enabled"] = False
-    cluster["security_group_id"] = "sg-1"
-
-    with (
-        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
-        patch("drover.services.deletion.k3s_cluster") as mock_db,
-        patch("drover.services.deletion.nova") as mock_nova,
-        patch("drover.services.deletion.neutron") as mock_neutron,
-        patch("drover.services.deletion.octavia"),
-        patch("drover.services.deletion.k3s_kube") as mock_kube,
-    ):
-        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.update_cluster_status = AsyncMock()
-        mock_db.delete_cluster_record = AsyncMock()
-        mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        mock_nova.delete_server_safe = MagicMock(side_effect=TimeoutError("timeout"))
-        mock_neutron.delete_security_group_safe = MagicMock()
-        mock_kube.delete_k8s_nodes = AsyncMock()
-
-        resp = await client.post("/v1/clusters/k3s-vm-wait-timeout/delete-async")
-
-    assert resp.status_code == 200
-    mock_db.delete_cluster_record.assert_called_once()
-    mock_neutron.delete_security_group_safe.assert_called()
+        store.update_cluster_status = AsyncMock()
+        store.delete_cluster_record = AsyncMock()
+        store.get_agent_vm_names = AsyncMock(return_value={})
+        nova.delete_server_safe = MagicMock()
+        messages = await _run_delete_progress(cluster)
+    assert messages[-1].step.value == "completed"
+    store.delete_cluster_record.assert_awaited_once()
 
 # ---------------------------------------------------------------------------
 # API LB octavia 서비스 단위 테스트 (LB-first 전략)
@@ -1019,91 +1037,111 @@ async def test_delete_drover_cluster_async_not_found(client):
 
 
 @pytest.mark.asyncio
-async def test_delete_drover_cluster_async_happy_path(client):
-    """정상 흐름: delete_init → ... → delete_record → completed 순서로 이벤트가 수신되고 delete_cluster_record가 호출된다."""
+async def test_delete_async_enqueues_durable_job_and_streams_saved_events(client):
     cluster = _make_cluster_record()
     cluster["id"] = "k3s-async-1"
-    cluster["occm_enabled"] = False
-    cluster["security_group_id"] = "sg-async-1"
-
+    events = [
+        SimpleNamespace(sequence=1, phase="job_enqueued", message="Job delete enqueued", payload_json={}),
+        SimpleNamespace(sequence=2, phase="delete_init", message="클러스터 삭제 준비 중...", payload_json={}),
+        SimpleNamespace(sequence=3, phase="delete_record", message="삭제 이력 기록 중...", payload_json={}),
+        SimpleNamespace(sequence=4, phase="completed", message="클러스터 삭제 완료", payload_json={}),
+    ]
     with (
-        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
-        patch("drover.services.deletion.k3s_cluster") as mock_db,
-        patch("drover.services.deletion.nova") as mock_nova,
-        patch("drover.services.deletion.neutron") as mock_neutron,
-        patch("drover.services.deletion.octavia") as mock_octavia,
-        patch("drover.services.deletion.k3s_kube") as mock_kube,
+        patch("drover.api.clusters.k3s_cluster") as store,
+        patch("drover.api.clusters._enqueue_cluster_delete", new=AsyncMock(return_value="delete-operation")),
+        patch("drover.api.clusters.operations.get_operation_events", new=AsyncMock(return_value=events)),
+        patch(
+            "drover.api.clusters.operations.get_operation",
+            new=AsyncMock(return_value=SimpleNamespace(status="SUCCEEDED", error=None)),
+        ),
     ):
-        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.update_cluster_status = AsyncMock()
-        mock_db.delete_cluster_record = AsyncMock()
-        mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        mock_nova.delete_server_safe = MagicMock()
-        mock_neutron.delete_security_group_safe = MagicMock()
-        mock_octavia.delete_load_balancer_safe = MagicMock()
-        mock_kube.delete_k8s_nodes = AsyncMock()
-
+        store.get_cluster = AsyncMock(return_value=cluster)
         async with client.stream("POST", "/v1/clusters/k3s-async-1/delete-async") as resp:
             assert resp.status_code == 200
-            msgs = await _consume_sse(resp)
+            messages = await _consume_sse(resp)
 
-    steps = [m["step"] for m in msgs]
-    assert "delete_init" in steps
-    assert "delete_record" in steps
-    assert steps[-1] == "completed"
-    assert steps.index("delete_init") < steps.index("delete_record")
-    mock_db.delete_cluster_record.assert_called_once()
+    assert [message["step"] for message in messages] == [
+        "delete_init",
+        "delete_init",
+        "delete_record",
+        "completed",
+    ]
+    assert [message["sequence"] for message in messages] == [1, 2, 3, 4]
+    assert messages[2]["progress"] == 98
 
 
 @pytest.mark.asyncio
-async def test_delete_drover_cluster_async_partial_failure_continues(client):
-    """LB 목록 조회가 실패해도 최종 completed 이벤트 + delete_cluster_record 호출."""
+async def test_delete_async_resumes_existing_operation_without_reexecuting_delete(client):
     cluster = _make_cluster_record()
-    cluster["id"] = "k3s-async-partial"
-    cluster["occm_enabled"] = True
-
+    cluster["id"] = "k3s-async-resume"
+    events = [
+        SimpleNamespace(sequence=7, phase="delete_security_group", message="Ports 및 보안 그룹 정리 중...", payload_json={}),
+        SimpleNamespace(sequence=8, phase="completed", message="클러스터 삭제 완료", payload_json={}),
+    ]
     with (
-        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
-        patch("drover.services.deletion.k3s_cluster") as mock_db,
-        patch("drover.services.deletion.nova"),
-        patch("drover.services.deletion.neutron"),
-        patch("drover.services.deletion.octavia") as mock_octavia,
-        patch("drover.services.deletion.k3s_kube") as mock_kube,
+        patch("drover.api.clusters.k3s_cluster") as store,
+        patch("drover.api.clusters._enqueue_cluster_delete", new=AsyncMock(return_value="existing-operation")) as enqueue,
+        patch("drover.api.clusters.operations.get_operation_events", new=AsyncMock(return_value=events)),
+        patch(
+            "drover.api.clusters.operations.get_operation",
+            new=AsyncMock(return_value=SimpleNamespace(status="SUCCEEDED", error=None)),
+        ),
     ):
-        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.update_cluster_status = AsyncMock()
-        mock_db.delete_cluster_record = AsyncMock()
-        mock_db.get_agent_vm_names = AsyncMock(return_value={})
-        mock_octavia.delete_load_balancer_safe = MagicMock(side_effect=Exception("octavia error"))
-        mock_kube.delete_k8s_nodes = AsyncMock()
+        store.get_cluster = AsyncMock(return_value=cluster)
+        async with client.stream("POST", "/v1/clusters/k3s-async-resume/delete-async") as resp:
+            messages = await _consume_sse(resp)
 
-        async with client.stream(
-            "POST", "/v1/clusters/k3s-async-partial/delete-async"
-        ) as resp:
-            assert resp.status_code == 200
-            msgs = await _consume_sse(resp)
+    enqueue.assert_awaited_once()
+    assert [message["step"] for message in messages] == ["delete_security_group", "completed"]
+    assert messages[0]["progress"] == 85
 
-    steps = [m["step"] for m in msgs]
-    assert steps[-1] == "completed"
-    mock_db.delete_cluster_record.assert_called_once()
 
 @pytest.mark.asyncio
-async def test_delete_drover_cluster_async_already_deleted(client):
-    """이미 삭제된 클러스터는 단일 completed 이벤트를 반환하고 delete_cluster_record를 호출하지 않는다."""
+async def test_delete_async_reports_durable_worker_failure(client):
+    cluster = _make_cluster_record()
+    cluster["id"] = "k3s-async-failed"
+    events = [
+        SimpleNamespace(
+            sequence=1,
+            phase="job_failed",
+            message="Job delete failed",
+            payload_json={"error": "authority revoked"},
+        ),
+    ]
+    with (
+        patch("drover.api.clusters.k3s_cluster") as store,
+        patch("drover.api.clusters._enqueue_cluster_delete", new=AsyncMock(return_value="failed-operation")),
+        patch("drover.api.clusters.operations.get_operation_events", new=AsyncMock(return_value=events)),
+        patch(
+            "drover.api.clusters.operations.get_operation",
+            new=AsyncMock(return_value=SimpleNamespace(status="FAILED", error="authority revoked")),
+        ),
+    ):
+        store.get_cluster = AsyncMock(return_value=cluster)
+        async with client.stream("POST", "/v1/clusters/k3s-async-failed/delete-async") as resp:
+            messages = await _consume_sse(resp)
+
+    assert len(messages) == 1
+    assert messages[0]["step"] == "failed"
+    assert messages[0]["error"] == "authority revoked"
+
+
+@pytest.mark.asyncio
+async def test_delete_async_already_deleted_does_not_enqueue(client):
     cluster = _make_cluster_record()
     cluster["id"] = "k3s-async-already"
     cluster["deleted_at"] = "2024-01-01T00:00:00Z"
-
-    with patch("drover.api.clusters.k3s_cluster") as mock_db:
-        mock_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.delete_cluster_record = AsyncMock()
+    with (
+        patch("drover.api.clusters.k3s_cluster") as store,
+        patch("drover.api.clusters._enqueue_cluster_delete", new=AsyncMock(return_value=None)) as enqueue,
+    ):
+        store.get_cluster = AsyncMock(return_value=cluster)
         async with client.stream("POST", "/v1/clusters/k3s-async-already/delete-async") as resp:
-            assert resp.status_code == 200
-            msgs = await _consume_sse(resp)
+            messages = await _consume_sse(resp)
 
-    assert len(msgs) == 1
-    assert msgs[0]["step"] == "completed"
-    mock_db.delete_cluster_record.assert_not_called()
+    enqueue.assert_awaited_once()
+    assert len(messages) == 1
+    assert messages[0]["step"] == "completed"
 
 
 # ---------------------------------------------------------------------------
@@ -1123,24 +1161,3 @@ async def test_create_cluster_returns_503_when_policy_storage_is_unavailable(cli
     assert resp.json() == {"detail": "resource policy storage is unavailable"}
 
 
-@pytest.mark.asyncio
-async def test_delete_drover_cluster_async_fatal_failure(client):
-    """update_cluster_status가 치명적 예외를 던지면 failed 이벤트가 수신되고 delete_cluster_record는 호출되지 않는다."""
-    cluster = _make_cluster_record()
-    cluster["id"] = "k3s-async-fatal"
-    cluster["occm_enabled"] = False
-
-    with (
-        patch("drover.api.clusters.k3s_cluster") as mock_api_db,
-        patch("drover.services.deletion.k3s_cluster") as mock_db,
-    ):
-        mock_api_db.get_cluster = AsyncMock(return_value=cluster)
-        mock_db.update_cluster_status = AsyncMock(side_effect=Exception("DB 연결 실패"))
-        mock_db.delete_cluster_record = AsyncMock()
-        async with client.stream("POST", "/v1/clusters/k3s-async-fatal/delete-async") as resp:
-            assert resp.status_code == 200
-            msgs = await _consume_sse(resp)
-
-    steps = [m["step"] for m in msgs]
-    assert "failed" in steps
-    mock_db.delete_cluster_record.assert_not_called()
