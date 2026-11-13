@@ -5,16 +5,16 @@
 ### 한국어
 
 - 버전: **0.4.19**.
-- 릴리스 일자: **미발행**; 준비일 **2026-11-13 Asia/Seoul (UTC+09:00)**.
-- 배포 일자: **미배포**; 발행과 운영 배포는 구분합니다.
+- 릴리스 일자: **2026-11-13**; tag `0.4.19`와 wheel을 발행했습니다.
+- 배포 일자: **2026-11-13**; DMS Lab 세 컨트롤러에 배포했습니다. `test-k3s` 삭제 재시도는 owner 인증 확보 전까지 대기합니다.
 - 변경/수정: Afterglow UI가 호출하는 `POST /v1/clusters/{id}/delete-async`가 requester trust 기반 durable delete job을 enqueue/reuse하고 저장된 operation event를 SSE로 재생합니다. 연결이 끊겨도 Worker 정리는 계속됩니다.
 - 폐기/제거: **없음**. API 경로, progress schema, dependency, DB schema/migration은 유지합니다.
 
 ### English
 
 - Version: **0.4.19**.
-- Release date: **Not published**; prepared **2026-11-13 Asia/Seoul (UTC+09:00)**.
-- Deployment date: **Not deployed**; publication and rollout are separate.
+- Release date: **2026-11-13**; published tag `0.4.19` and wheel.
+- Deployment date: **2026-11-13**; deployed to all three DMS Lab controllers. `test-k3s` deletion retry remains pending owner authentication.
 - Changes/fixes: Afterglow's existing `POST /v1/clusters/{id}/delete-async` now enqueues or reuses a requester-trusted durable delete job and streams persisted operation events. Worker cleanup continues when the client disconnects.
 - Deprecated/removed: **None**. The API path, progress schema, dependencies, database schema and migrations remain unchanged.
 

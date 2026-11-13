@@ -43,7 +43,7 @@ Tag `0.4.19` targets metadata SHA `97fb46730a6659d09ee2ff983ac25c810f27a835`. AP
 
 On 2026-11-13, backup: `/etc/kolla/afterglow-release-backups/drover-0.4.19-20261113T081913Z`. Drover-only `genconfig` reported `changed=0`; image pull succeeded. Rolling `reconfigure --tags drover --skip-tags haproxy` on controllers 3, 2, 1 returned `failed=0`, `unreachable=0`, `changed=1` each. Six API/Worker containers now run version `0.4.19`, revision `97fb46730a6659d09ee2ff983ac25c810f27a835`, on pinned digests. Each `/v1/health/ready` and public readiness returned `status=ok`; DB, Redis, migrations and Keystone checks were `ok`.
 
-Container census against the backup found unchanged non-Drover counts (230/234/218) but changed IDs for `palimpsest_hub_api`, `palimpsest_hub_worker`, `waygate_api` and `waygate_worker` on every controller. Their image references were unchanged; cause is unknown. Do not claim full-window isolation. HAProxy was excluded with `--skip-tags haproxy`.
+Container census found four non-Drover IDs changed per controller. Exact `Created` times clustered across hosts: Palimpsest API `08:27:16.793–08:27:17.875Z`, Worker `08:27:23.884–08:27:24.081Z`; Waygate API `08:34:01.802–08:34:33.923Z`, Worker `08:34:15.529–08:34:39.762Z`. These cohorts do not match our three one-host Drover reconfigurations. `genconfig` changed=0; pull fetched only Drover images. The separate operation and actor remain unknown; pre-deploy image digests were not captured, so image-content equality is unverified. Do not claim full-window isolation. HAProxy was excluded with `--skip-tags haproxy`.
 
 ## 0.4.18 Kolla 2026.1 auth-cloud selector — published and deployed
 

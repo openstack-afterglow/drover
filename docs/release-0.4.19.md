@@ -2,17 +2,17 @@
 
 ## 한국어
 
-- 버전: **0.4.19** (로컬 릴리스 후보).
-- 릴리스 일자: **미발행**; 준비일 **2026-11-13 Asia/Seoul (UTC+09:00)**.
-- 배포 일자: **미배포**. 패키지 발행과 운영 배포는 별도 단계입니다.
+- 버전: **0.4.19** (published tag; metadata SHA `97fb46730a6659d09ee2ff983ac25c810f27a835`).
+- 릴리스 일자: **2026-11-13**; tag와 wheel을 발행했습니다.
+- 배포 일자: **2026-11-13**; DMS Lab 세 컨트롤러에 API/Worker를 배포했습니다.
 - 변경/수정: Afterglow UI와 SDK가 이미 사용하는 `POST /v1/clusters/{id}/delete-async`가 이제 requester trust 기반 durable delete job을 enqueue하거나 진행 중 delete operation을 재사용합니다. 요청은 operation ID와 sequence가 포함된 저장 이벤트를 SSE로 재생합니다. 클라이언트 연결이 끊겨도 Worker 정리는 계속되고, 같은 endpoint 재호출은 진행 중 operation에 다시 연결됩니다. Job enqueue와 cluster `DELETING` 상태 기록은 같은 DB transaction에서 수행합니다.
 - 폐기/제거: **없음**. API 경로와 `K3sProgressMessage` schema, SDK method, dependency, DB schema/migration은 변경하지 않습니다.
 
 ## English
 
-- Version: **0.4.19** (local release candidate).
-- Release date: **Not published**; prepared **2026-11-13 Asia/Seoul (UTC+09:00)**.
-- Deployment date: **Not deployed**. Artifact publication and production rollout are separate.
+- Version: **0.4.19** (published tag; metadata SHA `97fb46730a6659d09ee2ff983ac25c810f27a835`).
+- Release date: **2026-11-13**; tag and wheel published.
+- Deployment date: **2026-11-13**; API/Worker deployed to all three DMS Lab controllers.
 - Changes/fixes: the existing Afterglow UI/SDK endpoint `POST /v1/clusters/{id}/delete-async` now enqueues a requester-trusted durable delete job or reuses the active delete operation. It streams persisted events with operation ID and sequence. Worker cleanup survives client disconnects, and retrying the same route reconnects to the active operation. Job enqueue and cluster `DELETING` state are persisted in one DB transaction.
 - Deprecated/removed: **None**. The API path, `K3sProgressMessage` schema, SDK method, dependencies and database schema/migrations remain unchanged.
 

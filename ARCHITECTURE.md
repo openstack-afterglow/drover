@@ -330,9 +330,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "8df818272688ef4a84544e27f54ab2576b4c1e3df5862b9b4441239452e4cb97",
-  "reviewed_at": "2026-11-13T08:44:10Z",
-  "summary": "0.4.19 release and three-controller rollout verified; readiness passed; no DB migration. Record unrelated controller container changes and pending owner-scoped deletion retry."
+  "source_sha256": "758c124efe08f6a150c12ebfe084c46929e8ace15c2c88541b40ef13f42ab6e1",
+  "reviewed_at": "2026-11-13T08:57:27Z",
+  "summary": "0.4.19 publication and three-controller deployment status corrected; synchronized non-Drover container cohorts recorded with unknown initiating operation; no runtime code change."
 }
 ```
 <!-- architecture-review:end -->
