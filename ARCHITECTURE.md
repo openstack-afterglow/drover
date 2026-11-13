@@ -12,11 +12,11 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker들이 SQL lease를 얻어 OpenStack 작업을 실행한다. Redis server-time membership은 Worker의 discovery/recovery/reconciliation/delegation 역할과 health/Stampede target 소유권을 분배한다. DB job consumer는 Redis leader 아래로 이동하지 않는다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 credential 없는 임시 ownership·callback token·짧은 상태/헬스 캐시·stampede 이벤트 같은 보조 저장소다.
 
-### Durable tenant delete SSE candidate 0.4.19
+### Durable tenant delete SSE 0.4.19
 
 Afterglow's existing tenant delete buttons call `POST /v1/clusters/{id}/delete-async`. This route now atomically enqueues/reuses the requester-trusted durable delete job and sets `DELETING`, then streams persisted operation events. Disconnect/reconnect no longer owns or cancels cleanup; the worker continues and the same route replays event history. The caller-owned credential retirement remains an admission-side attempt. No API path, guest/runtime behavior, or schema changes.
 
-### Kolla 2026.1 auth-cloud selector candidate 0.4.18
+### Kolla 2026.1 auth-cloud selector 0.4.18 — published and deployed
 
 Drover's Kolla `config.yml` resolves the service project with `openstack.cloud.project_info`. Kolla Ansible 2026.1 requires `openstack_auth_cloud` alongside `openstack_auth`; omitting the explicit cloud selector fails with missing `auth_url` before config rendering. The role now supplies the selected Kolla cloud. This is a Kolla task/package compatibility fix only: no Drover runtime, dependency, migration, database or service-authority change. Exact-SHA tests and release/rollout evidence are tracked in `docs/release-0.4.18.md`.
 
@@ -330,9 +330,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "fb2a4f4fb6becb115b6e8ca2246e26e995f9ba746e16b033268a46cb47e34953",
-  "reviewed_at": "2026-11-13T07:55:49Z",
-  "summary": "0.4.19 release metadata pins the durable delete SSE implementation SHA; schema and dependencies unchanged."
+  "source_sha256": "8df818272688ef4a84544e27f54ab2576b4c1e3df5862b9b4441239452e4cb97",
+  "reviewed_at": "2026-11-13T08:44:10Z",
+  "summary": "0.4.19 release and three-controller rollout verified; readiness passed; no DB migration. Record unrelated controller container changes and pending owner-scoped deletion retry."
 }
 ```
 <!-- architecture-review:end -->

@@ -37,9 +37,13 @@ Every replica must share MariaDB and the configured service Redis/Sentinel names
 
 Kolla registry metadata is v0.4.15; source-build mode asserts source `314c7a6ab743e7ee766ade41e11ddcb0040e3797`, pinned by release-metadata commit `977a1cad411cc0eafb5a92090bdced272de0611a`. Exact-SHA CI and the tag Release/Docker workflows succeeded. The 2026-10-14 DMS Lab rollout stopped all 3 APIs and 3 workers (exit 0), verified a cold restore of 16 tables / 75,225 rows, needed no migration (ledger 4/4), and changed no generated config. All six replicas ran pinned amd64 digests/revision with 0 restarts, APIs healthy, and readiness 200 on three listeners plus public. Drover's REDIS_URL points at the dms-controller1 read-only Valkey replica (Sentinel master on dms-controller3); no Drover error was observed after cutover. Full digests, local amd64/arm64 qualification and remaining credential/Sentinel evidence limits are in the [0.4.15 receipt](../../docs/release-0.4.0.md#tagged-0415-publication-and-dms-lab-production-rollout--2026-10-14).
 
-## 0.4.19 durable tenant deletion candidate
+## 0.4.19 durable tenant deletion — published and deployed
 
-Prepared 2026-11-13; not yet published or deployed. Tenant `POST /v1/clusters/{id}/delete-async` now atomically enqueues/reuses a requester-trusted durable delete job and streams persisted operation events. A disconnected client no longer cancels cleanup; reconnecting replays progress. Registry mode uses `0.4.19`; source-build mode pins implementation `762fac3dd896e49e22e86c94a1b55ae77f293e47` from the separate release-metadata commit. No schema or dependency change is intended.
+Tag `0.4.19` targets metadata SHA `97fb46730a6659d09ee2ff983ac25c810f27a835`. API image index: `sha256:2b4ec465c08a4aae6d9c6f86aa07683bef03acee47b43028adfd26e89567d979`; Worker: `sha256:d67e928c7589454ed7be4fec1f0f96ee2240a5be695b9b835307ddc047b47a86` (amd64 plus attestations). Operator installed Drover `0.4.19`; lock diff changed only Drover.
+
+On 2026-11-13, backup: `/etc/kolla/afterglow-release-backups/drover-0.4.19-20261113T081913Z`. Drover-only `genconfig` reported `changed=0`; image pull succeeded. Rolling `reconfigure --tags drover --skip-tags haproxy` on controllers 3, 2, 1 returned `failed=0`, `unreachable=0`, `changed=1` each. Six API/Worker containers now run version `0.4.19`, revision `97fb46730a6659d09ee2ff983ac25c810f27a835`, on pinned digests. Each `/v1/health/ready` and public readiness returned `status=ok`; DB, Redis, migrations and Keystone checks were `ok`.
+
+Container census against the backup found unchanged non-Drover counts (230/234/218) but changed IDs for `palimpsest_hub_api`, `palimpsest_hub_worker`, `waygate_api` and `waygate_worker` on every controller. Their image references were unchanged; cause is unknown. Do not claim full-window isolation. HAProxy was excluded with `--skip-tags haproxy`.
 
 ## 0.4.18 Kolla 2026.1 auth-cloud selector — published and deployed
 
