@@ -1,0 +1,17 @@
+# Drover 0.4.20 — sandbox-ready cluster profile and sandbox connection
+
+## 한국어
+
+- 버전: **0.4.20** (릴리스 준비됨; 발행·배포 결과는 이 문서에 관측된 뒤에만 기록한다).
+- 변경/수정: (1) 모든 클러스터가 자기 security group에서 오는 tcp/6443을 연다. 제한 CIDR 클러스터에서 agent가 API에 접속하지 못해 join하지 않던 결함을 고친다. (2) 관리자 런타임 설정 `k3s.cluster_profiles`와 `profile` 요청 필드로 네트워크·SSH/API/NodePort/HTTP(S) CIDR을 관리자가 고정한다. profile cluster의 네트워크·규칙 식별자·drift 상세는 비관리자 응답과 operation 이벤트에서 숨긴다. (3) reconcile이 agent의 Kubernetes node Ready를 관찰한다(Nova 방식 이름 정규화, 한 번도 Ready가 아니었던 agent만 합류 창 900초와 연속 2회 실패 뒤 자동 회복되는 reconciler 소유 `ERROR`). 생성 operation은 느린 join으로 실패시키지 않는다. (4) `profile`이 없는 요청의 request hash는 이전과 같아 기존 `Idempotency-Key` 재생이 유지된다. (5) 새 `POST /v1/clusters/{id}/sandbox-connection`(정책 action `drover:sandbox:connect`, human 토큰 전용)이 sandbox 컨트롤러용 namespace(restricted Pod Security, `lumen-default-deny`), namespace Role, Namespace·RuntimeClass `get` ClusterRole과 900초 이하 bearer token을 발급하고 `sandbox_connection_issue` audit을 남긴다. Role은 Lumen `_check_rbac`가 허용하는 동작(pods get/list/create/delete 등)과 같다.
+- 폐기/제거: **없음**. DB schema/migration, 의존성 변경 **없음**.
+- 운영 영향: 클러스터당 security group 규칙이 1개 늘어 quota admission 계산이 1 증가한다(신규 생성 클러스터만; 기존 클러스터의 규칙은 바뀌지 않는다). 배포 직후 agent가 있는 기존 모든 클러스터가 첫 reconcile부터 노드 관찰(reconcile당 최대 약 15초 추가)을 받는다. `profile`을 설정하지 않으면 NodePort·80·443 기본값(`0.0.0.0/0`)은 그대로다.
+- 한계: sandbox-connection은 합성 Kubernetes 경계에서만 검증되었다(`resourceNames`는 평가되지 않음). RuntimeClass 설치와 qualification evidence는 없다. Lumen이 응답 계약을 아직 확인하지 않았다.
+
+## English
+
+- Version: **0.4.20** (release prepared; publication and deployment results are recorded here only once observed).
+- Changes/fixes: (1) every cluster opens tcp/6443 from its own security group, fixing agents that could never join a restricted-CIDR cluster; (2) an administrator `k3s.cluster_profiles` runtime setting and a `profile` request field pin the network and SSH/API/NodePort/HTTP(S) CIDRs, and a profile cluster's network, rule identifiers and drift details are hidden from non-admin responses and operation events; (3) reconciliation observes agent node readiness (Nova-style name normalisation; only an agent never observed Ready escalates, after the 900 s window and two consecutive failed observations, to a self-clearing reconciler-owned `ERROR`; the create operation is not failed by a slow join); (4) the request hash of a request without `profile` is unchanged, so existing `Idempotency-Key` replays still work; (5) new `POST /v1/clusters/{id}/sandbox-connection` (policy action `drover:sandbox:connect`, human tokens only) issues a sandbox controller namespace (restricted Pod Security, `lumen-default-deny`), a namespace Role, a ClusterRole limited to `get` on that Namespace and RuntimeClass and a bearer token of at most 900 s, with a `sandbox_connection_issue` audit row. The Role equals what Lumen's `_check_rbac` accepts.
+- Deprecated/removed: **None**. No database schema/migration or dependency change.
+- Operational impact: one more security-group rule per newly created cluster, so quota admission counts one more rule (existing clusters' rules are unchanged). After rollout every existing cluster that has agents gets the node observation from its first reconcile (up to about 15 s extra per reconcile). Without a configured `profile`, NodePort, 80 and 443 stay `0.0.0.0/0`.
+- Limits: sandbox-connection is verified against a synthetic Kubernetes boundary only (`resourceNames` is not evaluated). There is no RuntimeClass provisioning or qualification evidence. Lumen has not yet confirmed the response contract.

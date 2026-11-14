@@ -333,9 +333,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "513f026317b083e4389b5f863a6bc8e2b74625588ca9bc25a99f3bc64b0de589",
-  "reviewed_at": "2026-11-14T05:46:49Z",
-  "summary": "Sandbox Role matches Lumen RBAC preflight (no pods watch, no pods/log); sandbox connection issuance audited"
+  "source_sha256": "0a20585208e4e94f4bda685cdce54409d1767250daefb14091bab9bffe758eb5",
+  "reviewed_at": "2026-11-14T07:45:30Z",
+  "summary": "0.4.20: sandbox-ready cluster profile, self-group API access, recoverable agent-join observation, sandbox-connection endpoint; no schema or dependency change."
 }
 ```
 <!-- architecture-review:end -->
