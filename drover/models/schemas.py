@@ -86,6 +86,22 @@ class CreateK3sClusterRequest(BaseModel):
     template_id: str | None = None
     master_count: int = Field(default=1)
     stampede_enabled: bool = True
+    profile: str | None = Field(
+        default=None,
+        description=(
+            "Administrator-managed network profile. When set, network_id and allowed_cidrs must be omitted; "
+            "the profile supplies the network and every ingress CIDR set."
+        ),
+    )
+
+    @field_validator("profile")
+    @classmethod
+    def validate_profile(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", v):
+            raise ValueError("profile 이름은 소문자·숫자·하이픈이며 최대 32자입니다")
+        return v
 
     @field_validator("master_count")
     @classmethod

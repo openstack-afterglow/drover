@@ -52,6 +52,7 @@ class ReconciliationTestStore:
         self.events = {}
         self.jobs = {}
         self.create_operations = {}
+        self.agent_vms = {}
 
     def add_cluster(self, project_id: str, cluster_id: str, data: dict):
         cl = {
@@ -193,6 +194,11 @@ def mock_services(monkeypatch, test_store):
     monkeypatch.setattr(inventory, "record_resource", fake_record_resource)
     monkeypatch.setattr(store, "update_cluster_reconciliation", fake_update_cluster_reconciliation)
     monkeypatch.setattr(operations, "append_operation_event", fake_append_operation_event)
+
+    async def fake_list_agent_vms(cluster_id):
+        return [dict(row) for row in test_store.agent_vms.get(cluster_id, [])]
+
+    monkeypatch.setattr(store, "list_agent_vms", fake_list_agent_vms)
 
 
 @pytest.mark.asyncio
@@ -674,3 +680,100 @@ async def test_reconciliation_sdk_reads_leave_domain_heartbeat_runnable_and_drai
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+def _health(nodes, *, reachable=True):
+    from drover.models.schemas import K3sClusterHealth, K3sNodeHealth
+
+    return K3sClusterHealth(
+        cluster_id="cluster-1",
+        cluster_name="c",
+        status="HEALTHY" if reachable else "UNREACHABLE",
+        api_server_reachable=reachable,
+        healthz_ok=reachable,
+        nodes=[K3sNodeHealth(name=n, role="agent" if n != "server-node" else "server", ready=ready) for n, ready in nodes],
+        checked_at=datetime.now(UTC).isoformat(),
+        reachability="direct" if reachable else "unreachable",
+    )
+
+
+def _agent_cluster(test_store, *, age_seconds, status="ACTIVE", status_reason=None):
+    from datetime import timedelta
+
+    cluster = test_store.add_cluster("project-1", "cluster-1", {
+        "server_vm_id": "server-1", "kubeconfig": "config", "status": status, "status_reason": status_reason,
+    })
+    test_store.agent_vms["cluster-1"] = [
+        {"vm_id": "vm-agent", "name": "agent-1", "created_at": datetime.now(UTC) - timedelta(seconds=age_seconds)}
+    ]
+    return cluster
+
+
+def _server_present():
+    conn = _empty_connection()
+    conn.compute.find_server.return_value = DummyServer("server-1", "primary", "project-1", "cluster-1")
+    return conn
+
+
+@pytest.mark.asyncio
+async def test_agent_still_joining_is_pending_not_error(test_store, monkeypatch):
+    from drover.services import health
+
+    cluster = _agent_cluster(test_store, age_seconds=120)
+    monkeypatch.setattr(health, "check_cluster_health", AsyncMock(return_value=_health([("server-node", True)])))
+    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+    assert cluster["status"] == "ACTIVE"
+    assert drift["agent_join_pending"][0]["name"] == "agent-1"
+    assert drift["has_drift"] is True and drift["missing_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_not_ready_after_window_is_recoverable_error(test_store, monkeypatch):
+    from drover.services import health
+
+    cluster = _agent_cluster(test_store, age_seconds=reconciliation.AGENT_JOIN_WINDOW_SECONDS + 60)
+    check = AsyncMock(return_value=_health([("server-node", True)]))
+    monkeypatch.setattr(health, "check_cluster_health", check)
+    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+    assert cluster["status"] == "ERROR"
+    assert cluster["status_reason"].startswith("Reconciliation failed:")
+    assert "Kubernetes agent node 'agent-1' is not Ready" in cluster["status_reason"]
+    assert drift["missing_count"] == 1 and "agent_join_pending" not in drift
+
+    # A late join clears the reconciler-owned ERROR without operator action.
+    check.return_value = _health([("server-node", True), ("agent-1", True)])
+    recovered = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+    assert recovered["has_drift"] is False
+    assert cluster["status"] == "ACTIVE"
+    assert not cluster["status_reason"]
+
+
+@pytest.mark.asyncio
+async def test_unobservable_node_list_neither_raises_nor_clears_agent_error(test_store, monkeypatch):
+    from drover.services import health
+
+    healthy = _agent_cluster(test_store, age_seconds=60)
+    monkeypatch.setattr(health, "check_cluster_health", AsyncMock(return_value=_health([], reachable=False)))
+    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+    assert healthy["status"] == "ACTIVE" and drift["has_drift"] is False
+
+    errored = _agent_cluster(
+        test_store, age_seconds=3600, status="ERROR",
+        status_reason="Reconciliation failed: Required Kubernetes agent node 'agent-1' is not Ready",
+    )
+    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+    assert errored["status"] == "ERROR"
+    assert "could not be re-observed" in errored["status_reason"]
+    assert drift["missing_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cluster_without_agents_does_not_probe_the_api(test_store, monkeypatch):
+    from drover.services import health
+
+    test_store.add_cluster("project-1", "cluster-1", {"server_vm_id": "server-1", "kubeconfig": "config"})
+    check = AsyncMock()
+    monkeypatch.setattr(health, "check_cluster_health", check)
+    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+    assert drift["has_drift"] is False
+    check.assert_not_called()

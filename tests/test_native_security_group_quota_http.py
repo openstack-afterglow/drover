@@ -135,11 +135,11 @@ def test_native_quota_error_does_not_fall_back(status):
 
 def test_native_rule_budget_includes_legacy_generated_rules_and_exact_cidr_plan():
     with native_neutron() as (conn, state):
-        # Two CIDRs yield eleven authored ingress rules plus two native egress.
-        state["quota"]["security_group_rule"].update(limit=17)
-        assert _check(conn, ["192.0.2.0/24", "198.51.100.0/24"]) == 11
+        # Two CIDRs yield twelve authored ingress rules plus two native egress.
+        state["quota"]["security_group_rule"].update(limit=18)
+        assert _check(conn, ["192.0.2.0/24", "198.51.100.0/24"]) == 12
         state["quota"]["security_group_rule"]["reserved"] = 1
-        with pytest.raises(neutron.SecurityGroupQuotaExceeded, match="required=13, available=12"):
+        with pytest.raises(neutron.SecurityGroupQuotaExceeded, match="required=14, available=13"):
             _check(conn, ["192.0.2.0/24", "198.51.100.0/24"])
         assert all(method == "GET" for method, _ in state["requests"])
 
@@ -147,13 +147,13 @@ def test_native_rule_budget_includes_legacy_generated_rules_and_exact_cidr_plan(
 def test_native_first_group_includes_implicit_default_group_and_rules():
     with native_neutron() as (conn, state):
         state["quota"]["security_group"].update(limit=1, used=0)
-        state["quota"]["security_group_rule"].update(limit=15, used=0)
+        state["quota"]["security_group_rule"].update(limit=16, used=0)
         with pytest.raises(neutron.SecurityGroupQuotaExceeded, match="required=2, available=1"):
             _check(conn)
         state["quota"]["security_group"]["limit"] = 2
-        _check(conn)  # 9 authored + 2 custom egress + 4 implicit default rules.
-        state["quota"]["security_group_rule"]["limit"] = 14
-        with pytest.raises(neutron.SecurityGroupQuotaExceeded, match="required=15, available=14"):
+        _check(conn)  # 10 authored + 2 custom egress + 4 implicit default rules.
+        state["quota"]["security_group_rule"]["limit"] = 15
+        with pytest.raises(neutron.SecurityGroupQuotaExceeded, match="required=16, available=15"):
             _check(conn)
         assert not any("/security-groups" in path for _, path in state["requests"])
 
@@ -167,12 +167,12 @@ def test_native_custom_rule_templates_replace_legacy_assumption():
             {"id": "default-only", "used_in_default_sg": True, "used_in_non_default_sg": False},
             {"id": "custom-3", "used_in_default_sg": False, "used_in_non_default_sg": True},
         ]
-        state["quota"]["security_group_rule"].update(limit=15)  # 11 free, but 12 needed.
-        with pytest.raises(neutron.SecurityGroupQuotaExceeded, match="required=12, available=11"):
+        state["quota"]["security_group_rule"].update(limit=15)  # 11 free, but 13 needed.
+        with pytest.raises(neutron.SecurityGroupQuotaExceeded, match="required=13, available=11"):
             _check(conn)
         state["quota"]["security_group"].update(used=0)
-        state["quota"]["security_group_rule"].update(limit=14, used=0)
-        _check(conn)  # 9 authored + 3 custom + 2 default.
+        state["quota"]["security_group_rule"].update(limit=15, used=0)
+        _check(conn)  # 10 authored + 3 custom + 2 default.
 
 
 def test_native_empty_templates_and_unlimited_quota_are_valid():
@@ -239,7 +239,7 @@ async def test_worker_rechecks_after_admission_before_any_resource_write():
 def run_native_smoke():
     with native_neutron() as (conn, state):
         rules = _check(conn)
-        assert rules == 9
+        assert rules == 10
         assert all(method == "GET" for method, _ in state["requests"])
         state["reject_create"] = True  # Another native writer consumes capacity after preflight.
         try:

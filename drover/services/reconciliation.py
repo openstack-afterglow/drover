@@ -19,6 +19,63 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+AGENT_JOIN_WINDOW_SECONDS = 900
+_AGENT_NODE_MARK = "Kubernetes agent node"
+
+
+async def _observe_agent_join(
+    cluster: dict[str, Any], *, now: datetime | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Compare the recorded agent VMs with the live Kubernetes node list.
+
+    Returns ``(required_missing, pending)``. An agent that is not a Ready node is ``pending`` during its join window
+    and becomes a required missing resource afterwards. The resulting reconciler-owned ``ERROR`` clears itself on a
+    later pass that observes the node Ready; the create operation is never failed for a slow join. When the node list
+    cannot be observed nothing new is reported, but an earlier agent-node ``ERROR`` is carried forward so an outage
+    cannot silently clear it.
+    """
+    from drover.services import health
+
+    agents = await store.list_agent_vms(cluster["id"])
+    if not agents:
+        return [], []
+    now = now or _now()
+    try:
+        result = await health.check_cluster_health(cluster)
+    except Exception:
+        _logger.warning("Agent join observation failed for cluster %s", cluster.get("id"), exc_info=True)
+        result = None
+    observed = bool(result and result.api_server_reachable and result.healthz_ok and result.nodes)
+    if not observed:
+        previous = cluster.get("status_reason") or ""
+        if cluster.get("status") == "ERROR" and previous.startswith("Reconciliation failed:") and _AGENT_NODE_MARK in previous:
+            return [{
+                "service": "kubernetes", "resource_type": "node", "resource_id": None,
+                "name": "agent nodes", "is_required": True,
+                "reason": f"Required {_AGENT_NODE_MARK} state could not be re-observed (API unreachable)",
+            }], []
+        return [], []
+    ready = {node.name.casefold() for node in result.nodes if node.ready}
+    missing: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    for agent in agents:
+        name = agent.get("name") or agent["vm_id"]
+        if name.casefold() in ready:
+            continue
+        created = agent.get("created_at")
+        if created is not None and created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        age = (now - created).total_seconds() if created is not None else float(AGENT_JOIN_WINDOW_SECONDS)
+        if age < AGENT_JOIN_WINDOW_SECONDS:
+            pending.append({"vm_id": agent["vm_id"], "name": name, "age_seconds": int(age)})
+        else:
+            missing.append({
+                "service": "kubernetes", "resource_type": "node", "resource_id": agent["vm_id"],
+                "name": name, "is_required": True,
+                "reason": f"Required {_AGENT_NODE_MARK} '{name}' is not Ready",
+            })
+    return missing, pending
+
 def _is_not_found(exc: Exception) -> bool:
     if isinstance(exc, (ResourceNotFound, NotFoundException)):
         return True
@@ -599,11 +656,14 @@ async def reconcile_cluster(
                     "reason": reason,
                 })
 
+        agent_missing, agent_pending = await _observe_agent_join(cluster_dict)
+        missing_resources.extend(agent_missing)
+
         # Scan for unknown tagged orphan resources (report-only, no deletion)
         orphaned_resources = await run_sync(scan_orphan_resources, conn, project_id, cluster_id, known_resource_ids)
 
         has_missing_required = any(m.get("is_required", True) for m in missing_resources)
-        has_drift = bool(missing_resources or orphaned_resources or state_mismatches)
+        has_drift = bool(missing_resources or orphaned_resources or state_mismatches or agent_pending)
 
         drift_summary = {
             "has_drift": has_drift,
@@ -614,6 +674,7 @@ async def reconcile_cluster(
             "orphans": orphaned_resources,
             "mismatches": state_mismatches,
             "reconciled_at": _now().isoformat(),
+            **({"agent_join_pending": agent_pending} if agent_pending else {}),
         }
 
         # Update cluster record status and drift_status

@@ -157,6 +157,7 @@ Requests carrying `Idempotency-Key` retain structured reason/message/quota but *
     "key_name": "my-key",
     "os_type": "ubuntu",
     "allowed_cidrs": ["10.0.0.0/8"],
+    "profile": null,
     "template_id": "template-uuid",
     "master_count": 1,
     "stampede_enabled": true
@@ -164,6 +165,7 @@ Requests carrying `Idempotency-Key` retain structured reason/message/quota but *
   ```
 - **Stampede 기본값(0.4.13)**: `stampede_enabled`를 생략하면 새 클러스터는 Stampede가 켜진 상태로 생성됩니다. 끄려면 명시적으로 `false`를 보냅니다. 기존 클러스터의 저장된 값은 바꾸지 않습니다. `default-server`와 사용자가 요청한 초기 worker의 `default-agent` 그룹은 자동 축소 대상이 아니며(`stampede_enabled=false`) 자동 증감은 명시적 flavor를 가진 nodegroup에서 수행됩니다. 서버 전역 `stampede_enabled`의 Kolla·TOML 기본값도 `true`이며 운영자는 `false`로 전체를 끌 수 있습니다([요청 schema](../drover/models/schemas.py), [저장](../drover/services/store.py), [default group](../drover/services/nodegroup.py)).
 - **클러스터 네트워크**: `network_id`는 Neutron 외부 네트워크의 ID만 받습니다. 생략하면 관리자 `k3s.default_network` 정책의 외부 네트워크 ID를 조회·재검증합니다. 공유 네트워크라도 외부가 아니면 명시 요청과 기본 정책 모두 사용할 수 없습니다. 명시한 네트워크가 없거나 내부이면 기록 전에 `400`, 기본 정책이 누락·만료되면 `503`, 네트워크 조회 서비스가 불가하면 `503`으로 거부하며 Nova 자동 네트워크 선택으로 우회하지 않습니다. 선택한 ID와 이름은 cluster/job의 `resource_policy_snapshot["k3s.default_network"]`에, ID는 `network_id`에도 저장되고 primary·HA·agent·nodegroup 프로비저닝과 후속 scale에 사용됩니다. [요청 처리](../drover/api/clusters.py), [정책 제약과 조회](../drover/services/resource_policies.py), [정책 스냅샷](../drover/services/resource_policy_store.py), [직접 VM 생성](../drover/services/provisioner.py), [노드그룹 VM 생성](../drover/services/autoscale.py).
+- **관리자 profile (미릴리스)**: `profile`은 `PUT /v1/admin/runtime-settings/k3s.cluster_profiles`로 관리자가 정의한 이름(소문자·숫자·하이픈, 최대 32자)이다. profile을 지정하면 `network_id`와 `allowed_cidrs`를 함께 보낼 수 없고(`400`), 네트워크와 SSH/API/NodePort/HTTP(S) 접근 CIDR은 profile에서만 옵니다. 정의되지 않은 이름은 `400`, profile 정책이 비정상이거나 profile 네트워크가 사라졌으면 `503`입니다. 값 형식은 `{"<name>": {"network_id": "...", "ssh_cidrs": [...], "api_cidrs": [...], "nodeport_cidrs": [...], "http_cidrs": [...]}}`이고 `ssh_cidrs`·`api_cidrs`·`nodeport_cidrs`는 비어 있을 수 없으며 `http_cidrs`가 비어 있으면 80/443을 열지 않습니다. profile cluster의 `network_id`, 보안 그룹 규칙 식별자, `drift_status` 상세는 관리자 응답에서만 보입니다. 모든 cluster는 자기 security group에서 오는 tcp/6443 규칙을 항상 갖습니다. [요청 처리](../drover/api/clusters.py), [규칙 계획](../drover/services/provisioner.py), [검증](../drover/services/resource_policy_store.py).
 - **응답 (200 OK)**: `text/event-stream` (SSE 스트림)
   - 이벤트 라인 형식 (`K3sProgressMessage`):
     `data: {"step": "security_group", "progress": 10, "message": "...", "cluster_id": "...", "operation_id": "op-123"}`
@@ -522,6 +524,7 @@ Policy `drover:admin` (시스템 관리자 전용) 인증이 요구되는 관리
   - `PUT /v1/admin/resource-policies/{policy_key}`: 자원 정책 동적 업데이트
   - `GET /v1/admin/runtime-settings`: 런타임 설정 조회
   - `PUT /v1/admin/runtime-settings/{setting_key}`: 런타임 설정 동적 업데이트
+  - `k3s.cluster_profiles`: 이름 있는 클러스터 네트워크 profile(관리자 전용). 값은 위 형식이며 검증에 실패하면 `422`입니다.
 
 ---
 

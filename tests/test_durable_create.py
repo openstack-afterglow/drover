@@ -567,7 +567,7 @@ async def test_native_security_quota_shortage_never_issues_or_queues(
     assert detail["quota"] == {
         "project_id": "proj-test-123",
         "resource": resource,
-        "required": 1 if resource == "security_group" else 11,
+        "required": 1 if resource == "security_group" else 12,
         "available": 0,
         **entries[resource],
     }
@@ -715,3 +715,67 @@ async def test_overlapping_keyed_refusal_cannot_claim_no_operation_exists(
     replay = await async_client.post("/v1/clusters/async", headers=headers, json=body)
     assert replay.status_code == 200
     assert len(store.clusters) == len(store.jobs) == len(store.operations) == 1
+
+
+_PROFILE = {
+    "network_id": "external-net",
+    "ssh_cidrs": ["172.30.0.50/32"],
+    "api_cidrs": ["172.30.0.11/32", "172.30.0.12/32"],
+    "nodeport_cidrs": ["172.30.0.11/32"],
+    "http_cidrs": [],
+}
+
+
+@pytest.fixture
+def cluster_profile(monkeypatch):
+    monkeypatch.setattr(
+        "drover.services.resource_policy_store.get_cluster_profile",
+        AsyncMock(side_effect=lambda name: dict(_PROFILE) if name == "sandbox" else None),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra", [{"allowed_cidrs": ["0.0.0.0/0"]}, {"network_id": "external-net"}])
+async def test_profile_rejects_request_level_network_and_cidrs_before_durable_writes(
+    async_client, store, cluster_profile, extra
+):
+    response = await async_client.post("/v1/clusters/async", json={"name": "p", "profile": "sandbox", **extra})
+
+    assert response.status_code == 400
+    assert store.clusters == {} and store.jobs == {} and store.operations == {}
+
+
+@pytest.mark.asyncio
+async def test_unknown_profile_is_rejected_before_durable_writes(async_client, store, cluster_profile):
+    response = await async_client.post("/v1/clusters/async", json={"name": "p", "profile": "missing"})
+
+    assert response.status_code == 400
+    assert store.clusters == {} and store.jobs == {} and store.operations == {}
+
+
+@pytest.mark.asyncio
+async def test_invalid_profile_policy_fails_closed(async_client, store, monkeypatch):
+    from drover.services.resource_policy_store import RuntimeSettingValidationError
+
+    monkeypatch.setattr(
+        "drover.services.resource_policy_store.get_cluster_profile",
+        AsyncMock(side_effect=RuntimeSettingValidationError("bad")),
+    )
+    response = await async_client.post("/v1/clusters/async", json={"name": "p", "profile": "sandbox"})
+
+    assert response.status_code == 503
+    assert store.clusters == {} and store.jobs == {}
+
+
+@pytest.mark.asyncio
+async def test_profile_cluster_snapshots_administrator_sources_not_request_values(async_client, store, cluster_profile):
+    response = await async_client.post("/v1/clusters/async", json={"name": "profiled", "profile": "sandbox"})
+
+    assert response.status_code == 200
+    cluster = next(iter(store.clusters.values()))
+    job = next(iter(store.jobs.values())).payload_json
+    for data in (cluster, job):
+        snapshot = data["resource_policy_snapshot"]["cluster_profile"]
+        assert snapshot == {"name": "sandbox", **_PROFILE}
+        assert data["network_id"] == "external-net"
+        assert data["allowed_cidrs"] is None

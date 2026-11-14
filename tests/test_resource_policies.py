@@ -99,5 +99,5 @@ def test_k3s_version_runtime_setting_rejects_invalid_values(value):
 
 
 def test_runtime_setting_registry_is_drover_scoped():
-    assert set(store.RUNTIME_SETTING_SPECS) == {"k3s.version"}
+    assert set(store.RUNTIME_SETTING_SPECS) == {"k3s.version", "k3s.cluster_profiles"}
     assert store._validate_runtime_value("k3s.version", " v1.31.5+k3s1 ") == "v1.31.5+k3s1"

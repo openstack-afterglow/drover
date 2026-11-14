@@ -69,7 +69,29 @@ def _rand_suffix(length: int = 5) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
-def _cluster_to_info(c: dict) -> K3sClusterInfo:
+def _has_cluster_profile(c: dict) -> bool:
+    snapshot = c.get("resource_policy_snapshot")
+    return isinstance(snapshot, dict) and bool(snapshot.get("cluster_profile"))
+
+
+def _tenant_status_reason(reason: str | None) -> str | None:
+    # Reconciliation reasons can name security-group rules; profile clusters keep those administrator-only.
+    if reason and "security_group" in reason.replace(" ", "_").lower():
+        return "Reconciliation failed: managed network resource drift (administrator review required)"
+    return reason or None
+
+
+def _tenant_drift_status(drift: dict | None) -> dict | None:
+    if not drift:
+        return None
+    kept = {k: v for k, v in drift.items() if k not in {"missing", "orphans", "mismatches"}}
+    kept["details_hidden"] = True
+    return kept
+
+
+def _cluster_to_info(c: dict, *, admin: bool = False) -> K3sClusterInfo:
+    """Build the response model; non-administrators never see network or security-group identifiers of profile clusters."""
+    hidden = not admin and _has_cluster_profile(c)
     agent_vm_ids = c.get("agent_vm_ids") or []
     if isinstance(agent_vm_ids, str):
         import json
@@ -83,13 +105,13 @@ def _cluster_to_info(c: dict) -> K3sClusterInfo:
         project_id=c.get("project_id", ""),
         name=c.get("name", ""),
         status=c.get("status", ""),
-        status_reason=c.get("status_reason") or None,
+        status_reason=(_tenant_status_reason(c.get("status_reason")) if hidden else c.get("status_reason") or None),
         server_vm_id=c.get("server_vm_id") or None,
         agent_vm_ids=agent_vm_ids,
         agent_count=int(c.get("agent_count") or 0),
         api_address=c.get("api_address") or None,
         server_ip=c.get("server_ip") or None,
-        network_id=c.get("network_id") or None,
+        network_id=None if hidden else (c.get("network_id") or None),
         key_name=c.get("key_name") or None,
         k3s_version=c.get("k3s_version") or None,
         created_at=c.get("created_at") or None,
@@ -105,7 +127,7 @@ def _cluster_to_info(c: dict) -> K3sClusterInfo:
         master_count=int(c.get("master_count") or 1),
         stampede_enabled=bool(c.get("stampede_enabled", False)),
         last_reconciled_at=c.get("last_reconciled_at") or None,
-        drift_status=c.get("drift_status") or None,
+        drift_status=(_tenant_drift_status(c.get("drift_status")) if hidden else c.get("drift_status") or None),
     )
 
 
@@ -512,6 +534,8 @@ async def create_k3s_cluster_async(
         from drover.services.resource_policies import validate_existing_selection
         from drover.services.resource_policy_store import (
             ResourcePolicyStorageUnavailable,
+            RuntimeSettingValidationError,
+            get_cluster_profile,
             get_policy_snapshot,
             get_required_runtime_setting,
             resolve_policy_snapshot,
@@ -570,7 +594,31 @@ async def create_k3s_cluster_async(
             selection = await validate_existing_selection(conn, optional_key, stored_selection["id"])
             policy_snapshot[optional_key] = {"id": selection["id"], "name": selection["name"]}
 
-        if req.network_id:
+        cluster_profile: dict | None = None
+        if req.profile:
+            if req.network_id or req.allowed_cidrs is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A profile supplies the network and every ingress CIDR set; omit network_id and allowed_cidrs",
+                )
+            try:
+                cluster_profile = await get_cluster_profile(req.profile)
+            except ResourcePolicyStorageUnavailable as exc:
+                raise HTTPException(status_code=503, detail="resource policy storage is unavailable") from exc
+            except RuntimeSettingValidationError as exc:
+                raise HTTPException(status_code=503, detail="Cluster profile policy is invalid") from exc
+            if cluster_profile is None:
+                raise HTTPException(status_code=400, detail="Requested cluster profile is not defined")
+        if cluster_profile is not None:
+            try:
+                selected_network = await validate_existing_selection(
+                    conn, "k3s.default_network", cluster_profile["network_id"]
+                )
+            except (resource_policies.ResourcePolicyValidationError, ResourceNotFound) as exc:
+                raise HTTPException(status_code=503, detail="Cluster profile network is missing or stale") from exc
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="OpenStack network lookup is unavailable") from exc
+        elif req.network_id:
             if not req.network_id.strip():
                 raise HTTPException(status_code=400, detail="Requested network is unavailable or is not external")
             try:
@@ -592,6 +640,8 @@ async def create_k3s_cluster_async(
                 raise HTTPException(status_code=503, detail="OpenStack network lookup is unavailable") from exc
         network_id = selected_network["id"]
         policy_snapshot["k3s.default_network"] = {"id": network_id, "name": selected_network["name"]}
+        if cluster_profile is not None:
+            policy_snapshot["cluster_profile"] = {"name": req.profile, **cluster_profile}
         ssh_public_key = None
         if req.key_name:
             try:
@@ -614,7 +664,7 @@ async def create_k3s_cluster_async(
             # A keyed request can overlap another admission after both initial
             # lookups missed. Its own refusal cannot prove the shared key has
             # no operation; do not mint an authoritative absence marker.
-            await preflight_cluster_security_group(conn, project_id, req.allowed_cidrs)
+            await preflight_cluster_security_group(conn, project_id, req.allowed_cidrs, cluster_profile)
         except SecurityGroupQuotaExceeded as exc:
             raise HTTPException(
                 status_code=409,

@@ -102,46 +102,43 @@ async def _persist_ha_endpoint_snapshot(
     )
 
 
+def _tcp_ingress(port_min: int, port_max: int, **remote) -> dict:
+    return dict(direction="ingress", protocol="tcp", port_range_min=port_min, port_range_max=port_max, **remote)
+
+
 def _cluster_security_group_rules(
     allowed_cidrs: list[str] | None,
     security_group_id: str,
+    profile: dict | None = None,
 ) -> list[dict]:
-    rules = []
-    for cidr in allowed_cidrs or ["0.0.0.0/0"]:
-        rules.append(
-            dict(
-                direction="ingress",
-                protocol="tcp",
-                port_range_min=22,
-                port_range_max=22,
-                remote_ip_prefix=cidr,
-            )
-        )
-        rules.append(
-            dict(
-                direction="ingress",
-                protocol="tcp",
-                port_range_min=6443,
-                port_range_max=6443,
-                remote_ip_prefix=cidr,
-            )
-        )
+    """Plan the cluster security group.
+
+    Without a profile the requester's ``allowed_cidrs`` (default world) select the SSH/API sources and 80, 443 and the
+    NodePort range stay world-open. With an administrator-managed profile every CIDR set comes from the profile; an
+    empty ``http_cidrs`` omits 80/443. tcp/6443 from the cluster's own group is always present so agent nodes can reach
+    the API regardless of how narrow the administrator CIDRs are.
+    """
+    rules: list[dict] = []
+    if profile is None:
+        ssh_cidrs = api_cidrs = list(allowed_cidrs or ["0.0.0.0/0"])
+        nodeport_cidrs = http_cidrs = ["0.0.0.0/0"]
+    else:
+        ssh_cidrs = list(profile["ssh_cidrs"])
+        api_cidrs = list(profile["api_cidrs"])
+        nodeport_cidrs = list(profile["nodeport_cidrs"])
+        http_cidrs = list(profile["http_cidrs"])
+    if profile is None:
+        for cidr in ssh_cidrs:
+            rules.append(_tcp_ingress(22, 22, remote_ip_prefix=cidr))
+            rules.append(_tcp_ingress(6443, 6443, remote_ip_prefix=cidr))
+    else:
+        rules.extend(_tcp_ingress(22, 22, remote_ip_prefix=cidr) for cidr in ssh_cidrs)
+        rules.extend(_tcp_ingress(6443, 6443, remote_ip_prefix=cidr) for cidr in api_cidrs)
+    rules.append(_tcp_ingress(6443, 6443, remote_group_id=security_group_id))
     rules.extend(
         [
-            dict(
-                direction="ingress",
-                protocol="tcp",
-                port_range_min=2379,
-                port_range_max=2380,
-                remote_group_id=security_group_id,
-            ),
-            dict(
-                direction="ingress",
-                protocol="tcp",
-                port_range_min=10250,
-                port_range_max=10250,
-                remote_group_id=security_group_id,
-            ),
+            _tcp_ingress(2379, 2380, remote_group_id=security_group_id),
+            _tcp_ingress(10250, 10250, remote_group_id=security_group_id),
             dict(
                 direction="ingress",
                 protocol="udp",
@@ -156,33 +153,18 @@ def _cluster_security_group_rules(
                 port_range_max=51820,
                 remote_group_id=security_group_id,
             ),
-            dict(
-                direction="ingress",
-                protocol="tcp",
-                port_range_min=80,
-                port_range_max=80,
-                remote_ip_prefix="0.0.0.0/0",
-            ),
-            dict(
-                direction="ingress",
-                protocol="tcp",
-                port_range_min=443,
-                port_range_max=443,
-                remote_ip_prefix="0.0.0.0/0",
-            ),
-            dict(
-                direction="ingress",
-                protocol="tcp",
-                port_range_min=30000,
-                port_range_max=32767,
-                remote_ip_prefix="0.0.0.0/0",
-            ),
         ]
     )
+    for cidr in http_cidrs:
+        rules.append(_tcp_ingress(80, 80, remote_ip_prefix=cidr))
+        rules.append(_tcp_ingress(443, 443, remote_ip_prefix=cidr))
+    rules.extend(_tcp_ingress(30000, 32767, remote_ip_prefix=cidr) for cidr in nodeport_cidrs)
     return rules
 
 
-async def preflight_cluster_security_group(conn, project_id: str, allowed_cidrs: list[str] | None) -> None:
+async def preflight_cluster_security_group(
+    conn, project_id: str, allowed_cidrs: list[str] | None, profile: dict | None = None
+) -> None:
     from drover.services import neutron
 
     try:
@@ -190,7 +172,7 @@ async def preflight_cluster_security_group(conn, project_id: str, allowed_cidrs:
             neutron.check_security_group_quota,
             conn,
             project_id,
-            len(_cluster_security_group_rules(allowed_cidrs, "pending-cluster-group")),
+            len(_cluster_security_group_rules(allowed_cidrs, "pending-cluster-group", profile)),
         )
     except neutron.SecurityGroupQuotaExceeded:
         raise
@@ -592,6 +574,7 @@ async def create_cluster_job(
     master_count = int(payload.get("master_count") or 1)
     allowed_cidrs = payload.get("allowed_cidrs") or ["0.0.0.0/0"]
     policy_snapshot = payload.get("resource_policy_snapshot") or {}
+    cluster_profile = policy_snapshot.get("cluster_profile") or None
     server_image_id = payload.get("server_image_id") or ""
     server_flavor_id = payload.get("server_flavor_id") or ""
     boot_volume_size = s.drover_boot_volume_size_gb
@@ -618,7 +601,7 @@ async def create_cluster_job(
             flavors = await worker_ownership.run_sync(nova.list_flavors, conn)
             if not any(flavor.id == payload.get("agent_flavor_id") for flavor in flavors):
                 raise RuntimeError("Selected agent flavor is unavailable")
-        await preflight_cluster_security_group(conn, project_id, allowed_cidrs)
+        await preflight_cluster_security_group(conn, project_id, allowed_cidrs, cluster_profile)
         # Step 1: Security Group
         if operation_id:
             await operations.append_operation_event(
@@ -643,7 +626,7 @@ async def create_cluster_job(
             name=sg_name,
         )
 
-        rules = _cluster_security_group_rules(allowed_cidrs, sg_id)
+        rules = _cluster_security_group_rules(allowed_cidrs, sg_id, cluster_profile)
         for rule_kwargs in rules:
             rule = await worker_ownership.run_sync(neutron.create_security_group_rule, conn, sg_id, **rule_kwargs)
             rule_id = rule.get("id") if isinstance(rule, dict) else getattr(rule, "id", None)

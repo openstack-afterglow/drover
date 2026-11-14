@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,7 +39,60 @@ class RuntimeSettingSpec:
 
 RUNTIME_SETTING_SPECS = {
     "k3s.version": RuntimeSettingSpec("k3s.version", "K3s version", "Version used for new K3s clusters."),
+    "k3s.cluster_profiles": RuntimeSettingSpec(
+        "k3s.cluster_profiles",
+        "Cluster network profiles",
+        "Administrator-managed named network and ingress CIDR sets. A cluster created with a profile takes its "
+        "network and security-group sources only from the profile.",
+    ),
 }
+
+_PROFILE_NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_PROFILE_KEYS = {"network_id", "ssh_cidrs", "api_cidrs", "nodeport_cidrs", "http_cidrs"}
+_PROFILE_REQUIRED_CIDRS = ("ssh_cidrs", "api_cidrs", "nodeport_cidrs")
+_PROFILE_MAX_CIDRS = 20
+
+
+def _profile_cidrs(profile_name: str, key: str, value: object, *, required: bool) -> list[str]:
+    if not isinstance(value, list) or len(value) > _PROFILE_MAX_CIDRS or (required and not value):
+        raise RuntimeSettingValidationError(
+            f"profile {profile_name}: {key} must be a list of at most {_PROFILE_MAX_CIDRS} CIDRs"
+            + (" and may not be empty" if required else "")
+        )
+    normalized: list[str] = []
+    for item in value:
+        try:
+            if not isinstance(item, str):
+                raise ValueError
+            network = str(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            raise RuntimeSettingValidationError(f"profile {profile_name}: {key} contains an invalid CIDR") from None
+        if network not in normalized:
+            normalized.append(network)
+    return normalized
+
+
+def _validate_cluster_profiles(value: object) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict) or not value:
+        raise RuntimeSettingValidationError("k3s.cluster_profiles must be a nonempty object of named profiles")
+    profiles: dict[str, dict[str, Any]] = {}
+    required_keys = {"network_id", *_PROFILE_REQUIRED_CIDRS}
+    for name, raw in value.items():
+        if not isinstance(name, str) or not _PROFILE_NAME.match(name):
+            raise RuntimeSettingValidationError("profile names are lowercase letters, digits and hyphens (max 32)")
+        if not isinstance(raw, dict) or set(raw) - _PROFILE_KEYS or not required_keys <= set(raw):
+            raise RuntimeSettingValidationError(
+                f"profile {name}: required keys are {sorted(required_keys)}; allowed keys are {sorted(_PROFILE_KEYS)}"
+            )
+        network_id = raw["network_id"]
+        if not isinstance(network_id, str) or not network_id.strip() or len(network_id) > 64:
+            raise RuntimeSettingValidationError(f"profile {name}: network_id must be a nonblank ID")
+        entry: dict[str, Any] = {"network_id": network_id.strip()}
+        for key in _PROFILE_REQUIRED_CIDRS:
+            entry[key] = _profile_cidrs(name, key, raw[key], required=True)
+        entry["http_cidrs"] = _profile_cidrs(name, "http_cidrs", raw.get("http_cidrs", []), required=False)
+        profiles[name] = entry
+    return profiles
 
 
 def _require_db():
@@ -189,6 +244,8 @@ def _runtime_spec(key: str) -> RuntimeSettingSpec:
 
 
 def _validate_runtime_value(key: str, value: object) -> object:
+    if key == "k3s.cluster_profiles":
+        return _validate_cluster_profiles(value)
     if key == "k3s.version":
         if not isinstance(value, str) or not value.strip() or len(value.strip()) > 32:
             raise RuntimeSettingValidationError("k3s.version must be a nonblank version string")
@@ -225,6 +282,14 @@ async def get_required_runtime_setting(key: str) -> object:
     if value is None:
         raise RuntimeSettingValidationError(f"required runtime setting is not configured: {key}")
     return _validate_runtime_value(key, value)
+
+
+async def get_cluster_profile(name: str) -> dict[str, Any] | None:
+    """Return the validated administrator profile ``name`` or None when it is not defined."""
+    value = await get_runtime_setting("k3s.cluster_profiles")
+    if value is None:
+        return None
+    return _validate_cluster_profiles(value).get(name)
 
 
 async def set_runtime_setting(*, key: str, value: object, updated_by_user_id: str) -> dict[str, Any]:

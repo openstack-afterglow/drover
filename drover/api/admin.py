@@ -53,7 +53,7 @@ async def list_admin_clusters(
         clusters = [cluster for cluster in clusters if cluster.get("status") in statuses]
     from drover.api.clusters import _cluster_to_info
 
-    return [_cluster_to_info(c) for c in clusters]
+    return [_cluster_to_info(c, admin=True) for c in clusters]
 
 
 @router.get("/clusters/{cluster_id}", response_model=K3sClusterInfo)
@@ -63,7 +63,7 @@ async def get_admin_cluster(cluster_id: str):
         raise HTTPException(status_code=404, detail="클러스터를 찾을 수 없습니다")
     from drover.api.clusters import _cluster_to_info
 
-    return _cluster_to_info(cluster)
+    return _cluster_to_info(cluster, admin=True)
 
 
 @router.get("/clusters/{cluster_id}/kubeconfig")

@@ -104,6 +104,8 @@ graph LR
 4. `/v1/callback`은 CIDR·Redis one-time token 검증 후 kubeconfig를 암호화해 저장한다. `provision_agents`, `bootstrap_ha` 및 HA callback의 Octavia 조회/변경은 create operation의 active delegation을 재사용한다. callback은 새 authority를 부여하지 않으며 trust가 없거나 revoked/만료되면 service/creator fallback 없이 실패한다.
    HA callback의 LB-member update 예외는 현재 warning으로 기록하고 join-count/후속 enqueue를 계속할 수 있다. 이 경로가 callback HTTP/operation을 즉시 terminalize한다고 주장하지 않는다. connection은 다른 identity로 대체하지 않으며 delegation 없는 후속 mutation job은 worker에서 terminal failure다.
 5. agent job이 완료되면 cluster가 `ACTIVE`가 되고 create operation이 `SUCCEEDED`가 된다. callback 실패·누락·30분 timeout은 operation/cluster를 실패 처리한다.
+6. (Source/test-defined, not yet released.) 클러스터 security group plan(`provisioner.py:_cluster_security_group_rules`)은 요청 CIDR이 얼마나 좁든 클러스터 자신의 group에서 오는 tcp/6443을 항상 연다. 이 규칙이 없으면 agent가 API에 접속하지 못해 join하지 않는다. 관리자 `k3s.cluster_profiles` 런타임 설정(`resource_policy_store.py:_validate_cluster_profiles`, 관리자 API `PUT /v1/admin/runtime-settings/k3s.cluster_profiles`)에 정의한 이름 있는 profile로 만든 cluster(`profile` 요청 필드)는 네트워크와 SSH/API/NodePort/HTTP(S) CIDR을 profile에서만 받고 요청의 `network_id`·`allowed_cidrs`는 `400`으로 거부한다. profile은 `resource_policy_snapshot["cluster_profile"]`에 스냅샷되고 규칙은 다른 규칙처럼 inventory에 기록된다. 따라서 기록된 규칙을 out-of-band로 삭제·교체하면 reconcile이 `ERROR`로 표시한다(과거 NodePort 강화가 그렇게 `ERROR`를 만들었다). 비관리자 응답(`clusters.py:_cluster_to_info`)은 profile cluster의 `network_id`, 규칙 식별자를 담은 `status_reason`과 `drift_status` 상세를 숨기고 관리자 응답(`admin=True`)만 전체를 보인다.
+7. (Source/test-defined, not yet released.) agent 합류 관찰은 reconcile이 맡는다(`reconciliation.py:_observe_agent_join`). 기록된 agent VM이 Kubernetes node로 Ready가 아니면 합류 창(`AGENT_JOIN_WINDOW_SECONDS`, 900초) 동안은 비필수 `agent_join_pending` drift로만 남고, 창이 지나면 reconciler 소유 `ERROR`(`Reconciliation failed: Required Kubernetes agent node '<name>' is not Ready`)가 된다. 이 `ERROR`는 이후 reconcile이 node Ready를 관찰하면 기존 경로로 자동 회복된다. `provision_agents`는 같은 `create` operation 종류이고 reconcile이 FAILED/CANCELLED create operation을 영구 상태 불일치로 보므로, 느린 join 때문에 create operation을 실패시키지 않는다. node 목록을 관찰할 수 없으면 새로 보고하지 않지만 이전 agent-node `ERROR`는 지우지 않고 이어 간다.
 
 Cluster creation performs read-only native Neutron security-group/rule admission through `neutron.check_security_group_quota` and `provisioner.preflight_cluster_security_group` before trust/credential/cluster/job creation, then repeats it using the worker's verified execution connection before its first group write. Strict integer limit/used/reserved values, the existing authored ingress plan, provider default-rule templates and an empty project's implicit default group/rules determine the budget. System-managed groups use the same project quota; no privileged increase, alternate project, resource reservation or automatic mutation retry is introduced. Native Neutron still arbitrates concurrent writers.
 
@@ -330,9 +332,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "758c124efe08f6a150c12ebfe084c46929e8ace15c2c88541b40ef13f42ab6e1",
-  "reviewed_at": "2026-11-13T08:57:27Z",
-  "summary": "0.4.19 publication and three-controller deployment status corrected; synchronized non-Drover container cohorts recorded with unknown initiating operation; no runtime code change."
+  "source_sha256": "e483bc3ad27e514728d5984fadc4ea875f2aadabb5e8fa0efd5c9a2df488fba5",
+  "reviewed_at": "2026-11-14T04:48:28Z",
+  "summary": "Phase 1 cluster profile, self-group 6443, recoverable agent-join observation; reviewed ARCHITECTURE create flow items 6-7 and API reference"
 }
 ```
 <!-- architecture-review:end -->

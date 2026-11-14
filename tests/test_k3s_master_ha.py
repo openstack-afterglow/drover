@@ -37,7 +37,14 @@ def test_ha_security_group_allows_embedded_etcd_between_masters():
         "remote_group_id": "sg-1",
     } in rules
 
-    assert len(rules) == 9
+    assert len(rules) == 10
+    assert {
+        "direction": "ingress",
+        "protocol": "tcp",
+        "port_range_min": 6443,
+        "port_range_max": 6443,
+        "remote_group_id": "sg-1",
+    } in rules
     assert {
         (rule["protocol"], rule["port_range_min"], rule["port_range_max"])
         for rule in rules
