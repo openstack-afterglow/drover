@@ -141,6 +141,7 @@ DEFAULT_RULES: list[policy.RuleDefault] = [
     _project_rule("drover:access:read"),
     _project_rule("drover:access:admin"),
     _project_rule("drover:workloads:write"),
+    _project_rule("drover:sandbox:connect"),
     _project_rule("drover:certificates:rotate"),
     policy.RuleDefault("drover:templates:manage", "rule:context_is_admin"),
     policy.RuleDefault("drover:admin", "rule:context_is_admin"),
@@ -156,6 +157,7 @@ _RESTRICTED_ACTIONS = _SYSTEM_ACTIONS | frozenset({
     # Guest/control application credentials carry provider member authority, not
     # permission to mint further access or mutate other clusters in the project.
     "drover:access:get", "drover:access:read", "drover:workloads:write", "drover:certificates:rotate",
+    "drover:sandbox:connect",
 })
 _ACTIONS = tuple(sorted(rule.name for rule in DEFAULT_RULES if rule.name.startswith("drover:")))
 # UI labels only: never inserted into credentials or delegated to Keystone.

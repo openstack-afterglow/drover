@@ -179,6 +179,39 @@ async def ensure_workload_namespace(cluster_id: str, token_info: dict) -> str:
     return namespace
 
 
+async def _request_token(client: httpx.AsyncClient, server: str, account: str, sa_uid: str,
+                         deadline: datetime) -> tuple[str, datetime]:
+    """TokenRequest for an issuer-namespace account, verified against identity and deadline."""
+    ttl = math.floor((deadline - datetime.now(UTC)).total_seconds())
+    if ttl < 600:
+        raise HTTPException(401, "Keystone token has insufficient remaining lifetime")
+    response = await client.post(f"{server}/api/v1/namespaces/{ISSUER_NAMESPACE}/serviceaccounts/{account}/token", json={
+        "apiVersion": "authentication.k8s.io/v1", "kind": "TokenRequest", "spec": {"expirationSeconds": ttl},
+    })
+    if response.status_code not in (200, 201):
+        raise K3sApiError(502, "Kubernetes token issuance failed")
+    status = response.json()["status"]
+    token = status["token"]
+    try:
+        expiry = _expiry(status["expirationTimestamp"])
+    except HTTPException:
+        raise K3sApiError(502, "Kubernetes token expiration is invalid") from None
+    # Provider-authenticated JWT claims must agree with the requested identity and expiry.
+    payload = token.split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    identity = claims["kubernetes.io"]
+    jwt_expiry = datetime.fromtimestamp(claims["exp"], UTC)
+    if (claims["sub"] != f"system:serviceaccount:{ISSUER_NAMESPACE}:{account}"
+            or identity["namespace"] != ISSUER_NAMESPACE
+            or identity["serviceaccount"]["name"] != account
+            or identity["serviceaccount"]["uid"] != sa_uid
+            or not datetime.now(UTC) < expiry <= deadline
+            or not datetime.now(UTC) < jwt_expiry <= deadline
+            or jwt_expiry != expiry):
+        raise K3sApiError(502, "Kubernetes token identity or lifetime mismatch")
+    return token, expiry
+
+
 async def issue_kubeconfig(cluster_id: str, token_info: dict, *, grade: str) -> IssuedKubeconfig:
     """Issue fresh RBAC/TokenRequest credentials, never cache or fall back to admin."""
     project_id, user_id = token_info.get("project_id"), token_info.get("user_id")
@@ -226,33 +259,7 @@ async def issue_kubeconfig(cluster_id: str, token_info: dict, *, grade: str) -> 
                 "metadata": {"name": account}, "subjects": [subject],
                 "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": kind, "name": account},
             })
-            ttl = math.floor((deadline - datetime.now(UTC)).total_seconds())
-            if ttl < 600:
-                raise HTTPException(401, "Keystone token has insufficient remaining lifetime")
-            response = await client.post(f"{server}/api/v1/namespaces/{ISSUER_NAMESPACE}/serviceaccounts/{account}/token", json={
-                "apiVersion": "authentication.k8s.io/v1", "kind": "TokenRequest", "spec": {"expirationSeconds": ttl},
-            })
-            if response.status_code not in (200, 201):
-                raise K3sApiError(502, "Kubernetes token issuance failed")
-            status = response.json()["status"]
-            token = status["token"]
-            try:
-                expiry = _expiry(status["expirationTimestamp"])
-            except HTTPException:
-                raise K3sApiError(502, "Kubernetes token expiration is invalid") from None
-            # Provider-authenticated JWT claims must agree with the requested identity and expiry.
-            payload = token.split(".")[1]
-            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-            identity = claims["kubernetes.io"]
-            jwt_expiry = datetime.fromtimestamp(claims["exp"], UTC)
-            if (claims["sub"] != f"system:serviceaccount:{ISSUER_NAMESPACE}:{account}"
-                    or identity["namespace"] != ISSUER_NAMESPACE
-                    or identity["serviceaccount"]["name"] != account
-                    or identity["serviceaccount"]["uid"] != sa["metadata"]["uid"]
-                    or not datetime.now(UTC) < expiry <= deadline
-                    or not datetime.now(UTC) < jwt_expiry <= deadline
-                    or jwt_expiry != expiry):
-                raise K3sApiError(502, "Kubernetes token identity or lifetime mismatch")
+            token, expiry = await _request_token(client, server, account, sa["metadata"]["uid"], deadline)
         config = {"apiVersion": "v1", "kind": "Config", "clusters": [{"name": cluster_id, "cluster": public_cluster}],
                   "users": [{"name": account, "user": {"token": token}}],
                   "contexts": [{"name": account, "context": {"cluster": cluster_id, "user": account, "namespace": namespace}}],

@@ -12,19 +12,20 @@
 3. **Cluster network profile.** New admin-only policy `k3s.cluster_profiles` (name to profile): `network_id`, `ssh_cidrs`, `api_cidrs`, `nodeport_cidrs`, `http_cidrs` (empty to omit 80/443), self-group rules fixed. A request may carry `profile` (name). With a profile, request-level `allowed_cidrs` and `network_id` are rejected with 400; without a profile the current behaviour stays for backward compatibility. Profile rules are recorded like any rule, so removing them out of band is still drift. The profile is admin-managed; its rule detail and security-group/network identifiers are returned only to `drover:admin`.
 4. **Visibility.** Cluster and operation responses for non-admin callers omit `security_group_id`, rule details and network identifiers for profile clusters; the sandbox project has no human members and its groups are not shared.
 
-## Phase 2 design (contract draft, to be agreed with the Lumen session)
+## Phase 2 design (implemented; contract still to be confirmed by the Lumen session)
 
-`POST /v1/clusters/{id}/sandbox-connection` with body `{ "deployment_id": str, "pool_name": str }` (labels bind the namespace to a Lumen pool). Human-token action (new `drover:sandbox:connect` in the restricted action set for credential tokens). Response:
+`POST /v1/clusters/{id}/sandbox-connection` with body `{ "deployment_id": str, "pool_name": str, "runtime_class_name": "gvisor" }` (labels bind the namespace to a Lumen pool). Human-token action: the new `drover:sandbox:connect` is in the restricted action set, so credential tokens are refused. Implemented response (differences from the first draft: `token` not `bearer_token`; the RuntimeClass object with handler/uid/`spec_sha256` is Phase 3 evidence, only `runtime_class_name` is returned now):
 
 ```json
 {
   "server": "https://<api>:6443",
   "ca_pem": "-----BEGIN CERTIFICATE-----...",
-  "namespace": "lumen-<id>",
+  "namespace": "drover-sandbox-<24hex>",
   "namespace_uid": "<uid>",
-  "bearer_token": "<expiring TokenRequest token>",
+  "service_account": "drover-sandbox-<24hex>",
+  "token": "<expiring TokenRequest token>",
   "expires_at": "<RFC3339>",
-  "runtime_class": {"name": "gvisor", "handler": "runsc", "uid": "<uid>", "spec_sha256": "<hex>"}
+  "runtime_class_name": "gvisor"
 }
 ```
 

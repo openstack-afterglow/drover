@@ -154,7 +154,7 @@ def test_allow_all_cannot_cross_project_or_credential_ceiling(tmp_path, restrict
         assert authorize(action, None, token, policy_file=str(path))
         assert not authorize(action, {"project_id": "other"}, token, do_raise=False, policy_file=str(path))
     for action in ("drover:access:get", "drover:access:read", "drover:access:admin",
-                   "drover:workloads:write", "drover:certificates:rotate",
+                   "drover:workloads:write", "drover:certificates:rotate", "drover:sandbox:connect",
                    "drover:clusters:create", "drover:clusters:scale", "drover:clusters:delete",
                    "drover:clusters:reauthorize", "drover:clusters:retire_credentials"):
         assert authorize(action, None, token, do_raise=False, policy_file=str(path)) is not restricted

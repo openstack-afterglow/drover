@@ -150,7 +150,7 @@ async def native_boundary(monkeypatch):
     principal = {"project_id": "project-one", "user_id": "user-one", "roles": MEMBER_ROLES,
                  "expires_at": (datetime.now(UTC) + timedelta(seconds=800)).isoformat(), "is_system_admin": False}
     stored = yaml.safe_dump({"apiVersion": "v1", "clusters": [{"name": "admin", "cluster": {
-        "server": boundary.server, "certificate-authority-data": "synthetic-ca"}}],
+        "server": boundary.server, "certificate-authority-data": base64.b64encode(b"synthetic-ca").decode()}}],
         "users": [{"name": "admin", "user": {"client-certificate-data": "Y2VydA==", "client-key-data": "a2V5"}}]})
     cluster = {"id": "cluster-one", "project_id": "project-one", "name": "native-smoke"}
 
@@ -536,3 +536,123 @@ async def test_user_issuer_uses_exact_read_action_not_log_content(native_boundar
     assert native_boundary.k8s.tokens
     assert "drover:access:read" in policy.capabilities(native_boundary.principal)["actions"]
     assert "drover:access:get" not in policy.capabilities(native_boundary.principal)["actions"]
+
+
+# --- sandbox connection (least-privilege controller access) -------------------------------------
+
+async def _sandbox(smoke, **overrides):
+    smoke.cluster["status"] = "ACTIVE"
+    body = {"deployment_id": "lumen-prod", "pool_name": "agent-sandbox"}
+    body.update(overrides)
+    return await smoke.route.post("/v1/clusters/cluster-one/sandbox-connection", json=body)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_connection_prepares_namespace_and_scopes_the_token(native_boundary):
+    from drover.services import sandbox_connection as sc
+
+    smoke = native_boundary
+    first, second = await _sandbox(smoke), await _sandbox(smoke)
+    assert first.status_code == second.status_code == 200
+    data = first.json()
+    namespace = sc.sandbox_namespace("project-one", "cluster-one", "lumen-prod", "agent-sandbox")
+    assert data["namespace"] == namespace == second.json()["namespace"]
+    assert data["namespace_uid"] == "uid-" + namespace
+    assert data["server"] == smoke.k8s.server and data["runtime_class_name"] == "gvisor"
+    assert data["ca_pem"] == "synthetic-ca"
+    assert data["token"] != second.json()["token"]
+    assert first.headers["cache-control"] == "no-store"
+    expiry = datetime.fromisoformat(data["expires_at"])
+    assert datetime.now(UTC) < expiry <= datetime.fromisoformat(smoke.principal["expires_at"])
+
+    objects = {path: obj for path, obj in smoke.k8s.objects.items()}
+    ns = objects["/api/v1/namespaces/" + namespace]
+    assert ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "restricted"
+    assert ns["metadata"]["labels"][sc.DEPLOYMENT_LABEL] == "lumen-prod"
+    assert ns["metadata"]["annotations"] == {sc.DEPLOYMENT_LABEL: "lumen-prod", sc.POOL_LABEL: "agent-sandbox"}
+    policy = objects[f"/apis/networking.k8s.io/v1/namespaces/{namespace}/networkpolicies/{sc.NETWORK_POLICY_NAME}"]
+    assert policy["spec"] == {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}
+    account = data["service_account"]
+    role = objects[f"/apis/rbac.authorization.k8s.io/v1/namespaces/{namespace}/roles/{account}"]
+    assert role["rules"] == sc.NAMESPACE_RULES
+    assert not any("*" in rule["verbs"] + rule["resources"] for rule in role["rules"])
+    cluster_role = objects[f"/apis/rbac.authorization.k8s.io/v1/clusterroles/{account}"]
+    assert cluster_role["rules"][0]["resourceNames"] == [namespace]
+    assert cluster_role["rules"][1]["resourceNames"] == ["gvisor"]
+
+    async with httpx.AsyncClient(base_url=smoke.k8s.server, headers={"Authorization": "Bearer " + data["token"]}) as k8s:
+        assert (await k8s.get(f"/api/v1/namespaces/{namespace}/pods")).status_code == 200
+        assert (await k8s.post(f"/api/v1/namespaces/{namespace}/secrets")).status_code == 200
+        assert (await k8s.get(f"/apis/networking.k8s.io/v1/namespaces/{namespace}/networkpolicies")).status_code == 200
+        assert (await k8s.get("/apis/node.k8s.io/v1/runtimeclasses/gvisor")).status_code == 200
+        for method, path in [
+            ("GET", f"/api/v1/namespaces/{namespace}/secrets"),
+            ("POST", f"/api/v1/namespaces/{namespace}/pods/example/exec"),
+            ("POST", f"/api/v1/namespaces/{namespace}/serviceaccounts/default/token"),
+            ("GET", f"/apis/rbac.authorization.k8s.io/v1/namespaces/{namespace}/roles"),
+            ("GET", f"/apis/apps/v1/namespaces/{namespace}/deployments"),
+            ("GET", "/api/v1/namespaces/other/pods"),
+            ("GET", "/api/v1/nodes"),
+            ("GET", "/apis/rbac.authorization.k8s.io/v1/clusterroles"),
+        ]:
+            assert (await k8s.request(method, path)).status_code == 403, path
+
+
+@pytest.mark.asyncio
+async def test_sandbox_connection_is_separate_per_deployment_and_pool(native_boundary):
+    from drover.services import sandbox_connection as sc
+
+    smoke = native_boundary
+    first = (await _sandbox(smoke)).json()
+    other_pool = (await _sandbox(smoke, pool_name="other")).json()
+    other_deployment = (await _sandbox(smoke, deployment_id="lumen-dev")).json()
+    assert len({first["namespace"], other_pool["namespace"], other_deployment["namespace"]}) == 3
+    assert len({first["service_account"], other_pool["service_account"], other_deployment["service_account"]}) == 3
+    assert sc.sandbox_namespace("project-two", "cluster-one", "lumen-prod", "agent-sandbox") != first["namespace"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("roles,restricted,status", [
+    (["reader"], False, 403), (["member"], True, 403), (["drover_user"], False, 403),
+])
+async def test_sandbox_connection_refuses_readers_and_credential_tokens(native_boundary, roles, restricted, status):
+    smoke = native_boundary
+    smoke.principal["roles"] = roles
+    smoke.principal["credential_restricted"] = restricted
+    response = await _sandbox(smoke)
+    assert response.status_code == status
+    assert smoke.k8s.requests == []
+
+
+@pytest.mark.asyncio
+async def test_sandbox_connection_requires_an_active_owned_cluster_and_valid_names(native_boundary):
+    smoke = native_boundary
+    smoke.cluster["status"] = "ERROR"
+    response = await smoke.route.post("/v1/clusters/cluster-one/sandbox-connection",
+                                      json={"deployment_id": "d", "pool_name": "p"})
+    assert response.status_code == 409
+    missing = await smoke.route.post("/v1/clusters/other-cluster/sandbox-connection",
+                                     json={"deployment_id": "d", "pool_name": "p"})
+    assert missing.status_code == 404
+    for body in ({"deployment_id": "", "pool_name": "p"}, {"deployment_id": "d/../x", "pool_name": "p"},
+                 {"deployment_id": "d", "pool_name": "p", "runtime_class_name": "Bad_Name"},
+                 {"deployment_id": "d", "pool_name": "p", "unexpected": 1}):
+        assert (await smoke.route.post("/v1/clusters/cluster-one/sandbox-connection", json=body)).status_code in (422,)
+    assert smoke.k8s.requests == []
+
+
+@pytest.mark.asyncio
+async def test_sandbox_connection_short_keystone_session_fails_closed(native_boundary):
+    smoke = native_boundary
+    smoke.principal["expires_at"] = (datetime.now(UTC) + timedelta(seconds=300)).isoformat()
+    assert (await _sandbox(smoke)).status_code == 401
+    assert smoke.k8s.requests == []
+
+
+def test_label_value_keeps_valid_values_and_hashes_the_rest():
+    from drover.services.sandbox_connection import label_value
+
+    assert label_value("lumen-prod") == "lumen-prod"
+    hashed = label_value("deployment with spaces/and:colons")
+    assert hashed.startswith("h-") and len(hashed) == 62 and hashed == label_value("deployment with spaces/and:colons")
+    assert label_value("a" * 64) != "a" * 64 and len(label_value("a" * 64)) == 62

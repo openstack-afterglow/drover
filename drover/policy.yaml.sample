@@ -18,6 +18,7 @@
 "drover:access:read": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
 "drover:access:admin": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
 "drover:workloads:write": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
+"drover:sandbox:connect": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
 "drover:certificates:rotate": "rule:context_is_admin or (rule:owner and (role:admin or role:manager or role:member))"
 "drover:templates:manage": "rule:context_is_admin"
 "drover:admin": "rule:context_is_admin"

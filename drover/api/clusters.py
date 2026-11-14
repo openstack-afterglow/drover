@@ -37,6 +37,8 @@ from drover.models.schemas import (
     K3sInterfaceInfo,
     K3sProgressMessage,
     K3sProgressStep,
+    SandboxConnectionInfo,
+    SandboxConnectionRequest,
     ScaleK3sClusterRequest,
     StampedeMutationResponse,
     StampedeStatusResponse,
@@ -922,6 +924,37 @@ async def scale_k3s_cluster(
         extra={"desired_count": desired},
     )
     return {"message": f"스케일링 시작: {current} → {desired}", "agent_count": desired}
+
+
+@router.post("/{cluster_id}/sandbox-connection", response_model=SandboxConnectionInfo,
+             operation_id="issue_sandbox_connection")
+@limiter.limit("30/minute")
+async def issue_sandbox_connection(
+    request: Request,
+    cluster_id: str,
+    body: SandboxConnectionRequest,
+    response: Response,
+    token_info: dict = Depends(get_token_info),
+):
+    """Prepare the sandbox namespace and return a short-lived least-privilege connection.
+
+    The bearer token is never cached or stored; every call returns a fresh one.
+    """
+    from drover.services import sandbox_connection
+
+    issued = await sandbox_connection.issue_sandbox_connection(
+        cluster_id, token_info, deployment_id=body.deployment_id, pool_name=body.pool_name,
+        runtime_class_name=body.runtime_class_name,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    _logger.info("Sandbox connection issued cluster=%s namespace=%s expires_at=%s",
+                 cluster_id, issued.namespace, issued.expires_at.isoformat())
+    return SandboxConnectionInfo(
+        server=issued.server, ca_pem=issued.ca_pem, namespace=issued.namespace, namespace_uid=issued.namespace_uid,
+        service_account=issued.service_account, token=issued.token, expires_at=issued.expires_at,
+        runtime_class_name=issued.runtime_class_name,
+    )
 
 
 @router.delete("/{cluster_id}", status_code=204)

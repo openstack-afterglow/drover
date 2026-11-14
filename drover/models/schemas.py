@@ -5,9 +5,10 @@ from __future__ import annotations
 import ipaddress
 import re
 import uuid
+from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$")
 _NODE_TOKEN_RE = re.compile(r"^[A-Za-z0-9:_+/=.\-]{8,512}$")
@@ -141,6 +142,24 @@ class CreateK3sClusterRequest(BaseModel):
                 raise ValueError(f"allowed_cidrs '{raw}' 가 유효한 CIDR 이 아닙니다: {e}") from e
             validated.append(str(net))
         return validated
+
+
+class SandboxConnectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    deployment_id: str = Field(min_length=1, max_length=128)
+    pool_name: str = Field(min_length=1, max_length=128)
+    runtime_class_name: str = Field(default="gvisor", min_length=1, max_length=253)
+
+
+class SandboxConnectionInfo(BaseModel):
+    server: str
+    ca_pem: str
+    namespace: str
+    namespace_uid: str
+    service_account: str
+    token: str
+    expires_at: datetime
+    runtime_class_name: str
 
 
 class K3sClusterInfo(BaseModel):

@@ -145,6 +145,12 @@ Requests carrying `Idempotency-Key` retain structured reason/message/quota but *
 - **응답 (200 OK)**: `application/yaml`, `Cache-Control: no-store`. 제한 grade는 `X-Credential-Expires-At`, `X-Workload-Namespace` 헤더를 포함한다.
 - **오류**: 권한 없는 grade `403`, 알 수 없는 grade `422`, 다른 프로젝트 cluster `404`, 발급·admission 실패 `502`(관리자 자격으로 대체하지 않음). `HEAD`는 권한만 확인하고 자격을 발급하지 않는다.
 
+### `POST /v1/clusters/{cluster_id}/sandbox-connection`
+- **설명**: sandbox 컨트롤러용 최소권한 연결 발급. project admin/manager/member 또는 검증된 human system-admin만 가능하며 application credential 등 reduced credential과 reader는 `403`이다. cluster가 `ACTIVE`가 아니면 `409`. 호출마다 같은 namespace·RBAC를 멱등 적용하고 새 token을 발급한다. (Rate limit: 30/min)
+- **요청 바디**: `{"deployment_id": str, "pool_name": str, "runtime_class_name": "gvisor"}` — `deployment_id`·`pool_name`은 1–128자(영숫자 시작, `[A-Za-z0-9_.:-]`), `runtime_class_name`은 RuntimeClass 이름이며 기본값 `gvisor`다. 알 수 없는 필드는 `422`.
+- **응답 (200 OK)**: `{"server", "ca_pem", "namespace", "namespace_uid", "service_account", "token", "expires_at", "runtime_class_name"}`, `Cache-Control: no-store`. token 수명은 900초와 호출자 Keystone 만료 중 짧은 쪽이며 600초 미만이면 `401`이다. namespace는 `(project, cluster, deployment_id, pool_name)` 해시로 정해진다(`drover-sandbox-<24hex>`).
+- **권한 범위**: namespace 안에서 pods(get/list/watch/create/delete), pods/log(get), services(get/list/create/delete), secrets(get/create/delete), networkpolicies(get/list/create/delete)만 허용한다. 클러스터 범위로는 해당 Namespace와 지정 RuntimeClass의 `get`, self-review `create`뿐이다. RuntimeClass 생성과 qualification evidence는 제공하지 않는다.
+
 ### `POST /v1/clusters/async`
 - **설명**: 비동기 K3s 클러스터 생성 (SSE 스트림 반환). `Idempotency-Key` 헤더 지원. (Rate limit: 5/min)
 - **요청 바디 (`CreateK3sClusterRequest`)**:
