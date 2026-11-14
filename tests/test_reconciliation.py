@@ -200,6 +200,13 @@ def mock_services(monkeypatch, test_store):
 
     monkeypatch.setattr(store, "list_agent_vms", fake_list_agent_vms)
 
+    async def fake_update_agent_vm_status(cluster_id, vm_id, status):
+        for row in test_store.agent_vms.get(cluster_id, []):
+            if row["vm_id"] == vm_id:
+                row["status"] = status
+
+    monkeypatch.setattr(store, "update_agent_vm_status", fake_update_agent_vm_status)
+
 
 @pytest.mark.asyncio
 async def test_reconcile_all_present(test_store):
@@ -691,21 +698,27 @@ def _health(nodes, *, reachable=True):
         status="HEALTHY" if reachable else "UNREACHABLE",
         api_server_reachable=reachable,
         healthz_ok=reachable,
-        nodes=[K3sNodeHealth(name=n, role="agent" if n != "server-node" else "server", ready=ready) for n, ready in nodes],
+        nodes=[
+            K3sNodeHealth(name=n, role="server" if n == "server-node" else "agent", ready=ready)
+            for n, ready in nodes
+        ],
         checked_at=datetime.now(UTC).isoformat(),
         reachability="direct" if reachable else "unreachable",
     )
 
 
-def _agent_cluster(test_store, *, age_seconds, status="ACTIVE", status_reason=None):
+def _agent_cluster(
+    test_store, *, age_seconds, status="ACTIVE", status_reason=None, name="agent-1", agent_status="CREATING"
+):
     from datetime import timedelta
 
     cluster = test_store.add_cluster("project-1", "cluster-1", {
         "server_vm_id": "server-1", "kubeconfig": "config", "status": status, "status_reason": status_reason,
     })
-    test_store.agent_vms["cluster-1"] = [
-        {"vm_id": "vm-agent", "name": "agent-1", "created_at": datetime.now(UTC) - timedelta(seconds=age_seconds)}
-    ]
+    test_store.agent_vms["cluster-1"] = [{
+        "vm_id": "vm-agent", "name": name, "status": agent_status,
+        "created_at": datetime.now(UTC) - timedelta(seconds=age_seconds),
+    }]
     return cluster
 
 
@@ -715,37 +728,97 @@ def _server_present():
     return conn
 
 
+async def _reconcile():
+    return await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+
+
 @pytest.mark.asyncio
 async def test_agent_still_joining_is_pending_not_error(test_store, monkeypatch):
     from drover.services import health
 
     cluster = _agent_cluster(test_store, age_seconds=120)
     monkeypatch.setattr(health, "check_cluster_health", AsyncMock(return_value=_health([("server-node", True)])))
-    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+    drift = await _reconcile()
     assert cluster["status"] == "ACTIVE"
     assert drift["agent_join_pending"][0]["name"] == "agent-1"
     assert drift["has_drift"] is True and drift["missing_count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_agent_not_ready_after_window_is_recoverable_error(test_store, monkeypatch):
+async def test_never_ready_agent_escalates_only_after_repeated_misses_and_late_join_recovers(test_store, monkeypatch):
     from drover.services import health
 
     cluster = _agent_cluster(test_store, age_seconds=reconciliation.AGENT_JOIN_WINDOW_SECONDS + 60)
     check = AsyncMock(return_value=_health([("server-node", True)]))
     monkeypatch.setattr(health, "check_cluster_health", check)
-    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+
+    first = await _reconcile()  # one miss is not enough, even past the window (rollout/blip protection)
+    assert cluster["status"] == "ACTIVE" and first["missing_count"] == 0
+    assert first["agent_join_misses"] == {"vm-agent": 1}
+
+    second = await _reconcile()
     assert cluster["status"] == "ERROR"
     assert cluster["status_reason"].startswith("Reconciliation failed:")
     assert "Kubernetes agent node 'agent-1' is not Ready" in cluster["status_reason"]
-    assert drift["missing_count"] == 1 and "agent_join_pending" not in drift
+    assert second["missing_count"] == 1
 
-    # A late join clears the reconciler-owned ERROR without operator action.
+    third = await _reconcile()  # the escalation must not flip-flop back to ACTIVE
+    assert cluster["status"] == "ERROR" and third["missing_count"] == 1
+
     check.return_value = _health([("server-node", True), ("agent-1", True)])
-    recovered = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+    recovered = await _reconcile()
     assert recovered["has_drift"] is False
-    assert cluster["status"] == "ACTIVE"
-    assert not cluster["status_reason"]
+    assert cluster["status"] == "ACTIVE" and not cluster["status_reason"]
+    assert test_store.agent_vms["cluster-1"][0]["status"] == reconciliation.AGENT_READY_STATUS
+
+
+@pytest.mark.asyncio
+async def test_agent_that_was_ready_never_escalates_after_a_restart(test_store, monkeypatch):
+    from drover.services import health
+
+    cluster = _agent_cluster(
+        test_store, age_seconds=86400, agent_status=reconciliation.AGENT_READY_STATUS
+    )
+    monkeypatch.setattr(health, "check_cluster_health", AsyncMock(return_value=_health([("server-node", True)])))
+    for _ in range(4):
+        drift = await _reconcile()
+    assert cluster["status"] == "ACTIVE" and drift["missing_count"] == 0
+    assert drift["agent_join_pending"][0]["seen_ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_underscore_cluster_name_matches_the_hostname_nova_derives(test_store, monkeypatch):
+    from drover.services import health
+
+    cluster = _agent_cluster(test_store, age_seconds=86400, name="My_Cluster-ab1cd")
+    monkeypatch.setattr(
+        health, "check_cluster_health",
+        AsyncMock(return_value=_health([("server-node", True), ("my-cluster-ab1cd", True)])),
+    )
+    for _ in range(3):
+        drift = await _reconcile()
+    assert cluster["status"] == "ACTIVE" and drift["has_drift"] is False
+    assert test_store.agent_vms["cluster-1"][0]["status"] == reconciliation.AGENT_READY_STATUS
+
+
+def test_node_name_normalisation_follows_nova_hostname_rules():
+    assert reconciliation._node_name("My_Cluster Name-AB1cd") == "my-cluster-name-ab1cd"
+    assert reconciliation._node_name("--edge.") == "edge"
+    assert len(reconciliation._node_name("a" * 80)) == 63
+
+
+@pytest.mark.asyncio
+async def test_unmatched_name_is_not_a_failure_when_a_ready_agent_node_explains_it(test_store, monkeypatch):
+    from drover.services import health
+
+    cluster = _agent_cluster(test_store, age_seconds=86400, name="renamed-by-guest")
+    monkeypatch.setattr(
+        health, "check_cluster_health",
+        AsyncMock(return_value=_health([("server-node", True), ("some-other-hostname", True)])),
+    )
+    for _ in range(3):
+        drift = await _reconcile()
+    assert cluster["status"] == "ACTIVE" and drift["missing_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -754,14 +827,14 @@ async def test_unobservable_node_list_neither_raises_nor_clears_agent_error(test
 
     healthy = _agent_cluster(test_store, age_seconds=60)
     monkeypatch.setattr(health, "check_cluster_health", AsyncMock(return_value=_health([], reachable=False)))
-    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+    drift = await _reconcile()
     assert healthy["status"] == "ACTIVE" and drift["has_drift"] is False
 
     errored = _agent_cluster(
         test_store, age_seconds=3600, status="ERROR",
         status_reason="Reconciliation failed: Required Kubernetes agent node 'agent-1' is not Ready",
     )
-    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+    drift = await _reconcile()
     assert errored["status"] == "ERROR"
     assert "could not be re-observed" in errored["status_reason"]
     assert drift["missing_count"] == 1
@@ -774,6 +847,6 @@ async def test_cluster_without_agents_does_not_probe_the_api(test_store, monkeyp
     test_store.add_cluster("project-1", "cluster-1", {"server_vm_id": "server-1", "kubeconfig": "config"})
     check = AsyncMock()
     monkeypatch.setattr(health, "check_cluster_health", check)
-    drift = await reconciliation.reconcile_cluster("project-1", "cluster-1", conn=_server_present())
+    drift = await _reconcile()
     assert drift["has_drift"] is False
     check.assert_not_called()

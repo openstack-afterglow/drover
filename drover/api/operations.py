@@ -11,7 +11,7 @@ from drover.auth import get_token_info
 from drover.models.orm import DroverOperation, DroverOperationEvent
 from drover.models.schemas import DroverOperationEventInfo, DroverOperationInfo
 from drover.policy import authorize
-from drover.services import operations
+from drover.services import operations, store
 
 router = APIRouter()
 _logger = logging.getLogger(__name__)
@@ -42,14 +42,33 @@ def _operation_to_info(op: DroverOperation) -> DroverOperationInfo:
     )
 
 
-def _event_to_info(ev: DroverOperationEvent) -> DroverOperationEventInfo:
+_DRIFT_DETAIL_KEYS = frozenset({"missing", "orphans", "mismatches"})
+
+
+async def _hides_profile_details(op: DroverOperation, token_info: dict) -> bool:
+    """True when a non-administrator reads events of a profile cluster, whose drift details name rule identifiers."""
+    if authorize("drover:admin", {"project_id": op.project_id}, token_info, do_raise=False):
+        return False
+    try:
+        cluster = await store.get_cluster(op.project_id, op.cluster_id)
+    except Exception:
+        _logger.warning("Operation %s: cluster lookup failed; hiding drift details", op.id, exc_info=True)
+        return True
+    snapshot = (cluster or {}).get("resource_policy_snapshot")
+    return isinstance(snapshot, dict) and bool(snapshot.get("cluster_profile"))
+
+
+def _event_to_info(ev: DroverOperationEvent, *, hide_drift_details: bool = False) -> DroverOperationEventInfo:
+    payload = ev.payload_json
+    if hide_drift_details and isinstance(payload, dict) and payload.keys() & _DRIFT_DETAIL_KEYS:
+        payload = {**{k: v for k, v in payload.items() if k not in _DRIFT_DETAIL_KEYS}, "details_hidden": True}
     return DroverOperationEventInfo(
         id=str(ev.id),
         operation_id=ev.operation_id,
         sequence=ev.sequence,
         phase=ev.phase,
         message=ev.message,
-        payload_json=ev.payload_json,
+        payload_json=payload,
         created_at=_format_dt(ev.created_at),
     )
 
@@ -78,4 +97,5 @@ async def list_operation_events(
         raise HTTPException(status_code=404, detail="Operation not found")
 
     events = await operations.get_operation_events(None, operation_id, since_sequence=since_sequence)
-    return [_event_to_info(ev) for ev in events]
+    hide = await _hides_profile_details(op, token_info)
+    return [_event_to_info(ev, hide_drift_details=hide) for ev in events]

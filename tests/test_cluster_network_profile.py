@@ -141,3 +141,73 @@ def test_unprofiled_cluster_responses_are_unchanged_for_tenants():
     assert info.network_id == "net-1"
     assert "abc" in info.status_reason
     assert info.drift_status["missing"][0]["resource_id"] == "abc"
+
+
+def test_request_hash_of_a_request_without_profile_matches_the_pre_profile_canonical_json():
+    import hashlib
+    import json
+
+    from drover.api.clusters import compute_request_hash
+    from drover.models.schemas import CreateK3sClusterRequest
+
+    # Canonical JSON of the request model before the `profile` field existed. A replayed Idempotency-Key must
+    # still match the stored hash after the upgrade.
+    legacy = {
+        "name": "k", "agent_count": 1, "agent_flavor_id": None, "network_id": None, "key_name": None,
+        "os_type": "ubuntu", "allowed_cidrs": None, "template_id": None, "master_count": 1,
+        "stampede_enabled": True,
+    }
+    expected = hashlib.sha256(json.dumps(legacy, sort_keys=True).encode("utf-8")).hexdigest()
+
+    assert compute_request_hash(CreateK3sClusterRequest(name="k")) == expected
+    assert compute_request_hash(CreateK3sClusterRequest(name="k", profile="sandbox")) != expected
+
+
+def _event(payload):
+    from drover.models.orm import DroverOperationEvent
+
+    return DroverOperationEvent(id=1, operation_id="op", sequence=1, phase="reconcile_complete", message="m", payload_json=payload)
+
+
+def test_operation_event_drift_details_are_hidden_only_when_requested():
+    from drover.api.operations import _event_to_info
+
+    payload = {"has_drift": True, "missing_count": 1, "missing": [{"resource_id": "abc"}], "orphans": [], "mismatches": []}
+
+    hidden = _event_to_info(_event(payload), hide_drift_details=True).payload_json
+    shown = _event_to_info(_event(payload)).payload_json
+
+    assert hidden == {"has_drift": True, "missing_count": 1, "details_hidden": True}
+    assert shown == payload
+    assert _event_to_info(_event({"step": "security_group", "progress": 5}), hide_drift_details=True).payload_json == {
+        "step": "security_group", "progress": 5,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "is_admin,snapshot,lookup_fails,expected",
+    [
+        (False, {"cluster_profile": {"name": "sandbox"}}, False, True),
+        (True, {"cluster_profile": {"name": "sandbox"}}, False, False),
+        (False, {"k3s.default_network": {"id": "net"}}, False, False),
+        (False, None, True, True),
+    ],
+)
+async def test_event_redaction_applies_to_non_admin_readers_of_profile_clusters(
+    monkeypatch, is_admin, snapshot, lookup_fails, expected
+):
+    from types import SimpleNamespace
+
+    from drover.api import operations as operations_api
+
+    async def get_cluster(project_id, cluster_id):
+        if lookup_fails:
+            raise RuntimeError("store unavailable")
+        return {"resource_policy_snapshot": snapshot}
+
+    monkeypatch.setattr(operations_api.store, "get_cluster", get_cluster)
+    monkeypatch.setattr(operations_api, "authorize", lambda *args, **kwargs: is_admin)
+    op = SimpleNamespace(id="op", project_id="p", cluster_id="c")
+
+    assert await operations_api._hides_profile_details(op, {}) is expected

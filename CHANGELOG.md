@@ -5,15 +5,15 @@
 ### 한국어
 
 - 상태: **미릴리스**(source/test-defined, 로컬 테스트 통과; 릴리스·배포·live 검증 안 함).
-- 변경/수정: 모든 클러스터가 자기 security group에서 오는 tcp/6443을 연다(제한 CIDR 클러스터에서 agent가 join하지 못하던 결함). 관리자 `k3s.cluster_profiles` 런타임 설정과 `profile` 요청 필드로 네트워크·SSH/API/NodePort/HTTP(S) CIDR을 관리자가 고정한다(요청의 `network_id`·`allowed_cidrs`는 `400`; 비관리자 응답은 profile cluster의 네트워크·규칙 식별자·drift 상세를 숨김). reconcile이 agent의 Kubernetes node Ready를 관찰해 합류 창(900초) 안에는 `agent_join_pending`, 이후에는 자동 회복되는 reconciler 소유 `ERROR`로 표시한다.
-- 영향: 클러스터당 security group 규칙이 1개 늘어 quota admission 계산도 1 증가한다. DB schema/migration 변경 **없음**. 기존 클러스터와 profile 없는 요청의 동작은 같다(NodePort·80·443 `0.0.0.0/0` 기본 유지).
+- 변경/수정: 모든 클러스터가 자기 security group에서 오는 tcp/6443을 연다(제한 CIDR 클러스터에서 agent가 join하지 못하던 결함). 관리자 `k3s.cluster_profiles` 런타임 설정과 `profile` 요청 필드로 네트워크·SSH/API/NodePort/HTTP(S) CIDR을 관리자가 고정한다(요청의 `network_id`·`allowed_cidrs`는 `400`; 비관리자 응답과 operation 이벤트는 profile cluster의 네트워크·규칙 식별자·drift 상세를 숨김). reconcile이 agent의 Kubernetes node Ready를 관찰한다: Nova 방식으로 정규화한 이름으로 맞추고, 한 번도 Ready가 아니었던 agent만 합류 창(900초)과 연속 2회 관찰 실패 뒤 자동 회복되는 reconciler 소유 `ERROR`로 표시한다. `profile`이 없는 요청의 request hash는 이전과 같아 기존 `Idempotency-Key` 재생이 유지된다.
+- 영향: 클러스터당 security group 규칙이 1개 늘어 quota admission 계산도 1 증가한다. DB schema/migration 변경 **없음**. profile 없는 요청의 보안 그룹 동작은 같다(NodePort·80·443 `0.0.0.0/0` 기본 유지). **배포 직후 agent가 있는 기존 모든 클러스터가 첫 reconcile부터 노드 관찰(reconcile당 최대 약 15초 추가)을 받는다.** 일시적인 NotReady는 한 번의 관찰로 `ERROR`가 되지 않으며, 한 번이라도 Ready였던 agent는 `ERROR`로 승격되지 않는다.
 - 폐기/제거: **없음**.
 
 ### English
 
 - Status: **unreleased** (source/test-defined, local tests pass; not released, deployed or live-verified).
-- Changes/fixes: every cluster opens tcp/6443 from its own security group (restricted-CIDR clusters could never admit an agent). An administrator `k3s.cluster_profiles` runtime setting and a `profile` request field pin the network and SSH/API/NodePort/HTTP(S) CIDRs (request `network_id`/`allowed_cidrs` get `400`; non-admin responses hide a profile cluster's network, rule identifiers and drift details). Reconciliation observes agent Kubernetes node readiness: `agent_join_pending` inside the 900 s join window, then a reconciler-owned `ERROR` that clears itself when the node becomes Ready.
-- Impact: one more security-group rule per cluster, so quota admission counts one more rule. No database schema or migration change. Existing clusters and requests without a profile behave as before (NodePort, 80 and 443 stay `0.0.0.0/0` by default).
+- Changes/fixes: every cluster opens tcp/6443 from its own security group (restricted-CIDR clusters could never admit an agent). An administrator `k3s.cluster_profiles` runtime setting and a `profile` request field pin the network and SSH/API/NodePort/HTTP(S) CIDRs (request `network_id`/`allowed_cidrs` get `400`; non-admin responses and operation events hide a profile cluster's network, rule identifiers and drift details). Reconciliation observes agent Kubernetes node readiness: agents are matched by the Nova-normalised name, and only an agent never observed Ready becomes a reconciler-owned `ERROR` (self-clearing) after the 900 s window and two consecutive failed observations. The request hash of a request without `profile` is unchanged, so replaying an existing `Idempotency-Key` still works.
+- Impact: one more security-group rule per cluster, so quota admission counts one more rule. No database schema or migration change. The security-group behaviour of requests without a profile is unchanged (NodePort, 80 and 443 stay `0.0.0.0/0` by default). **After rollout every existing cluster that has agents gets the node observation from its first reconcile (up to about 15 s extra per reconcile).** A transient NotReady does not become `ERROR` on one observation, and an agent that was ever Ready is never escalated.
 - Deprecated/removed: **None**.
 
 ## 0.4.19 — durable tenant cluster deletion

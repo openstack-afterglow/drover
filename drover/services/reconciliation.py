@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -20,25 +21,40 @@ def _now() -> datetime:
 
 
 AGENT_JOIN_WINDOW_SECONDS = 900
+AGENT_JOIN_MIN_MISSES = 2
+AGENT_READY_STATUS = "READY"
 _AGENT_NODE_MARK = "Kubernetes agent node"
+_HOSTNAME_FILTER = re.compile(r"[^a-z0-9.-]+")
+
+
+def _node_name(name: str) -> str:
+    """Normalise a VM name the way Nova derives a guest hostname (agents get no ``--node-name``).
+
+    Nova lowercases, turns spaces and underscores into hyphens, drops other characters, trims leading/trailing
+    ``.``/``-`` and caps the result at 63 characters; cluster names may contain ``_``.
+    """
+    value = re.sub(r"[ _]", "-", (name or "").casefold())
+    return _HOSTNAME_FILTER.sub("", value).strip(".-")[:63]
 
 
 async def _observe_agent_join(
     cluster: dict[str, Any], *, now: datetime | None = None
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Compare the recorded agent VMs with the live Kubernetes node list.
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    """Compare the recorded agent VMs with the live Kubernetes node list during and after their join.
 
-    Returns ``(required_missing, pending)``. An agent that is not a Ready node is ``pending`` during its join window
-    and becomes a required missing resource afterwards. The resulting reconciler-owned ``ERROR`` clears itself on a
-    later pass that observes the node Ready; the create operation is never failed for a slow join. When the node list
-    cannot be observed nothing new is reported, but an earlier agent-node ``ERROR`` is carried forward so an outage
-    cannot silently clear it.
+    Returns ``(required_missing, pending, misses)``. Only an agent that has never been observed Ready can escalate:
+    after its join window and ``AGENT_JOIN_MIN_MISSES`` consecutive missing observations it becomes a required
+    missing resource, which reconciliation clears itself once a later pass sees the node Ready. An agent that was
+    Ready before (a reboot or kubelet restart) is only reported as pending. Agents are matched to nodes by
+    Nova-normalised name, and an unmatched agent is explained by an unmatched Ready agent node (a naming difference
+    is not a join failure). A node list that cannot be observed reports nothing new but carries an earlier
+    agent-node ``ERROR`` forward. The create operation is never failed for a slow join.
     """
     from drover.services import health
 
     agents = await store.list_agent_vms(cluster["id"])
     if not agents:
-        return [], []
+        return [], [], {}
     now = now or _now()
     try:
         result = await health.check_cluster_health(cluster)
@@ -46,6 +62,9 @@ async def _observe_agent_join(
         _logger.warning("Agent join observation failed for cluster %s", cluster.get("id"), exc_info=True)
         result = None
     observed = bool(result and result.api_server_reachable and result.healthz_ok and result.nodes)
+    previous_drift = cluster.get("drift_status") if isinstance(cluster.get("drift_status"), dict) else {}
+    previous_misses = previous_drift.get("agent_join_misses") if isinstance(previous_drift, dict) else {}
+    previous_misses = previous_misses if isinstance(previous_misses, dict) else {}
     if not observed:
         previous = cluster.get("status_reason") or ""
         if cluster.get("status") == "ERROR" and previous.startswith("Reconciliation failed:") and _AGENT_NODE_MARK in previous:
@@ -53,28 +72,48 @@ async def _observe_agent_join(
                 "service": "kubernetes", "resource_type": "node", "resource_id": None,
                 "name": "agent nodes", "is_required": True,
                 "reason": f"Required {_AGENT_NODE_MARK} state could not be re-observed (API unreachable)",
-            }], []
-        return [], []
-    ready = {node.name.casefold() for node in result.nodes if node.ready}
+            }], [], {vm_id: int(count) for vm_id, count in previous_misses.items() if isinstance(count, int)}
+        return [], [], {}
+    ready_nodes = [node for node in result.nodes if node.ready]
+    ready_names = {_node_name(node.name) for node in ready_nodes}
+    unmatched: list[dict[str, Any]] = []
+    for agent in agents:
+        if _node_name(agent.get("name") or agent["vm_id"]) in ready_names:
+            if agent.get("status") != AGENT_READY_STATUS:
+                try:
+                    await store.update_agent_vm_status(cluster["id"], agent["vm_id"], AGENT_READY_STATUS)
+                except Exception:
+                    _logger.warning("Could not record agent %s as Ready", agent["vm_id"], exc_info=True)
+            continue
+        unmatched.append(agent)
+    matched_agents = len(agents) - len(unmatched)
+    unexplained_ready = max(0, sum(1 for node in ready_nodes if node.role == "agent") - matched_agents)
+    still_missing = sorted(unmatched, key=lambda a: a.get("created_at") or now)[: max(0, len(unmatched) - unexplained_ready)]
     missing: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
-    for agent in agents:
-        name = agent.get("name") or agent["vm_id"]
-        if name.casefold() in ready:
-            continue
+    misses: dict[str, int] = {}
+    for agent in still_missing:
+        vm_id = agent["vm_id"]
+        name = agent.get("name") or vm_id
         created = agent.get("created_at")
         if created is not None and created.tzinfo is None:
             created = created.replace(tzinfo=UTC)
         age = (now - created).total_seconds() if created is not None else float(AGENT_JOIN_WINDOW_SECONDS)
-        if age < AGENT_JOIN_WINDOW_SECONDS:
-            pending.append({"vm_id": agent["vm_id"], "name": name, "age_seconds": int(age)})
+        if agent.get("status") == AGENT_READY_STATUS:
+            pending.append({"vm_id": vm_id, "name": name, "age_seconds": int(age), "seen_ready": True})
+            continue
+        count = int(previous_misses.get(vm_id, 0) or 0) + 1
+        misses[vm_id] = count
+        if age < AGENT_JOIN_WINDOW_SECONDS or count < AGENT_JOIN_MIN_MISSES:
+            pending.append({"vm_id": vm_id, "name": name, "age_seconds": int(age), "misses": count})
         else:
             missing.append({
-                "service": "kubernetes", "resource_type": "node", "resource_id": agent["vm_id"],
+                "service": "kubernetes", "resource_type": "node", "resource_id": vm_id,
                 "name": name, "is_required": True,
                 "reason": f"Required {_AGENT_NODE_MARK} '{name}' is not Ready",
             })
-    return missing, pending
+    return missing, pending, misses
+
 
 def _is_not_found(exc: Exception) -> bool:
     if isinstance(exc, (ResourceNotFound, NotFoundException)):
@@ -656,7 +695,7 @@ async def reconcile_cluster(
                     "reason": reason,
                 })
 
-        agent_missing, agent_pending = await _observe_agent_join(cluster_dict)
+        agent_missing, agent_pending, agent_misses = await _observe_agent_join(cluster_dict)
         missing_resources.extend(agent_missing)
 
         # Scan for unknown tagged orphan resources (report-only, no deletion)
@@ -675,6 +714,7 @@ async def reconcile_cluster(
             "mismatches": state_mismatches,
             "reconciled_at": _now().isoformat(),
             **({"agent_join_pending": agent_pending} if agent_pending else {}),
+            **({"agent_join_misses": agent_misses} if agent_misses else {}),
         }
 
         # Update cluster record status and drift_status

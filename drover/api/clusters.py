@@ -264,6 +264,9 @@ async def head_kubeconfig(
 
 def compute_request_hash(req: CreateK3sClusterRequest) -> str:
     data = req.model_dump(mode="json")
+    # An unset profile must not change the hash of requests made before the field existed (idempotent replay).
+    if data.get("profile") is None:
+        data.pop("profile", None)
     canonical_json = json.dumps(data, sort_keys=True)
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 

@@ -1,15 +1,19 @@
 ## ADDED Requirements
 
 ### Requirement: Agent nodes admitted, recoverably
-Drover SHALL observe every requested agent node until it is a Ready Kubernetes node or a bounded window passes. It SHALL NOT fail the create operation for a slow join. After the window an agent that is not Ready SHALL make the cluster `ERROR` with a reconciler-owned reason naming the agent, and a later reconciliation that observes the node Ready SHALL restore `ACTIVE` without operator action.
+Drover SHALL observe every requested agent node until it is a Ready Kubernetes node. It SHALL NOT fail the create operation for a slow join. An agent never observed Ready SHALL make the cluster `ERROR` with a reconciler-owned reason naming the agent only after its join window has passed and consecutive observations have failed; a later reconciliation that observes the node Ready SHALL restore `ACTIVE` without operator action. An agent that was Ready before SHALL NOT escalate to `ERROR` because of a restart, and a naming difference between a VM and its node SHALL NOT count as a join failure.
 
 #### Scenario: Agent cannot reach the API
-- **WHEN** an agent VM is ACTIVE but does not join within the bounded window
+- **WHEN** an agent VM is ACTIVE but does not join within the bounded window and repeated observations
 - **THEN** the cluster is ERROR with a reconciler-owned reason, the create operation is not FAILED, and no success is reported for the agent
 
 #### Scenario: Agent joins late
 - **WHEN** the agent becomes Ready after the window
 - **THEN** the next reconciliation clears the ERROR and the cluster returns to ACTIVE
+
+#### Scenario: Restart of a previously Ready agent
+- **WHEN** an agent that was observed Ready is NotReady at a later observation
+- **THEN** the cluster stays ACTIVE and the agent is only reported as pending
 
 ### Requirement: Cluster-internal API access
 Drover SHALL open tcp/6443 from the cluster's own security group for every cluster so agents can reach the API regardless of administrator CIDR restrictions.
