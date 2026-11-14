@@ -6,9 +6,9 @@ Drover는 OpenStack 프로젝트 단위로 K3s 클러스터와 노드그룹의 �
 
 - Repository: https://github.com/openstack-afterglow/drover
 - 분석 기준: `dev` 브랜치, 작업 트리의 소스와 테스트
-- 패키지: 현재 발행·DMS Lab 배포 버전은 `drover==0.4.18`이다. Kolla 2026.1 toolbox의 service-project lookup에 명시 `openstack_auth_cloud`를 전달한다; 배포 receipt는 [`docs/release-0.4.18.md`](docs/release-0.4.18.md) 참조.
+- 패키지: 현재 발행·DMS Lab 배포 버전은 `drover==0.4.20`이다(sandbox-ready cluster profile, self-group 6443, agent 합류 관찰, `POST /v1/clusters/{id}/sandbox-connection`). 이전 0.4.19는 durable tenant delete-async, 0.4.18은 Kolla 2026.1 `openstack_auth_cloud` 선택이다; 배포 receipt는 [`docs/release-0.4.20.md`](docs/release-0.4.20.md), [`docs/release-0.4.19.md`](docs/release-0.4.19.md), [`docs/release-0.4.18.md`](docs/release-0.4.18.md) 참조.
 - 주요 런타임: Python `>=3.11`(root package `requires-python`; SDK는 `>=3.12`; CI·container image는 3.12), FastAPI `0.141.1`, Starlette `>=1.3.1`(lock `1.6.0`), Uvicorn `0.39.0`, openstacksdk `3.3.0`, SQLAlchemy `>=2.0`, Redis client `5.0.0`
-**Current published/deployed release — 0.4.18 (2026-11-11):** tag Release/Docker workflows and the root wheel succeeded. The Kolla 2026.1 auth-cloud fix was installed on all three DMS Lab controllers through Drover-only reconfigure; every API readiness check returned 200. Exactly six Drover API/Worker containers changed; the other 621 of 627 IDs, including HAProxy, ProxySQL and keepalived, remained unchanged. Worker/database evidence and limits are in [`docs/release-0.4.18.md`](docs/release-0.4.18.md). The 0.4.19 candidate makes tenant `delete-async` durable; publication and rollout are pending.
+**Current published/deployed release — 0.4.20 (2026-11-14):** tag Release/Docker workflows and the root wheel succeeded; the images are pinned by digest in `deploy/kolla/STAGING.md`. Drover-only reconfigure reached all three DMS Lab controllers (`failed=0`); exactly the six Drover containers changed and direct and public readiness returned `ok`. No schema or dependency change. Evidence and limits (synthetic-only `sandbox-connection` verification, no authenticated live call, no configured profile) are in [`docs/release-0.4.20.md`](docs/release-0.4.20.md).
 
 1분 요약: FastAPI API가 MariaDB에 cluster/operation/job을 함께 기록하고, 독립 Worker들이 SQL lease를 얻어 OpenStack 작업을 실행한다. Redis server-time membership은 Worker의 discovery/recovery/reconciliation/delegation 역할과 health/Stampede target 소유권을 분배한다. DB job consumer는 Redis leader 아래로 이동하지 않는다. 서버 VM의 일회성 cloud-init callback은 K3s bootstrap 결과를 전달하고, Worker가 agent/HA 후속 작업을 수행한다. MariaDB는 내구성 상태와 queue의 정본이며 Redis는 credential 없는 임시 ownership·callback token·짧은 상태/헬스 캐시·stampede 이벤트 같은 보조 저장소다.
 
@@ -333,9 +333,9 @@ Architecture maintenance는 문서 작업이 아니라 source snapshot을 확인
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "7777b0b215c075ac460f99035ba66c69824f7bf25504ff38de6ea6d936746bd6",
-  "reviewed_at": "2026-11-14T07:45:37Z",
-  "summary": "0.4.20 release metadata pins the sandbox-ready implementation SHA; schema and dependencies unchanged."
+  "source_sha256": "2ab34a6adb3bb8c48de9649b26f82459de56bedecdf99b6b7e3bd86f6669420a",
+  "reviewed_at": "2026-11-14T08:04:28Z",
+  "summary": "0.4.20 publication and DMS Lab rollout receipts; no source change."
 }
 ```
 <!-- architecture-review:end -->
