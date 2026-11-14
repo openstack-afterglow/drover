@@ -656,3 +656,40 @@ def test_label_value_keeps_valid_values_and_hashes_the_rest():
     hashed = label_value("deployment with spaces/and:colons")
     assert hashed.startswith("h-") and len(hashed) == 62 and hashed == label_value("deployment with spaces/and:colons")
     assert label_value("a" * 64) != "a" * 64 and len(label_value("a" * 64)) == 62
+
+
+@pytest.mark.asyncio
+async def test_sandbox_connection_issuance_is_audited_without_the_token(native_boundary):
+    from drover.api import clusters
+
+    smoke = native_boundary
+    clusters.rec.reset_mock()
+    response = await _sandbox(smoke, deployment_id="lumen-prod", pool_name="agent-sandbox")
+    assert response.status_code == 200
+    clusters.rec.assert_awaited_once()
+    kwargs = clusters.rec.call_args.kwargs
+    assert kwargs["action"] == "sandbox_connection_issue" and kwargs["resource_id"] == "cluster-one"
+    extra = kwargs["extra"]
+    assert extra["namespace"] == response.json()["namespace"]
+    assert (extra["deployment_id"], extra["pool_name"]) == ("lumen-prod", "agent-sandbox")
+    assert "source_ip" in extra and "expires_at" in extra
+    assert response.json()["token"] not in repr(clusters.rec.call_args)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_connection_audit_failure_does_not_fail_issuance_and_denials_are_unaudited(native_boundary):
+    from drover.api import clusters
+
+    smoke = native_boundary
+    clusters.rec.reset_mock()
+    clusters.rec.side_effect = RuntimeError("audit store down")
+    assert (await _sandbox(smoke)).status_code == 200
+    clusters.rec.side_effect = None
+    clusters.rec.reset_mock()
+    smoke.principal["roles"] = ["reader"]
+    assert (await _sandbox(smoke)).status_code == 403
+    smoke.principal["roles"] = MEMBER_ROLES
+    smoke.cluster["status"] = "ERROR"
+    assert (await smoke.route.post("/v1/clusters/cluster-one/sandbox-connection",
+                                   json={"deployment_id": "d", "pool_name": "p"})).status_code == 409
+    clusters.rec.assert_not_called()

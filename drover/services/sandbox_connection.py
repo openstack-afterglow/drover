@@ -40,11 +40,11 @@ _LABEL_VALUE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _RUNTIME_CLASS = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
 
-# Namespaced: only what running one sandbox needs. No list/watch on secrets, no
+# Namespaced: exactly the operations Lumen's `_check_rbac` accepts (it refuses any other
+# verb or resource, e.g. pods `watch` and `pods/log`). No list/watch on secrets, no
 # wildcards, no pods/exec, no RBAC, no serviceaccounts, no deployments.
 NAMESPACE_RULES = [
-    {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch", "create", "delete"]},
-    {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
+    {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "create", "delete"]},
     {"apiGroups": [""], "resources": ["services"], "verbs": ["get", "list", "create", "delete"]},
     {"apiGroups": [""], "resources": ["secrets"], "verbs": ["get", "create", "delete"]},
     {"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": ["get", "list", "create", "delete"]},

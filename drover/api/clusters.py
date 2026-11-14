@@ -950,6 +950,26 @@ async def issue_sandbox_connection(
     response.headers["Pragma"] = "no-cache"
     _logger.info("Sandbox connection issued cluster=%s namespace=%s expires_at=%s",
                  cluster_id, issued.namespace, issued.expires_at.isoformat())
+    # The credential can read and create Secrets in its namespace, so every issuance is
+    # audited like a kubeconfig download. Best effort: a failed audit write must not
+    # turn a successful issuance into an error, and the token is never recorded.
+    try:
+        from drover.rate_limit import _get_real_ip
+
+        await rec(
+            token_info,
+            None,
+            resource_type="k3s_cluster",
+            action="sandbox_connection_issue",
+            resource_id=cluster_id,
+            resource_name=issued.namespace,
+            extra={"source_ip": _get_real_ip(request), "namespace": issued.namespace,
+                   "deployment_id": body.deployment_id, "pool_name": body.pool_name,
+                   "runtime_class_name": issued.runtime_class_name,
+                   "expires_at": issued.expires_at.isoformat()},
+        )
+    except Exception:
+        _logger.warning("sandbox connection audit 기록 실패", exc_info=True)
     return SandboxConnectionInfo(
         server=issued.server, ca_pem=issued.ca_pem, namespace=issued.namespace, namespace_uid=issued.namespace_uid,
         service_account=issued.service_account, token=issued.token, expires_at=issued.expires_at,
